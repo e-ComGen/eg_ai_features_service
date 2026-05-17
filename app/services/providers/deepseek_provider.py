@@ -4,9 +4,19 @@ DeepSeek implements the same REST protocol as OpenAI, so we use the official
 ``openai`` SDK with a custom ``base_url``.  This gives us structured outputs
 (JSON mode) and streaming for free.
 
-Pricing (placeholder — update when official prices are confirmed):
-    deepseek-v4-flash:  $0.07 / 1M input tokens,  $0.14 / 1M output tokens
-    deepseek-v4-pro:    $0.27 / 1M input tokens,  $1.10 / 1M output tokens
+Official pricing (api.deepseek.com, май 2026):
+    deepseek-v4-flash:
+        input (cache miss): $0.14 / 1M tokens
+        input (cache hit):  $0.0028 / 1M tokens  (98% discount)
+        output:             $0.28 / 1M tokens
+
+    deepseek-v4-pro (PROMO до 31.05.2026, после ×4):
+        input (cache miss): $0.435 / 1M tokens   (после promo: $1.74)
+        input (cache hit):  $0.003625 / 1M tokens (после promo: $0.0145)
+        output:             $0.87 / 1M tokens    (после promo: $3.48)
+
+Через OpenRouter v4-flash дешевле: $0.112 / $0.224 (~20% объёмная скидка).
+Source: https://api-docs.deepseek.com/quick_start/pricing
 """
 
 from __future__ import annotations
@@ -21,13 +31,14 @@ from .base import LlmProvider, LlmResponse
 
 logger = logging.getLogger(__name__)
 
-# Hardcoded price table (USD per 1 million tokens).
-# TODO: replace with official DeepSeek pricing once confirmed.
+# Hardcoded price table (USD per 1 million tokens) — официальные цены DeepSeek май 2026.
+# Cache hit pricing применяется автоматически когда DeepSeek распознаёт identical prefix.
+# ⚠️ V4-Pro в промо до 31.05.2026 — после цена вырастет ×4. Проверить и обновить.
 _PRICES: dict[str, dict[str, float]] = {
-    "deepseek-v4-flash": {"input": 0.07, "output": 0.14},
-    "deepseek-v4-pro":   {"input": 0.27, "output": 1.10},
+    "deepseek-v4-flash": {"input": 0.14, "output": 0.28},
+    "deepseek-v4-pro":   {"input": 0.435, "output": 0.87},  # промо до 31.05.2026
 }
-_DEFAULT_PRICE = {"input": 0.07, "output": 0.14}  # fallback for unknown models
+_DEFAULT_PRICE = {"input": 0.14, "output": 0.28}  # fallback (= flash, безопаснее занизить)
 
 
 def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
