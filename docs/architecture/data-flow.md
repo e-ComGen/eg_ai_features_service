@@ -1,45 +1,52 @@
-# Data flow
+# Как данные ходят между этапами
 
-Какие данные передаются между стадиями pipeline. С JSON-примерами и Python type definitions.
+Документ показывает что именно передаётся между этапами pipeline. С реальными JSON-примерами и Python-типами — чтобы было понятно «что входит, что выходит».
 
 ---
 
-## Input: что приходит в pipeline
+## Что приходит на вход pipeline
+
+Снаружи (от PHP-аддона или другого коннектора) приходит товар плюс список характеристик которые нужно заполнить.
 
 ```python
 class ProductData(BaseModel):
-    id: int                              # external (CS-Cart product_id)
+    """Данные одного товара."""
+    id: int                              # внешний id (из CS-Cart product_id)
     name: str                            # "Nike Air Force 1 размер 42"
     description: str | None              # может быть пустым
     category_id: int                     # 42
     category_path: list[str]             # ["Обувь", "Кроссовки", "Мужские"]
-    brand: str | None                    # "Nike" — если CS-Cart хранит отдельно
-    ean: str | None                      # "0194253401234"
-    source_urls: list[str]               # ссылки на товар у поставщика (max 5)
-    image_urls: list[str]                # фото товара (max 10)
+    brand: str | None                    # "Nike" — если в CS-Cart хранится отдельно
+    ean: str | None                      # штрихкод "0194253401234"
+    source_urls: list[str]               # ссылки на товар у поставщика (макс 5)
+    image_urls: list[str]                # фото товара (макс 10)
 
 class BatchOptions(BaseModel):
-    enable_vision: bool = False
-    enable_web_search: bool = False
-    enable_llm_knowledge: bool = True    # самый дешёвый, default on
-    max_cost_credits: int = 100          # бюджет на товар
+    """Какие этапы вообще запускать. Селлер сам выбирает в настройках."""
+    enable_vision: bool = False          # анализ фото (дорогой)
+    enable_web_search: bool = False      # поиск в интернете (самое дорогое)
+    enable_llm_knowledge: bool = True    # знания ИИ — самое дешёвое, по умолчанию вкл
+    max_cost_credits: int = 100          # бюджет на один товар (защита от перерасхода)
 
 class TargetAttribute(BaseModel):
-    id: int                              # из схемы CS-Cart features
-    name: str                            # "Material"
+    """Одна характеристика которую нужно заполнить."""
+    id: int                              # id из схемы характеристик CS-Cart
+    name: str                            # "Материал"
     type: Literal["text", "numeric", "enum"]
-    allowed_values: list[str] | None     # для enum
-    semantic_type: str | None            # "color", "material_visual", "weight", ...
-                                          # подсказка classifier-у
+    allowed_values: list[str] | None     # для enum — допустимые значения
+    semantic_type: str | None            # подсказка для распределителя:
+                                          # "color" → лучше через фото
+                                          # "weight" → лучше через веб
+                                          # "brand" → лучше через знания ИИ
 ```
 
-JSON example:
+JSON пример полного запроса:
 
 ```json
 {
   "product": {
     "id": 12345,
-    "name": "Nike Air Force 1 Размер 42",
+    "name": "Nike Air Force 1 размер 42",
     "description": "Классические кожаные кроссовки",
     "category_id": 42,
     "category_path": ["Обувь", "Кроссовки"],
@@ -70,51 +77,75 @@ JSON example:
 
 ## Внутренние типы pipeline
 
+Это типы которые ходят между этапами внутри pipeline.
+
 ```python
 class Source(StrEnum):
-    DESCRIPTION = "description"
-    LLM_KNOWLEDGE = "llm_knowledge"
-    VISION = "vision"
-    WEB_SEARCH = "web_search"
+    """Откуда пришла характеристика."""
+    DESCRIPTION = "description"          # из описания товара
+    LLM_KNOWLEDGE = "llm_knowledge"      # из знаний ИИ
+    VISION = "vision"                    # с фото
+    WEB_SEARCH = "web_search"            # из веб-поиска
 
 class AttributeValue(BaseModel):
+    """Одно значение характеристики которое нашёл какой-то источник."""
     attribute_id: int
-    value: str | int | float | bool      # final value
-    confidence: float                     # 0.0-1.0 от extractor
+    value: str | int | float | bool      # само значение
+    confidence: float                     # 0.0 - 1.0, уверенность ИИ
     source: Source                        # откуда пришло
-    evidence: str | None                  # цитата / URL / описание основания
-    judge_validated: bool = False         # прошёл ли через judge
+    evidence: str | None                  # обоснование: цитата / URL / описание
+    judge_validated: bool = False         # прошёл ли через судью
 
 class ClassifierDecision(BaseModel):
-    """Что Classifier возвращает для каждого unfilled attr."""
+    """Что Распределитель решает для каждой ненайденной характеристики."""
     attribute_id: int
-    suggested_sources: list[Source]       # упорядоченный список (cheapest first)
-    reasoning: str                        # одна строка почему
+    suggested_sources: list[Source]       # список источников по порядку (сначала дешевле)
+    reasoning: str                        # одна строка объяснения почему
 ```
 
 ---
 
-## Data flow per stage
+## Поток данных по этапам (на нашем примере)
 
-### Stage 0 → Stage 1 (description → classifier)
+### Этап 0 — Парсер описания работает над тем что есть
 
-**Что Description вернула:**
+**Что есть на входе:** описание `"Классические кожаные кроссовки"` + 5 характеристик которые нужно заполнить.
+
+**Что Парсер вернул:**
 ```json
 [
-  {"attribute_id": 101, "value": "42", "confidence": 0.95, "source": "description", "evidence": "Размер 42 из названия"},
-  {"attribute_id": 102, "value": "white", "confidence": 0.95, "source": "description", "evidence": "Классические + белый известный цвет AF1 — выводи описанием"}
+  {
+    "attribute_id": 101,
+    "value": "42",
+    "confidence": 0.95,
+    "source": "description",
+    "evidence": "Размер 42 взят из названия товара"
+  },
+  {
+    "attribute_id": 102,
+    "value": "white",
+    "confidence": 0.95,
+    "source": "description",
+    "evidence": "Классические + известный цвет AF1"
+  }
 ]
 ```
 
-**Coverage check:**
-- target = `[101, 102, 103, 104, 105]`
-- filled = `[101, 102]`
-- **unfilled = `[103, 104, 105]`** → передаём в Classifier
+**Проверка заполнения:**
+- Нужно было: характеристики `[101, 102, 103, 104, 105]`
+- Заполнили: `[101, 102]`
+- **Осталось: `[103, 104, 105]`** → передаём Распределителю
 
-**Classifier input:**
+### Этап 1 — Распределитель решает где искать остальное
+
+**Распределителю на вход:**
 ```json
 {
-  "product": { "name": "...", "category_path": [...], "brand": "Nike" },
+  "product": {
+    "name": "Nike Air Force 1 размер 42",
+    "category_path": ["Обувь", "Кроссовки"],
+    "brand": "Nike"
+  },
   "unfilled_attributes": [
     {"id": 103, "name": "Материал", "semantic_type": "material_visual"},
     {"id": 104, "name": "Вес", "semantic_type": "weight"},
@@ -123,58 +154,86 @@ class ClassifierDecision(BaseModel):
 }
 ```
 
-**Classifier output:**
+**Распределитель отвечает:**
 ```json
 [
-  {"attribute_id": 103, "suggested_sources": ["vision", "web_search"], "reasoning": "Материал визуально определяем по фото; web search как fallback"},
-  {"attribute_id": 104, "suggested_sources": ["web_search"], "reasoning": "Вес обычно есть в спецификациях производителя в web"},
-  {"attribute_id": 105, "suggested_sources": ["llm_knowledge"], "reasoning": "Nike — общеизвестный бренд, LLM знает"}
+  {
+    "attribute_id": 103,
+    "suggested_sources": ["vision", "web_search"],
+    "reasoning": "Материал хорошо виден на фото; веб как запасной вариант"
+  },
+  {
+    "attribute_id": 104,
+    "suggested_sources": ["web_search"],
+    "reasoning": "Вес обычно есть в спецификации производителя в интернете"
+  },
+  {
+    "attribute_id": 105,
+    "suggested_sources": ["llm_knowledge"],
+    "reasoning": "Nike — общеизвестный бренд, ИИ его знает"
+  }
 ]
 ```
 
-### Stage 2 LLM Knowledge
+### Этап 2 — Знания ИИ
 
-**Input:** только attrs где `llm_knowledge` в suggested_sources → `[105]`.
+**Берём только характеристики где `llm_knowledge` идёт первым** → `[105]` (Бренд).
 
-**LLM prompt:** «What you know about: Nike Air Force 1. Fill these attributes: [Бренд]. Return JSON with confidence per value.»
+**Промпт к ИИ:**
+> «Что ты знаешь про товар: Nike Air Force 1. Заполни характеристики: [Бренд]. Верни JSON с уверенностью по каждому значению.»
 
-**Output:**
+**ИИ отвечает:**
 ```json
 [
-  {"attribute_id": 105, "value": "Nike", "confidence": 0.95, "source": "llm_knowledge"}
+  {
+    "attribute_id": 105,
+    "value": "Nike",
+    "confidence": 0.95,
+    "source": "llm_knowledge"
+  }
 ]
 ```
 
-`confidence 0.95 ≥ 0.92` → skip knowledge_judge.
+`Уверенность 95% ≥ порога 92%` → судью не зовём, доверяем.
 
-### Stage 3 Vision
+### Этап 3 — Фото
 
-**Input:** attrs где `vision` first in suggested_sources → `[103]`.
+**Берём характеристики где `vision` идёт первым** → `[103]` (Материал).
 
-**Vision producer prompt + image_urls:**
-> «Опиши товар на изображениях максимально подробно. Фокус на: цвет, материал, форма, размер...»
+**Промпт Vision-производителя** (с прикреплёнными фото):
+> «Опиши товар на изображениях максимально подробно. Сфокусируйся на: цвет, материал, форма, размер, видимые надписи.»
 
-**Vision text output:**
-> «На изображениях белые кроссовки с гладкой кожаной поверхностью верха, перфорация на боковых панелях, белая резиновая подошва...»
+**Текст от Vision:**
+> «На изображениях белые кроссовки с гладкой кожаной поверхностью верха, перфорацией на боковых панелях, белой резиновой подошвой...»
 
-**Extraction LLM call** на этот text:
+**Промпт извлечения характеристик из этого текста:**
+> «Из следующего текста извлеки: Материал. Текст: [текст выше]. Верни JSON с уверенностью.»
 
+**Результат извлечения:**
 ```json
 [
-  {"attribute_id": 103, "value": "Кожа", "confidence": 0.78, "source": "vision", "evidence": "гладкой кожаной поверхностью верха"}
+  {
+    "attribute_id": 103,
+    "value": "Кожа",
+    "confidence": 0.78,
+    "source": "vision",
+    "evidence": "гладкой кожаной поверхностью верха"
+  }
 ]
 ```
 
-`confidence 0.78 < 0.85` → запускаем `vision_judge`:
+`Уверенность 78% < порога 85%` → запускаем `vision_judge`:
 
-**Vision judge prompt:**
-> «Текст из vision: "На изображениях белые кроссовки с гладкой кожаной поверхностью верха...". Атрибут: Материал = Кожа. Действительно ли этот вывод обоснован визуально? Yes/No.»
+**Промпт судьи фото:**
+> «Текст от vision: "На изображениях белые кроссовки с гладкой кожаной поверхностью верха...". Значение которое извлекли: Материал = Кожа. Действительно ли этот вывод обоснован тем что видно на фото? Yes/No.»
 
-**Judge output:** `{"valid": true}` → attr принят.
+**Судья отвечает:** `{"valid": true}` → характеристика принята, помечаем `judge_validated: true`.
 
-### Stage 4 Web Search
+### Этап 4 — Веб-поиск
 
-**Cost predictor input:**
+Сначала Прогнозист стоимости:
+
+**Прогнозисту на вход:**
 ```json
 {
   "product_name": "Nike Air Force 1",
@@ -182,26 +241,39 @@ class ClassifierDecision(BaseModel):
 }
 ```
 
-**Cost predictor LLM prompt:**
-> «Товар: Nike Air Force 1. Attrs которые нужно найти: вес. Вероятно ли что мы найдём эти данные в публичном web (Nike.com, отзывы, обзоры)? Yes/No + 1 строка причины.»
+**Промпт Прогнозиста:**
+> «Товар: Nike Air Force 1. Характеристики которые нужно найти: вес. Есть ли разумная вероятность что мы найдём эти данные в публичном интернете (сайт Nike, отзывы, обзоры)? Yes/No + одна строка причины.»
 
-**Output:** `{"worth_it": true, "reason": "Nike публикует specs на официальном сайте"}` → запускаем WebSearch.
+**Прогнозист отвечает:** `{"worth_it": true, "reason": "Nike публикует характеристики на официальном сайте"}` → запускаем веб-поиск.
 
-**Web search producer:** делает 1 LLM call с `web_search` tool, query: «Nike Air Force 1 weight specifications».
+**Веб-поиск делает 1 обращение к ИИ с инструментом `web_search`**, запрос: «Nike Air Force 1 weight specifications».
 
-**Output text:**
+**Текст который вернулся:**
 > «По данным Nike.com, AF1 размера 42 весит 380 граммов на одну пару. Согласно отзывам на Wildberries: 400г каждая. Sneaker News: 350-400г.»
 
-**Extraction:** `[{"attribute_id": 104, "value": "380", "confidence": 0.85, "source": "web_search", "evidence": "Nike.com официально"}]`
+**Извлечение характеристик:**
+```json
+[
+  {
+    "attribute_id": 104,
+    "value": "380",
+    "confidence": 0.85,
+    "source": "web_search",
+    "evidence": "Nike.com официально указывает 380г"
+  }
+]
+```
 
-`0.85 < 0.88` → judge:
+`Уверенность 85% < порога 88%` → судья:
 
-**Websearch judge prompt:**
-> «Источники: Nike.com (official), Wildberries отзывы, Sneaker News. Заявленное значение: 380г. Соответствует ли наиболее credible источнику?»
+**Промпт судьи веб-поиска:**
+> «Источники: Nike.com (официальный), Wildberries отзывы, Sneaker News. Заявленное значение: 380г. Соответствует ли это наиболее достоверному источнику?»
 
-Judge approves → attr принят.
+Судья одобряет → характеристика принята.
 
-### Final merge
+### Финальное объединение
+
+Все характеристики собраны:
 
 ```json
 [
@@ -215,20 +287,22 @@ Judge approves → attr принят.
 
 ---
 
-## Output: что pipeline возвращает
+## Что pipeline возвращает наружу
 
 ```python
 class ExtractionResult(BaseModel):
-    request_id: str
-    filled_attributes: list[AttributeValue]   # final values, по одному на attr_id
-    unfilled_attributes: list[int]             # attr_ids которые не смогли заполнить
-    total_llm_calls: int                       # для audit
-    total_cost_credits: int                    # для billing
-    stage_breakdown: dict[str, int]            # {"description": 3, "classifier": 1, "knowledge": 1, ...}
-    audit_trail: list[dict]                    # каждое LLM-decision для debugging
+    """Что вернётся обратно в PHP-аддон или коннектор."""
+    request_id: str                            # для трейсинга
+    filled_attributes: list[AttributeValue]    # заполненные характеристики
+    unfilled_attributes: list[int]             # id характеристик которые не смогли заполнить
+    total_llm_calls: int                       # сколько всего обращений к ИИ сделали
+    total_cost_credits: int                    # сколько кредитов потратили
+    stage_breakdown: dict[str, int]            # сколько на каждой стадии
+                                                # для аудита и оптимизации
+    audit_trail: list[dict]                    # каждое решение ИИ для отладки
 ```
 
-JSON:
+JSON пример итога:
 ```json
 {
   "request_id": "req_abc123",
@@ -237,13 +311,31 @@ JSON:
   "total_llm_calls": 11,
   "total_cost_credits": 18,
   "stage_breakdown": {
-    "description": 3, "classifier": 1, "knowledge": 1,
-    "vision_producer": 1, "vision_extract": 1, "vision_judge": 1,
-    "cost_predictor": 1, "websearch_producer": 1, "websearch_extract": 1
+    "description": 3,
+    "classifier": 1,
+    "knowledge": 1,
+    "vision_producer": 1,
+    "vision_extract": 1,
+    "vision_judge": 1,
+    "cost_predictor": 1,
+    "websearch_producer": 1,
+    "websearch_extract": 1
   },
   "audit_trail": [
-    {"stage": "description", "input_hash": "abc", "output_attrs": [101, 102], "duration_ms": 1240, "model": "gpt-4o-mini"},
-    /* ... */
+    {
+      "stage": "description",
+      "input_hash": "abc",
+      "output_attrs": [101, 102],
+      "duration_ms": 1240,
+      "model": "gpt-4o-mini"
+    }
+    /* ... остальные шаги ... */
   ]
 }
 ```
+
+Эта подробная информация в `audit_trail` нужна для:
+- Отладки когда что-то пошло не так
+- Понимания на каких товарах какие этапы срабатывают чаще
+- Оптимизации тарифов (видим где реальный расход)
+- Споров с клиентом если он жалуется на качество

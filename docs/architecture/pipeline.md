@@ -1,67 +1,67 @@
-# Pipeline architecture
+# Главный pipeline обработки товара
 
-Главный extraction pipeline. **Sequential, cost-aware, per-attribute routing**.
+Когда селлер отправляет товар на заполнение характеристик, он проходит через цепочку этапов. Каждый этап что-то узнаёт о товаре, и после каждого мы проверяем — а нужны ли вообще следующие. Если уже всё нашли — останавливаемся и не тратим ни время, ни деньги на ИИ.
 
-## Правила
+## Главные правила
 
-1. **1 stage = 1 LLM call.** Никаких мега-промптов.
-2. **Sequential, не parallel.** Каждая стадия видит результат предыдущей и решает нужна ли вообще.
-3. **Cost-aware:** перед expensive (vision, web search) — coverage check + cost predictor.
-4. **Per-source judge:** у каждого source свой LLM judge. Skip judge если confidence ≥ source threshold.
-5. **Per-attribute routing:** LLM Classifier раз в начале решает где какой attr искать.
+1. **Один этап = одно обращение к ИИ.** Никаких огромных промптов где мы скармливаем всё подряд одним вызовом. Каждый вызов делает ровно одну задачу.
+2. **Этапы идут по очереди, не параллельно.** Это важно: после каждого этапа мы смотрим что уже знаем и решаем — а нужно ли вообще запускать следующий. Параллельный запуск всех этапов был бы расточительным.
+3. **Учитываем стоимость.** Перед самыми дорогими этапами (фото и поиск в интернете) ИИ-помощник сначала проверяет — а есть ли смысл туда лезть.
+4. **У каждого этапа свой судья.** Когда ИИ извлёк характеристику, мы не доверяем ему слепо — другой ИИ-судья проверяет результат. Но если первый ИИ сам сказал «я на 90%+ уверен» — судью пропускаем, экономим.
+5. **Каждая характеристика идёт своим путём.** Сначала ИИ-распределитель решает: размер кроссовок — это где смотреть, цвет — где, вес — где. И запускаем нужные этапы только для нужных характеристик.
 
 ---
 
-## Высокоуровневый flowchart
+## Большая схема всего pipeline
 
 ```mermaid
 flowchart TD
-    Start([Input: product + target_attrs]) --> S0
+    Start([На входе: товар + список характеристик которые нужно заполнить]) --> S0
     
-    S0["**Stage 0: DescriptionSource**<br/>(existing ai_pipeline 4-stage)<br/>1-4 LLM calls<br/>→ attrs_with_confidence"]
-    S0 --> CovA{All target<br/>attrs filled?}
-    CovA -->|yes| FINAL
-    CovA -->|no| S1
+    S0["**Этап 0: Парсер описания**<br/>(существующий ai_pipeline)<br/>1-4 обращения к ИИ<br/>→ характеристики которые нашлись в описании<br/>+ уверенность по каждой"]
+    S0 --> CovA{Все нужные<br/>характеристики<br/>заполнены?}
+    CovA -->|да| FINAL
+    CovA -->|нет| S1
     
-    S1["**Stage 1: LlmClassifier**<br/>1 LLM call<br/>For each unfilled attr → where to look?<br/>Output: {attr_id → [knowledge, vision, websearch]}"]
+    S1["**Этап 1: ИИ-распределитель**<br/>1 обращение к ИИ<br/>Для каждой ненайденной характеристики:<br/>где её лучше искать?<br/>→ {характеристика → [варианты источников]}"]
     S1 --> S2
     
-    S2["**Stage 2: LlmKnowledgeSource**<br/>1 LLM call<br/>(only for attrs tagged 'knowledge')<br/>→ attrs + confidence per attr"]
-    S2 --> J2{conf ≥ 0.92?}
-    J2 -->|yes| S2_DONE[Trust value]
-    J2 -->|no| JUDGE2["knowledge_judge<br/>1 LLM call"]
+    S2["**Этап 2: ИИ из памяти модели**<br/>1 обращение к ИИ<br/>(только для характеристик которые<br/>распределитель пометил как 'знание модели')<br/>→ характеристики + уверенность"]
+    S2 --> J2{Уверенность<br/>≥ 92%?}
+    J2 -->|да| S2_DONE[Доверяем]
+    J2 -->|нет| JUDGE2["Судья знаний<br/>1 обращение к ИИ"]
     JUDGE2 --> S2_DONE
-    S2_DONE --> CovB{All filled?}
-    CovB -->|yes| FINAL
-    CovB -->|no| S3GATE
+    S2_DONE --> CovB{Всё заполнено?}
+    CovB -->|да| FINAL
+    CovB -->|нет| S3GATE
     
-    S3GATE{image_urls present<br/>AND vision-tagged<br/>attrs remain?}
-    S3GATE -->|no| S4GATE
-    S3GATE -->|yes| S3
+    S3GATE{Есть ли фото товара<br/>И ещё остались<br/>'визуальные' характеристики?}
+    S3GATE -->|нет| S4GATE
+    S3GATE -->|да| S3
     
-    S3["**Stage 3: VisionSource**<br/>VisionProducer (1 LLM call)<br/>→ vision text<br/>+ extraction (1 LLM call)<br/>→ attrs + confidence"]
-    S3 --> J3{conf ≥ 0.85?}
-    J3 -->|yes| S3_DONE[Trust value]
-    J3 -->|no| JUDGE3["vision_judge<br/>1 LLM call"]
+    S3["**Этап 3: Анализ фото (Vision)**<br/>1) ИИ смотрит фото и описывает что видит — 1 обращение<br/>2) Из описания извлекаем характеристики — 1 обращение"]
+    S3 --> J3{Уверенность<br/>≥ 85%?}
+    J3 -->|да| S3_DONE[Доверяем]
+    J3 -->|нет| JUDGE3["Судья фото<br/>1 обращение к ИИ"]
     JUDGE3 --> S3_DONE
-    S3_DONE --> CovC{All filled?}
-    CovC -->|yes| FINAL
-    CovC -->|no| S4GATE
+    S3_DONE --> CovC{Всё заполнено?}
+    CovC -->|да| FINAL
+    CovC -->|нет| S4GATE
     
-    S4GATE["**CostPredictor**<br/>1 LLM call<br/>Worth web-searching this product?"]
-    S4GATE --> S4DEC{worth_it?}
-    S4DEC -->|no| FINAL
-    S4DEC -->|yes| S4
+    S4GATE["**Прогноз стоимости**<br/>1 обращение к ИИ<br/>Стоит ли вообще искать в интернете<br/>про этот конкретный товар?"]
+    S4GATE --> S4DEC{Стоит?}
+    S4DEC -->|нет| FINAL
+    S4DEC -->|да| S4
     
-    S4["**Stage 4: WebSearchSource**<br/>WebSearchProducer w/ web_search tool (1 LLM call)<br/>→ websearch text<br/>+ extraction (1 LLM call)<br/>→ attrs + confidence"]
-    S4 --> J4{conf ≥ 0.88?}
-    J4 -->|yes| S4_DONE[Trust value]
-    J4 -->|no| JUDGE4["websearch_judge<br/>1 LLM call"]
+    S4["**Этап 4: Поиск в интернете**<br/>1) ИИ с инструментом web_search ищет и собирает текст — 1 обращение<br/>2) Из найденного извлекаем характеристики — 1 обращение"]
+    S4 --> J4{Уверенность<br/>≥ 88%?}
+    J4 -->|да| S4_DONE[Доверяем]
+    J4 -->|нет| JUDGE4["Судья веб-поиска<br/>1 обращение к ИИ"]
     JUDGE4 --> S4_DONE
     S4_DONE --> FINAL
     
-    FINAL["**Merge**<br/>highest confidence per attr<br/>tie-break: DESCRIPTION > VISION > WEBSEARCH > KNOWLEDGE"]
-    FINAL --> Out([Output: filled_attrs + audit_trail])
+    FINAL["**Объединение результатов**<br/>Для каждой характеристики выбираем<br/>вариант с наибольшей уверенностью.<br/>При равной уверенности приоритет:<br/>Описание > Фото > Веб > Знания модели"]
+    FINAL --> Out([На выходе: заполненные характеристики + история откуда что взялось])
     
     style S0 fill:#cde,stroke:#369,color:#000
     style S1 fill:#fec,stroke:#c93,color:#000
@@ -77,121 +77,126 @@ flowchart TD
 
 ---
 
-## Sequence diagram: типичный случай
+## Как это работает на реальном примере
 
-Товар: «Nike Air Force 1 размер 42». Description есть но неполное. Image_urls есть. Target attrs: `[size, color, material, weight, brand]`.
+Возьмём кроссовки «Nike Air Force 1 размер 42». В карточке есть описание «Классические кожаные кроссовки», есть фото. Нужно заполнить: размер, цвет, материал, вес, бренд.
 
 ```mermaid
 sequenceDiagram
-    participant Orch as PipelineOrchestrator
-    participant Desc as DescriptionSource
-    participant Class as Classifier
-    participant Know as LLM Knowledge
-    participant Vis as Vision
-    participant Cost as CostPredictor
-    participant Web as Web Search
-    participant Judge as Judges
+    participant Orch as Оркестратор
+    participant Desc as Парсер описания
+    participant Class as Распределитель
+    participant Know as Знания ИИ
+    participant Vis as Фото
+    participant Cost as Прогноз стоимости
+    participant Web as Веб-поиск
+    participant Judge as Судьи
     
-    Orch->>Desc: extract([size, color, material, weight, brand])
-    Desc-->>Orch: [size=42 (0.95), color=red (0.95)]
-    Note over Orch: filled={size, color}<br/>remaining=[material, weight, brand]
+    Orch->>Desc: извлеки [размер, цвет, материал, вес, бренд]
+    Desc-->>Orch: размер=42 (95%), цвет=белый (95%)
+    Note over Orch: уже знаем: размер, цвет<br/>осталось: материал, вес, бренд
     
-    Orch->>Class: classify([material, weight, brand], product)
-    Class-->>Orch: {material:[vision,websearch], weight:[websearch], brand:[knowledge]}
+    Orch->>Class: где искать материал, вес, бренд?
+    Class-->>Orch: материал → фото или веб<br/>вес → веб<br/>бренд → знания ИИ
     
-    Orch->>Know: extract([brand])
-    Know-->>Orch: [brand=Nike (0.92)]
-    Note over Orch: conf ≥ 0.92, skip judge
-    Note over Orch: remaining=[material, weight]
+    Orch->>Know: какой бренд у Nike Air Force 1?
+    Know-->>Orch: Nike (92%)
+    Note over Orch: уверенность ≥ 92% — судью не зовём
+    Note over Orch: осталось: материал, вес
     
-    Orch->>Vis: extract([material])
-    Vis-->>Orch: [material=cotton (0.75)]
-    Note over Orch: conf < 0.85
-    Orch->>Judge: vision_judge.validate(material=cotton)
-    Judge-->>Orch: valid
-    Note over Orch: remaining=[weight]
+    Orch->>Vis: какой материал на фото?
+    Vis-->>Orch: кожа (78%)
+    Note over Orch: уверенность < 85% — зовём судью
+    Orch->>Judge: проверь что вывод "кожа" обоснован
+    Judge-->>Orch: да, обоснован
+    Note over Orch: осталось: вес
     
-    Orch->>Cost: is_web_search_worth([weight])
-    Cost-->>Orch: yes
-    Orch->>Web: extract([weight])
-    Web-->>Orch: [weight=350g (0.88)]
-    Note over Orch: conf ≥ 0.88, skip judge
+    Orch->>Cost: стоит ли искать вес в интернете?
+    Cost-->>Orch: да, Nike публикует характеристики
+    Orch->>Web: найди вес Nike AF1 42 размера
+    Web-->>Orch: 380 грамм (88%)
+    Note over Orch: уверенность = 88% — судью не зовём
     
-    Orch-->>Orch: merge → {size, color, brand, material, weight} ✓
+    Orch-->>Orch: финальный результат: все 5 характеристик готовы
 ```
 
-**Сколько LLM calls:** Description (~3 stage calls) + Classifier (1) + Knowledge (1) + Vision producer (1) + Vision extraction (1) + Vision judge (1) + CostPredictor (1) + WebSearch producer (1) + WebSearch extraction (1) = **~11 calls**.
+**Сколько обращений к ИИ сделано:**
+- Парсер описания: ~3
+- Распределитель: 1
+- Знания ИИ: 1
+- Фото (описание + извлечение + судья): 3
+- Прогноз стоимости: 1
+- Веб (поиск + извлечение): 2
+- **Итого: ~11 обращений на товар**
+
+В разных сценариях это число будет разным — подробный расчёт в [cost-breakdown.md](cost-breakdown.md).
 
 ---
 
-## Class diagram
+## Карта классов (как код устроен)
 
 ```mermaid
 classDiagram
     class AttributeSource {
-        <<abstract>>
+        <<абстрактный>>
         +Source source_type
         +float confidence_threshold
-        +async extract(product, target_attrs) AttributeValue[]
+        +async extract(товар, характеристики) AttributeValue[]
         +get_judge() LlmJudge
     }
     
     class AttributeValue {
         +int attribute_id
-        +Any value
-        +float confidence
-        +Source source
-        +Optional~str~ evidence
-        +bool judge_validated
+        +Any value (значение)
+        +float confidence (уверенность)
+        +Source source (откуда)
+        +Optional~str~ evidence (обоснование)
+        +bool judge_validated (проверено судьёй)
     }
     
     class DescriptionSource {
-        +ai_pipeline existing
-        +threshold 0.95
+        обёртка над существующим ai_pipeline
+        порог уверенности 95%
     }
     
     class LlmKnowledgeSource {
-        +llm_manager
-        +threshold 0.92
+        спрашиваем ИИ из его памяти
+        порог уверенности 92%
     }
     
     class VisionSource {
-        +vision_producer
-        +threshold 0.85
+        анализ фотографий товара
+        порог уверенности 85%
     }
     
     class WebSearchSource {
-        +websearch_producer
-        +threshold 0.88
+        поиск в интернете
+        порог уверенности 88%
     }
     
     class LlmJudge {
-        <<abstract>>
-        +async validate(value, product) bool
+        <<абстрактный>>
+        +async validate(значение, товар) bool
     }
     
     class LlmClassifier {
-        +async classify(unfilled_attrs, product)
+        ИИ-распределитель
+        +async classify(ненайденные_атрибуты, товар)
     }
     
     class CostPredictor {
-        +async is_web_search_worth(product, attrs) bool
+        ИИ-прогнозист стоимости
+        +async is_web_search_worth(товар, атрибуты) bool
     }
     
     class PipelineOrchestrator {
-        +description_source
-        +classifier
-        +knowledge_source
-        +vision_source
-        +websearch_source
-        +cost_predictor
-        +async fill(product, target_attrs) AttributeValue[]
+        главный дирижёр всего pipeline
+        +async fill(товар, характеристики) AttributeValue[]
     }
     
     class ConfidenceAwareJudgeWrapper {
-        +judge
-        +threshold
-        +async maybe_validate(value) AttributeValue
+        обёртка которая решает звать судью или нет
+        +async maybe_validate(значение) AttributeValue
     }
     
     AttributeSource <|-- DescriptionSource
@@ -209,28 +214,28 @@ classDiagram
 
 ---
 
-## Файловая структура
+## Где какие файлы будут лежать
 
 ```
 app/services/enrichment/
-├── base.py                    # AttributeSource ABC + AttributeValue + Source enum + judge interface
-├── pipeline.py                # PipelineOrchestrator (sequential)
+├── base.py                    Базовые типы: AttributeSource, AttributeValue, Source, интерфейс судьи
+├── pipeline.py                Оркестратор — главный дирижёр, запускает этапы по порядку
 │
-├── sources/
+├── sources/                   Источники характеристик — по одному классу на каждый
 │   ├── description_source.py
 │   ├── llm_knowledge_source.py
 │   ├── vision_source.py
 │   └── websearch_source.py
 │
-├── producers/                 ← УЖЕ есть от первого агента
-│   ├── vision_producer.py
-│   └── websearch_producer.py
+├── producers/                 Уже сделано первым агентом
+│   ├── vision_producer.py     (Описывает фото текстом)
+│   └── websearch_producer.py  (Ищет в интернете и возвращает текст)
 │
-├── intelligence/
-│   ├── classifier.py
-│   └── cost_predictor.py
+├── intelligence/              ИИ-агенты которые принимают решения
+│   ├── classifier.py          Распределитель: куда какую характеристику направить
+│   └── cost_predictor.py      Прогнозист: стоит ли запускать веб-поиск
 │
-└── judges/
+└── judges/                    Судьи — у каждого источника свой
     ├── base_judge.py
     ├── description_judge.py
     ├── vision_judge.py
@@ -240,28 +245,37 @@ app/services/enrichment/
 
 ---
 
-## Confidence thresholds (per source)
+## Пороги уверенности для каждого источника
 
-| Source | Threshold | Обоснование |
+| Источник | Порог | Почему такой |
 |---|---|---|
-| DescriptionSource | 0.95 | Самый надёжный — текст конкретного товара. Если LLM сомневается — judge |
-| LlmKnowledgeSource | 0.92 | LLM из памяти может галлюцинировать → строже judge |
-| VisionSource | 0.85 | Vision часто видит атрибут уверенно — низкая планка judge |
-| WebSearchSource | 0.88 | Зависит от качества источников web |
+| Парсер описания | 95% | Самый надёжный — описание про конкретный товар от селлера. Очень редко промахиваемся |
+| Знания ИИ из памяти | 92% | ИИ может выдумывать (галлюцинировать), поэтому строже к нему |
+| Анализ фото | 85% | Фото обычно показывают характеристику явно — порог низкий, чаще доверяем |
+| Веб-поиск | 88% | Зависит от качества источников в интернете — средний порог |
 
-При confidence < threshold → запускается per-source judge (специфичный промпт под failure modes этого source).
+Если уверенность ИИ ниже порога — зовём специального судью именно для этого источника (у него промпт заточен под типичные ошибки этого источника).
 
 ---
 
-## Принцип merge
+## Как объединяем результаты (merge)
+
+Может получиться так, что одну характеристику нашли несколько этапов: например, материал нашёлся и по фото (кожа, уверенность 78%) и в веб-поиске (натуральная кожа, уверенность 90%). Какой вариант выбрать?
 
 ```python
-def merge(branches: list[list[AttributeValue]]) -> list[AttributeValue]:
+def merge(результаты_всех_источников):
     """
-    Для каждого attribute_id: пиксаем вариант с highest confidence.
-    При равной confidence — приоритет по source:
-      DESCRIPTION > VISION > WEBSEARCH > LLM_KNOWLEDGE
+    Для каждой характеристики берём вариант с наибольшей уверенностью.
+    Если уверенность одинаковая — приоритет по источнику:
+      Описание > Фото > Веб > Знания ИИ
     """
 ```
 
-Эта приоритизация отражает «насколько источник был привязан к конкретному товару»: description у нас по конкретному товару от селлера, vision — по фото этого товара, websearch — найдено в инете о товаре, knowledge — общие знания LLM.
+Почему такой приоритет источников при равной уверенности? От самого «привязанного к конкретному товару» к самому общему:
+
+- **Описание** — конкретно про этот товар от селлера, самое релевантное
+- **Фото** — конкретно про этот товар, но визуально (может не быть видно деталей)
+- **Веб-поиск** — про этот товар или аналог, но из внешних источников
+- **Знания ИИ** — общие знания о категории, наименее привязанные
+
+В нашем примере с материалом победит веб (90% > 78%), даже несмотря на то что фото — выше по приоритету. Уверенность важнее при разнице.
