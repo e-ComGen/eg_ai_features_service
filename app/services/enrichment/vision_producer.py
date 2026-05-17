@@ -3,11 +3,18 @@ VisionProducer — 1 LLM call: image_urls → textual product description.
 
 Produces plain text only. Structured attribute extraction is done by a
 separate extraction step downstream (see job_processor._extract_attrs_from_text).
+
+Provider selection is config-driven (PROVIDER_VISION / VISION_MODEL).
+Default: OpenRouter → google/gemini-2.5-flash (cheap, multimodal).
+Fallback: PROVIDER_VISION=openai → existing gpt-4o path.
 """
 
 import asyncio
 import logging
 from typing import Optional
+
+from app import config
+from app.services.providers.base import LlmProvider
 
 logger = logging.getLogger(__name__)
 
@@ -37,16 +44,40 @@ class VisionProducer:
     The returned text is suitable for passing to an extraction step that
     pulls structured attribute values out of it.  This class intentionally
     does NOT return structured attrs — that is a separate concern.
+
+    Accepts either:
+    * An LlmProvider instance (new API — used when PROVIDER_VISION is set)
+    * A legacy llm_manager with .client attribute (old OpenAI path — backward compat)
     """
 
-    def __init__(self, llm_manager, model: str = "gpt-4o"):
-        """
-        Args:
-            llm_manager: OpenAIManager instance (provides .client: AsyncOpenAI).
-            model: Vision-capable model identifier.  Defaults to gpt-4o.
-        """
-        self.client = llm_manager.client
-        self.model = model
+    def __init__(
+        self,
+        # First positional arg accepts either an LlmProvider or a legacy llm_manager.
+        # Legacy tests pass an object with a .client attribute as the first arg.
+        provider_or_manager=None,
+        model: Optional[str] = None,
+    ):
+        if provider_or_manager is None:
+            # Auto-construct from config (preferred for production)
+            from app.services.providers.factory import get_vision_provider
+            self._provider = get_vision_provider()
+            self._model = model or config.VISION_MODEL
+            self._legacy_client = None
+        elif isinstance(provider_or_manager, LlmProvider):
+            # New path: explicit LlmProvider (OpenRouter, OpenAI adapter, etc.)
+            self._provider = provider_or_manager
+            self._model = model or config.VISION_MODEL
+            self._legacy_client = None
+        elif hasattr(provider_or_manager, 'client'):
+            # Legacy path: llm_manager with .client (old OpenAI direct call)
+            self._provider = None
+            self._legacy_client = provider_or_manager.client
+            self._model = model or "gpt-4o"
+        else:
+            raise TypeError(
+                f"VisionProducer: expected LlmProvider or llm_manager with .client, "
+                f"got {type(provider_or_manager).__name__}"
+            )
 
     async def produce_description(
         self,
@@ -95,16 +126,33 @@ class VisionProducer:
         ]
 
         try:
-            response = await asyncio.wait_for(
-                self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=0.1,
-                    max_tokens=512,
-                ),
-                timeout=timeout,
-            )
-            text = (response.choices[0].message.content or "").strip()
+            if self._provider is not None:
+                # New path: use LlmProvider.complete()
+                # Gemini 2.5 Flash via OpenRouter accepts OpenAI-format image_url content.
+                llm_resp = await asyncio.wait_for(
+                    self._provider.complete(
+                        messages=messages,
+                        model=self._model,
+                        temperature=0.1,
+                        max_tokens=512,
+                        timeout=timeout,
+                    ),
+                    timeout=timeout,
+                )
+                text = (llm_resp.content or "").strip()
+            else:
+                # Legacy path: direct AsyncOpenAI client call
+                response = await asyncio.wait_for(
+                    self._legacy_client.chat.completions.create(
+                        model=self._model,
+                        messages=messages,
+                        temperature=0.1,
+                        max_tokens=512,
+                    ),
+                    timeout=timeout,
+                )
+                text = (response.choices[0].message.content or "").strip()
+
             if not text:
                 logger.warning("VisionProducer: empty response from model.")
                 return None
