@@ -1,10 +1,9 @@
 from typing import Any
-from ..services.llm_manager import OpenAIManager
 from .judge_profile import JudgeProfile
 
 
 class HallucinationJudge:
-    def __init__(self, llm_manager: OpenAIManager):
+    def __init__(self, llm_manager):
         self.llm = llm_manager
 
     async def execute_audit(self, text: str, feature_name: str, extracted_value: Any, profile: JudgeProfile) -> tuple[

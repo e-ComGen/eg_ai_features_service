@@ -1,25 +1,36 @@
 import csv
 import os
 import datetime
-from typing import Optional
+from typing import Optional, Union
 from .llm_manager import OpenAIManager
 from .tree_router import TreeRouter
 from .web_search import WebSearchService
 from ..models import ResearchMode
 from ..strategies.base import DeductionResult
 from ..judge.judge import HallucinationJudge
+from ..config import OPENAI_API_KEY
 
 class AiFeaturePipeline:
 
-    def __init__(self, llm_manager: OpenAIManager,
+    def __init__(self, llm_manager,
                  web_search_model: str = "gpt-4o",
                  web_search_max_concurrent: int = 10):
         self.llm = llm_manager
-        self.router = TreeRouter(llm_manager.client)
+        # TreeRouter needs a raw AsyncOpenAI client for beta.chat.completions.parse.
+        # If llm_manager is a StructuredLlmManager or similar (no .client attr),
+        # fall back to a dedicated OpenAIManager for routing only.
+        if hasattr(llm_manager, 'client'):
+            router_client = llm_manager.client
+        else:
+            # New provider path: construct a lightweight OpenAIManager just for routing.
+            _openai_mgr = OpenAIManager(api_key=OPENAI_API_KEY)
+            router_client = _openai_mgr.client
+        self.router = TreeRouter(router_client)
         self.deduction_log_file = "deductions_log.csv"
         self.judge = HallucinationJudge(self.llm)
+        # WebSearchService also needs raw AsyncOpenAI client (Responses API).
         self.web_search = WebSearchService(
-            client=llm_manager.client,
+            client=router_client,
             model=web_search_model,
             max_concurrent=web_search_max_concurrent,
         )
