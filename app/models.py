@@ -2,7 +2,7 @@
 
 from enum import Enum
 from typing import List, Dict, Any, Optional, Union
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, AnyHttpUrl, field_validator
 
 
 class ResearchMode(str, Enum):
@@ -36,6 +36,17 @@ class ProductData(BaseModel):
     price: Union[float, int, str, None] = 0.0
     context: ProductContext
     languages: List[str] = ["en"]
+    source_urls: List[str] = Field(default_factory=list)
+
+    @field_validator("source_urls")
+    @classmethod
+    def validate_source_urls(cls, v: List[str]) -> List[str]:
+        if len(v) > 5:
+            raise ValueError("source_urls: maximum 5 URLs per product")
+        for url in v:
+            if not url.startswith("https://"):
+                raise ValueError(f"source_urls: only HTTPS URLs allowed, got: {url!r}")
+        return v
 
 
 class BatchPayload(BaseModel):
