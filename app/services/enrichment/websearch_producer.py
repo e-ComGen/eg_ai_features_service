@@ -1,17 +1,19 @@
 """
-WebSearchProducer — 1 LLM call with web_search tool: product identifiers →
-textual summary of web-found characteristics.
+WebSearchProducer — product identifiers → textual summary of web-found characteristics.
 
 Produces plain text only.  Structured attribute extraction is done
 by a separate extraction step downstream.
 
-Reuses the OpenAI Responses API (same approach as web_search.py) but
-with a product-level query rather than a per-feature one.
+Provider selection is config-driven (PROVIDER_WEB_SEARCH):
+  "serper"  → Serper Google Search API + LLM extraction (cheap, ~$0.001/query)
+  "openai"  → existing OpenAI Responses API with web_search tool (fallback)
 """
 
 import asyncio
 import logging
 from typing import Optional
+
+from app import config
 
 logger = logging.getLogger(__name__)
 
@@ -27,23 +29,73 @@ _WS_USER_TEMPLATE = (
     "If you cannot find reliable information, state that explicitly — do NOT invent specs."
 )
 
+_SERPER_EXTRACTION_SYSTEM = (
+    "You are a product data extractor. "
+    "Below are web search snippets about a specific product. "
+    "Extract and summarise the technical characteristics and specifications you find "
+    "(dimensions, weight, material, colour, capacity, power, connectivity, etc.). "
+    "Write a concise plain-text summary. "
+    "Do NOT invent any specs not present in the snippets. "
+    "If the snippets don't contain useful data, say so explicitly."
+)
+
 
 class WebSearchProducer:
-    """1 LLM call with web_search tool: product identifiers → textual summary.
+    """product identifiers → plain-text summary of web-found characteristics.
 
     The returned text is suitable for passing to an extraction step that
     pulls structured attribute values out of it.  This class intentionally
     does NOT return structured attrs — that is a separate concern.
+
+    Accepts:
+    * provider=None, serper_client=None → auto-detect from config
+    * serper_client + extractor_manager → Serper path
+    * llm_manager (legacy) → OpenAI Responses API path
     """
 
-    def __init__(self, llm_manager, model: str = "gpt-4o"):
-        """
-        Args:
-            llm_manager: OpenAIManager instance (provides .client: AsyncOpenAI).
-            model: Model that supports the web_search tool (e.g. gpt-4o).
-        """
-        self.client = llm_manager.client
-        self.model = model
+    def __init__(
+        self,
+        # Legacy param: llm_manager with .client (OpenAI Responses API).
+        # When provided explicitly, always uses the legacy OpenAI Responses API path,
+        # regardless of config.PROVIDER_WEB_SEARCH (backward compat for tests/old callers).
+        llm_manager=None,
+        model: str = "gpt-4o",
+        # New params: explicit provider objects (used in tests / production)
+        serper_client=None,
+        extractor_manager=None,
+    ):
+        if serper_client is not None:
+            # Explicitly injected Serper client (e.g. from tests)
+            self._serper = serper_client
+            self._extractor = extractor_manager
+            self._use_serper = True
+            self._legacy_client = None
+            self._legacy_model = model
+        elif llm_manager is not None:
+            # Legacy path: explicit llm_manager — always use OpenAI Responses API.
+            # This preserves backward compatibility (existing tests, old callers).
+            self._legacy_client = llm_manager.client
+            self._legacy_model = model
+            self._use_serper = False
+            self._serper = None
+            self._extractor = None
+        elif config.PROVIDER_WEB_SEARCH == "serper":
+            # Auto-construct Serper path from config
+            from app.services.providers.factory import get_web_search_client, get_main_manager
+            self._serper = get_web_search_client()
+            self._extractor = get_main_manager()
+            self._use_serper = True
+            self._legacy_client = None
+            self._legacy_model = model
+        else:
+            # Auto-construct legacy path (OpenAI Responses API)
+            from app.services.llm_manager import OpenAIManager
+            mgr = OpenAIManager(api_key=config.OPENAI_API_KEY)
+            self._legacy_client = mgr.client
+            self._legacy_model = model
+            self._use_serper = False
+            self._serper = None
+            self._extractor = None
 
     async def produce_summary(
         self,
@@ -61,6 +113,139 @@ class WebSearchProducer:
             logger.debug("WebSearchProducer: no product_name provided, skipping.")
             return None
 
+        if self._use_serper:
+            return await self._produce_via_serper(product_name, brand, ean, timeout)
+        else:
+            return await self._produce_via_openai(product_name, brand, ean, timeout)
+
+    # ------------------------------------------------------------------
+    # Serper path: Google search + LLM extraction
+    # ------------------------------------------------------------------
+    async def _produce_via_serper(
+        self,
+        product_name: str,
+        brand: Optional[str],
+        ean: Optional[str],
+        timeout: int,
+    ) -> Optional[str]:
+        # Build search query
+        parts = [product_name]
+        if brand:
+            parts.append(brand)
+        if ean:
+            parts.append(ean)
+        query = " ".join(parts) + " характеристики технические"
+
+        try:
+            results = await asyncio.wait_for(
+                self._serper.search(query, num_results=5),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "WebSearchProducer (serper): search timed out after %ds for %r.",
+                timeout,
+                product_name,
+            )
+            return None
+        except Exception as exc:
+            logger.error("WebSearchProducer (serper): search failed: %s", exc)
+            return None
+
+        if not results.organic_results:
+            logger.warning(
+                "WebSearchProducer (serper): no organic results for %r.", product_name
+            )
+            return None
+
+        # Build context from top snippets
+        snippets = [
+            f"[{r.position}] {r.title}\n{r.snippet}"
+            for r in results.organic_results[:5]
+        ]
+        search_context = "\n\n".join(snippets)
+
+        # 1 LLM call: extract characteristics from snippets
+        user_text = (
+            f"Товар: {product_name}"
+            + (f"\nБренд: {brand}" if brand else "")
+            + (f"\nEAN: {ean}" if ean else "")
+            + f"\n\nНайденные фрагменты:\n{search_context}"
+        )
+
+        if self._extractor is None:
+            logger.error(
+                "WebSearchProducer (serper): extractor_manager is None, cannot extract."
+            )
+            return None
+
+        try:
+            # extractor_manager exposes structured_request() OR complete()
+            if hasattr(self._extractor, "complete"):
+                from app.services.providers.base import LlmProvider
+                if isinstance(self._extractor, LlmProvider):
+                    llm_resp = await asyncio.wait_for(
+                        self._extractor.complete(
+                            messages=[
+                                {"role": "system", "content": _SERPER_EXTRACTION_SYSTEM},
+                                {"role": "user", "content": user_text},
+                            ],
+                            model=config.EXTRACTION_FROM_TEXT_MODEL,
+                            temperature=0.1,
+                            max_tokens=1024,
+                        ),
+                        timeout=timeout,
+                    )
+                    text = (llm_resp.content or "").strip()
+                    if not text:
+                        logger.warning(
+                            "WebSearchProducer (serper): empty extraction result for %r.",
+                            product_name,
+                        )
+                        return None
+                    return text
+
+            # StructuredLlmManager / OpenAIManager path — use complete() via provider
+            # Fall through to direct provider call
+            from app.services.providers.factory import _make_raw_provider
+            from app import config as _cfg
+            raw_provider = _make_raw_provider(_cfg.PROVIDER_MAIN)
+            llm_resp = await asyncio.wait_for(
+                raw_provider.complete(
+                    messages=[
+                        {"role": "system", "content": _SERPER_EXTRACTION_SYSTEM},
+                        {"role": "user", "content": user_text},
+                    ],
+                    model=config.EXTRACTION_FROM_TEXT_MODEL,
+                    temperature=0.1,
+                    max_tokens=1024,
+                ),
+                timeout=timeout,
+            )
+            text = (llm_resp.content or "").strip()
+            if not text:
+                return None
+            return text
+
+        except asyncio.TimeoutError:
+            logger.warning(
+                "WebSearchProducer (serper): extraction timed out for %r.", product_name
+            )
+            return None
+        except Exception as exc:
+            logger.error("WebSearchProducer (serper): extraction failed: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # Legacy path: OpenAI Responses API with web_search tool
+    # ------------------------------------------------------------------
+    async def _produce_via_openai(
+        self,
+        product_name: str,
+        brand: Optional[str],
+        ean: Optional[str],
+        timeout: int,
+    ) -> Optional[str]:
         brand_line = f"Brand: {brand}\n" if brand else ""
         ean_line = f"EAN / barcode: {ean}\n" if ean else ""
 
@@ -72,8 +257,8 @@ class WebSearchProducer:
 
         try:
             response = await asyncio.wait_for(
-                self.client.responses.create(
-                    model=self.model,
+                self._legacy_client.responses.create(
+                    model=self._legacy_model,
                     input=query,
                     tools=[{"type": "web_search"}],
                 ),
@@ -81,20 +266,19 @@ class WebSearchProducer:
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "WebSearchProducer: timed out after %ds for product %r.",
+                "WebSearchProducer (openai): timed out after %ds for product %r.",
                 timeout,
                 product_name,
             )
             return None
         except Exception as exc:
-            logger.error("WebSearchProducer: Responses API call failed: %s", exc)
+            logger.error("WebSearchProducer (openai): Responses API call failed: %s", exc)
             return None
 
-        # Extract plain text answer from the Responses API output.
         answer_text = (getattr(response, "output_text", "") or "").strip()
         if not answer_text:
             logger.warning(
-                "WebSearchProducer: empty response for product %r.", product_name
+                "WebSearchProducer (openai): empty response for product %r.", product_name
             )
             return None
 
