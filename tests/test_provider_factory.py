@@ -38,11 +38,15 @@ class TestGetMainManager:
         from app.services.providers.factory import get_main_manager
         from app.services.providers.deepseek_provider import DeepSeekProvider
 
+        mock_provider = MagicMock(spec=LlmProvider)
+        mock_provider.name = "deepseek"
+
         with patch("app.services.providers.factory.config") as mock_cfg, \
              patch("app.services.providers.factory.DeepSeekProvider") as MockDS:
             mock_cfg.PROVIDER_MAIN = "deepseek"
             mock_cfg.MAIN_MODEL = "deepseek-v4-flash"
-            MockDS.return_value = MagicMock(spec=LlmProvider)
+            mock_cfg.ENABLE_OPENAI_FALLBACK = False
+            MockDS.return_value = mock_provider
 
             result = get_main_manager()
 
@@ -53,11 +57,15 @@ class TestGetMainManager:
         """When PROVIDER_MAIN=openrouter, a StructuredLlmManager wrapping OpenRouterProvider is returned."""
         from app.services.providers.factory import get_main_manager
 
+        mock_provider = MagicMock(spec=LlmProvider)
+        mock_provider.name = "openrouter"
+
         with patch("app.services.providers.factory.config") as mock_cfg, \
              patch("app.services.providers.factory.OpenRouterProvider") as MockOR:
             mock_cfg.PROVIDER_MAIN = "openrouter"
             mock_cfg.MAIN_MODEL = "google/gemini-2.5-flash"
-            MockOR.return_value = MagicMock(spec=LlmProvider)
+            mock_cfg.ENABLE_OPENAI_FALLBACK = False
+            MockOR.return_value = mock_provider
 
             result = get_main_manager()
 
@@ -82,20 +90,24 @@ class TestGetMainManager:
 
 class TestGetVisionProvider:
     def test_returns_openrouter_for_openrouter(self):
-        """PROVIDER_VISION=openrouter → OpenRouterProvider."""
+        """PROVIDER_VISION=openrouter → OpenRouterProvider (possibly wrapped in FallbackProvider)."""
         from app.services.providers.factory import get_vision_provider
         from app.services.providers.openrouter_provider import OpenRouterProvider
+
+        mock_provider = MagicMock(spec=LlmProvider)
+        mock_provider.name = "openrouter"
 
         with patch("app.services.providers.factory.config") as mock_cfg, \
              patch("app.services.providers.factory.OpenRouterProvider") as MockOR:
             mock_cfg.PROVIDER_VISION = "openrouter"
             mock_cfg.VISION_MODEL = "google/gemini-2.5-flash"
-            MockOR.return_value = MagicMock(spec=LlmProvider)
+            mock_cfg.ENABLE_OPENAI_FALLBACK = False
+            MockOR.return_value = mock_provider
 
             result = get_vision_provider()
 
         MockOR.assert_called_once()
-        assert result is MockOR.return_value
+        assert result is mock_provider
 
     def test_returns_openai_adapter_for_openai(self):
         """PROVIDER_VISION=openai → OpenAIProviderAdapter wrapping OpenAIManager."""
