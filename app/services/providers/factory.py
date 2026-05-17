@@ -1,0 +1,138 @@
+"""Provider factory — returns the correct backend based on config settings.
+
+All provider selection is config-driven (PROVIDER_MAIN, PROVIDER_VISION,
+PROVIDER_WEB_SEARCH env vars).  Callers import get_main_manager(),
+get_vision_provider(), get_web_search_provider() — never instantiate
+providers directly.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+from app import config
+from .base import LlmProvider
+from .deepseek_provider import DeepSeekProvider
+from .openrouter_provider import OpenRouterProvider
+from .serper_client import SerperClient
+from .structured_adapter import StructuredLlmManager
+
+if TYPE_CHECKING:
+    from ..llm_manager import OpenAIManager
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Main LLM — used by AiPipeline (parser, deduction, judge, extraction)
+# Returns a StructuredLlmManager that exposes structured_request()
+# compatible with the existing pipeline interface.
+# ---------------------------------------------------------------------------
+
+def get_main_manager(openai_manager: "OpenAIManager | None" = None) -> "StructuredLlmManager | OpenAIManager":
+    """Return a structured_request()-compatible manager for the main pipeline.
+
+    When PROVIDER_MAIN="openai" the existing openai_manager is returned as-is
+    (it already has structured_request()).  For other providers, a
+    StructuredLlmManager wrapping the selected LlmProvider is returned.
+
+    Args:
+        openai_manager: The existing OpenAIManager instance.  Required only
+            when PROVIDER_MAIN="openai".
+    """
+    provider_name = config.PROVIDER_MAIN
+    model = config.MAIN_MODEL
+
+    if provider_name == "openai":
+        if openai_manager is None:
+            # Lazy import to avoid circular dependency
+            from ..llm_manager import OpenAIManager
+            openai_manager = OpenAIManager(api_key=config.OPENAI_API_KEY)
+        logger.info("Main provider: openai (gpt-4o-mini via structured parse)")
+        return openai_manager
+
+    provider = _make_raw_provider(provider_name)
+    logger.info("Main provider: %s, model: %s", provider_name, model)
+    return StructuredLlmManager(provider=provider, model=model)
+
+
+# ---------------------------------------------------------------------------
+# Vision LLM — used by VisionProducer
+# Returns a plain LlmProvider (complete() only — no structured parse needed)
+# ---------------------------------------------------------------------------
+
+def get_vision_provider() -> LlmProvider:
+    """Return a vision-capable LlmProvider based on PROVIDER_VISION."""
+    provider_name = config.PROVIDER_VISION
+
+    if provider_name == "openrouter":
+        logger.info("Vision provider: openrouter, model: %s", config.VISION_MODEL)
+        return OpenRouterProvider()
+
+    if provider_name == "openai":
+        # Wrap OpenAIManager client into a thin LlmProvider
+        from ..llm_manager import OpenAIManager
+        from .openai_adapter import OpenAIProviderAdapter
+        manager = OpenAIManager(api_key=config.OPENAI_API_KEY)
+        logger.info("Vision provider: openai (gpt-4o via chat.completions.create)")
+        return OpenAIProviderAdapter(manager)
+
+    raise ValueError(
+        f"Unknown PROVIDER_VISION={provider_name!r}. "
+        "Valid values: 'openrouter', 'openai'."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Web search — used by WebSearchProducer
+# Returns either SerperClient or None (None means use existing OpenAI path)
+# ---------------------------------------------------------------------------
+
+def get_web_search_client() -> "SerperClient | None":
+    """Return SerperClient when PROVIDER_WEB_SEARCH='serper', else None.
+
+    When None is returned, WebSearchProducer falls back to the existing
+    OpenAI Responses API path (web_search.py).
+    """
+    if config.PROVIDER_WEB_SEARCH == "serper":
+        logger.info("Web search provider: serper")
+        return SerperClient()
+    logger.info("Web search provider: openai (existing Responses API)")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Extraction LLM — used for text extracted from vision/web search results
+# (same provider as main but model may differ)
+# ---------------------------------------------------------------------------
+
+def get_extraction_manager() -> "StructuredLlmManager | OpenAIManager":
+    """Return a structured_request()-compatible manager for post-enrichment extraction.
+
+    Uses PROVIDER_MAIN backend but EXTRACTION_FROM_TEXT_MODEL model.
+    """
+    provider_name = config.PROVIDER_MAIN
+    model = config.EXTRACTION_FROM_TEXT_MODEL
+
+    if provider_name == "openai":
+        from ..llm_manager import OpenAIManager
+        return OpenAIManager(api_key=config.OPENAI_API_KEY)
+
+    provider = _make_raw_provider(provider_name)
+    return StructuredLlmManager(provider=provider, model=model)
+
+
+# ---------------------------------------------------------------------------
+# Internal helper
+# ---------------------------------------------------------------------------
+
+def _make_raw_provider(provider_name: str) -> LlmProvider:
+    if provider_name == "deepseek":
+        return DeepSeekProvider()
+    if provider_name == "openrouter":
+        return OpenRouterProvider()
+    raise ValueError(
+        f"Unknown provider {provider_name!r}. "
+        "Valid values: 'deepseek', 'openrouter', 'openai'."
+    )
