@@ -38,6 +38,17 @@ PREMIUM_MODEL: str = os.getenv("PREMIUM_MODEL", "deepseek-v4-pro")
 VISION_MODEL: str = os.getenv("VISION_MODEL", "google/gemini-2.5-flash")
 EXTRACTION_FROM_TEXT_MODEL: str = os.getenv("EXTRACTION_FROM_TEXT_MODEL", "deepseek-v4-flash")
 
+# Tree routing — defaults to the same provider/model as PROVIDER_MAIN
+PROVIDER_ROUTER: str = os.getenv("PROVIDER_ROUTER", os.getenv("PROVIDER_MAIN", "deepseek"))
+ROUTER_MODEL: str = os.getenv("ROUTER_MODEL", os.getenv("MAIN_MODEL", "deepseek-v4-flash"))
+
+# ---------------------------------------------------------------------------
+# Fallback to OpenAI on transient provider errors
+# ---------------------------------------------------------------------------
+ENABLE_OPENAI_FALLBACK: bool = os.getenv("ENABLE_OPENAI_FALLBACK", "true").lower() in ("1", "true", "yes")
+OPENAI_FALLBACK_MODEL: str = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-4o-mini")
+OPENAI_FALLBACK_MODEL_VISION: str = os.getenv("OPENAI_FALLBACK_MODEL_VISION", "gpt-4o")
+
 # Vague / placeholder feature names that must NEVER trigger an LLM call.
 # These are operator-defined placeholders (e.g. "NewFeature" from CS-Cart's
 # default schema templates) — extracting any value for them would be a
