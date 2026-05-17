@@ -46,6 +46,25 @@ async def main():
 
     print("\nDone.")
 
+    print("\n=== Pipeline E2E mini-smoke ===")
+    try:
+        from app.services.enrichment.pipeline import PipelineOrchestrator
+        from app.services.enrichment.base import ExtractionContext, TargetAttribute, Source
+
+        orch = PipelineOrchestrator()
+        ctx = ExtractionContext(
+            product_id=1, product_name="Test pen",
+            product_description="Blue ballpoint pen, plastic body.",
+            category_id=1
+        )
+        targets = [TargetAttribute(id=1, name="Color", type="text", semantic_type="color")]
+        result = await orch.enrich(ctx, targets)
+        print(f"[OK] Pipeline e2e: {len(result)} attrs filled, {ctx.llm_calls_so_far} LLM calls")
+        for v in result[:3]:
+            print(f"     [{v.source.value}] {v.value!r} (conf {v.confidence:.2f})")
+    except Exception as e:
+        print(f"[FAIL] Pipeline e2e: {type(e).__name__}: {e}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
