@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from fastapi import FastAPI, Depends
 from .security import verify_internal_token
 from .models import BatchPayload
@@ -8,7 +9,11 @@ from .services.llm_manager import OpenAIManager
 from .services.job_processor import JobProcessor
 from .services.ai_pipeline import AiFeaturePipeline
 from .services.matcher import MatcherService
-from .config import OPENAI_API_KEY, WEB_SEARCH_MODEL, WEB_SEARCH_MAX_CONCURRENT
+from .services.enrichment import VisionProducer, WebSearchProducer
+from .services.providers.factory import get_main_manager, get_vision_provider, get_web_search_client
+from .config import OPENAI_API_KEY, WEB_SEARCH_MODEL, WEB_SEARCH_MAX_CONCURRENT, PROVIDER_MAIN
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AI Worker")
 
@@ -16,14 +21,37 @@ GLOBAL_LIMIT = 50
 global_semaphore = asyncio.Semaphore(GLOBAL_LIMIT)
 
 db_cache = DatabaseCacheManager()
-llm_manager = OpenAIManager(api_key=OPENAI_API_KEY)
+
+# OpenAIManager is always constructed — it owns the raw AsyncOpenAI client used
+# by TreeRouter (beta.chat.completions.parse) and as openai fallback.
+openai_manager = OpenAIManager(api_key=OPENAI_API_KEY)
+
+# Main LLM manager: config-driven (DeepSeek / OpenRouter / OpenAI fallback).
+# Returns StructuredLlmManager (new providers) or OpenAIManager (PROVIDER_MAIN=openai).
+main_llm_manager = get_main_manager(openai_manager=openai_manager)
+logger.info("Using main LLM provider: %s", PROVIDER_MAIN)
+
+# AiFeaturePipeline still receives the manager via its constructor.
+# TreeRouter always uses openai_manager.client (beta.parse) — not swapped here.
 pipeline = AiFeaturePipeline(
-    llm_manager,
+    main_llm_manager,
     web_search_model=WEB_SEARCH_MODEL,
     web_search_max_concurrent=WEB_SEARCH_MAX_CONCURRENT,
 )
+
+# Enrichment producers wired to config-selected providers.
+vision_producer = VisionProducer()        # auto-detects PROVIDER_VISION from config
+websearch_producer = WebSearchProducer()  # auto-detects PROVIDER_WEB_SEARCH from config
+
 matcher = MatcherService(None)
-processor = JobProcessor(pipeline, db_cache, matcher, global_semaphore)
+processor = JobProcessor(
+    pipeline,
+    db_cache,
+    matcher,
+    global_semaphore,
+    vision_producer=vision_producer,
+    websearch_producer=websearch_producer,
+)
 
 
 @app.on_event("startup")
