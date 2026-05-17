@@ -9,28 +9,41 @@ from ..models import ResearchMode
 from ..strategies.base import DeductionResult
 from ..judge.judge import HallucinationJudge
 from ..config import OPENAI_API_KEY
+from .providers.structured_adapter import StructuredLlmManager
 
 class AiFeaturePipeline:
 
     def __init__(self, llm_manager,
                  web_search_model: str = "gpt-4o",
-                 web_search_max_concurrent: int = 10):
+                 web_search_max_concurrent: int = 10,
+                 router_manager=None):
         self.llm = llm_manager
-        # TreeRouter needs a raw AsyncOpenAI client for beta.chat.completions.parse.
-        # If llm_manager is a StructuredLlmManager or similar (no .client attr),
-        # fall back to a dedicated OpenAIManager for routing only.
-        if hasattr(llm_manager, 'client'):
-            router_client = llm_manager.client
+        # TreeRouter uses StructuredLlmManager (provider-agnostic).
+        # router_manager can be injected explicitly (e.g. for tests or a dedicated routing model).
+        # If not provided, we reuse llm_manager when it's already a StructuredLlmManager,
+        # otherwise fall back to a lightweight OpenAI-backed manager for routing.
+        if router_manager is not None:
+            routing_manager = router_manager
+        elif isinstance(llm_manager, StructuredLlmManager):
+            routing_manager = llm_manager
         else:
-            # New provider path: construct a lightweight OpenAIManager just for routing.
-            _openai_mgr = OpenAIManager(api_key=OPENAI_API_KEY)
-            router_client = _openai_mgr.client
-        self.router = TreeRouter(router_client)
+            # Legacy: llm_manager is an OpenAIManager — wrap it in StructuredLlmManager.
+            from .providers.openai_adapter import OpenAIProviderAdapter
+            from .providers.structured_adapter import StructuredLlmManager as _SM
+            _adapter = OpenAIProviderAdapter(llm_manager)
+            routing_manager = _SM(provider=_adapter, model="gpt-4o-mini")
+        self.router = TreeRouter(routing_manager)
         self.deduction_log_file = "deductions_log.csv"
         self.judge = HallucinationJudge(self.llm)
-        # WebSearchService also needs raw AsyncOpenAI client (Responses API).
+        # WebSearchService needs a raw AsyncOpenAI client (Responses API).
+        # Build a dedicated OpenAI client for this purpose.
+        if hasattr(llm_manager, 'client'):
+            ws_client = llm_manager.client
+        else:
+            _openai_mgr = OpenAIManager(api_key=OPENAI_API_KEY)
+            ws_client = _openai_mgr.client
         self.web_search = WebSearchService(
-            client=router_client,
+            client=ws_client,
             model=web_search_model,
             max_concurrent=web_search_max_concurrent,
         )

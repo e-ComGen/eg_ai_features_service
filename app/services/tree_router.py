@@ -7,14 +7,15 @@ from typing import Type
 from pydantic import BaseModel, Field
 from ..strategies.base import BaseStrategyNode
 from ..strategies.definitions.root import RootStrategy
+from .providers.structured_adapter import StructuredLlmManager
 
 class RoutingDecision(BaseModel):
     selected_name: str = Field(..., description="The exact name of the selected child node.")
     reasoning: str = Field(..., description="Explain WHY you chose this node based on the product context.")
 
 class TreeRouter:
-    def __init__(self, client):
-        self.client = client
+    def __init__(self, llm_manager: StructuredLlmManager):
+        self.llm_manager = llm_manager
         self.log_file = "tree_traversal_log.csv"
         self._load_all_strategies()
         self._init_log()
@@ -69,14 +70,16 @@ class TreeRouter:
         )
 
         try:
-            decision = await self.client.beta.chat.completions.parse(
-                model="gpt-4o-mini",
-                messages=[{"role": "system", "content": sys_msg}, {"role": "user", "content": "Analyze and route."}],
-                response_format=RoutingDecision,
-                temperature=0.0
+            parsed, _tokens = await self.llm_manager.structured_request(
+                system_prompt=sys_msg,
+                user_text="Analyze and route.",
+                response_model=RoutingDecision,
             )
 
-            parsed = decision.choices[0].message.parsed
+            if parsed is None:
+                print(f"⚠️ Router: structured_request returned None. Fallback.")
+                return "Extract value directly.", {}, None
+
             target_name = parsed.selected_name
             reasoning = parsed.reasoning
 
