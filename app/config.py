@@ -6,6 +6,18 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 INTERNAL_SERVICE_SECRET = os.getenv("INTERNAL_SERVICE_SECRET", "")
 
+# --- Cheap LLM providers (Tier 1 cost reduction) ---
+# DeepSeek: env var is DEEP_SEEK_API_KEY (user convention)
+DEEPSEEK_API_KEY = os.getenv("DEEP_SEEK_API_KEY", "")
+DEEPSEEK_DEFAULT_MODEL = os.getenv("DEEPSEEK_DEFAULT_MODEL", "deepseek-v4-flash")
+DEEPSEEK_PRO_MODEL = os.getenv("DEEPSEEK_PRO_MODEL", "deepseek-v4-pro")
+
+# OpenRouter: env var is OPEN_ROUTER_API_KEY (user convention)
+OPENROUTER_API_KEY = os.getenv("OPEN_ROUTER_API_KEY", "")
+
+# Serper web search API
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
+
 WEB_SEARCH_MODEL = os.getenv("WEB_SEARCH_MODEL", "gpt-4o")
 WEB_SEARCH_MAX_CONCURRENT = int(os.getenv("WEB_SEARCH_MAX_CONCURRENT", "10"))
 
