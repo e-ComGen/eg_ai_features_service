@@ -5,6 +5,7 @@ import re
 from .ai_pipeline import AiFeaturePipeline
 from .db_cache import DatabaseCacheManager
 from .matcher import MatcherService
+from .url_fetcher import fetch_all
 from ..models import ProductData, FeatureOption, ResearchMode
 from ..database import AsyncSessionLocal
 from ..config import VAGUE_FEATURE_PATTERNS
@@ -51,7 +52,21 @@ class JobProcessor:
         total_tokens_used = 0
         is_fully_cached = True
 
-        info = f"Title: {product.name}\nDescription: {product.description[:10000]}"
+        # --- Web-fetch enrichment (Stage 2) ---
+        # Fetch supplier/competitor URLs in parallel and inject into description.
+        # Failures are non-fatal: pipeline continues with whatever was fetched.
+        fetched_content = ""
+        if getattr(product, "source_urls", None):
+            try:
+                fetched_content = await fetch_all(product.source_urls)
+            except Exception as _fetch_exc:
+                logger.warning("fetch_all failed entirely, continuing without URL content: %s", _fetch_exc)
+
+        description = product.description or ""
+        if fetched_content:
+            description = f"{description}\n\n=== Sourced from URLs ===\n{fetched_content}"
+
+        info = f"Title: {product.name}\nDescription: {description[:50000]}"
         context_hash = f"{product.name} {product.description}"
 
         async def process_feature(f_name, f_schema):
