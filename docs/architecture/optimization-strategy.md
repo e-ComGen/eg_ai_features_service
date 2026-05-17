@@ -8,14 +8,28 @@
 
 ## Главное открытие
 
-**DeepSeek V3 (api.deepseek.com)** — глобальная top-tier модель, которая:
-- Стоит **$0.14/$0.28 за 1M tokens** (input/output)
-- В **17-35 раз дешевле GPT-4o** ($2.50/$10)
-- **Бьёт GPT-4o на 22 из 26 бенчмарков** (MMLU 88.5, MMLU-Pro 75.9, GPQA 59.1)
-- Имеет нативный JSON mode + кэширование (-50% на cache-hit)
-- V3.2 заявляет «GPT-5 class» на математических соревнованиях
+**DeepSeek V4 (api.deepseek.com)** — глобальная top-tier модель, доступная в двух размерах:
 
-Это означает что переход с GPT-4o на DeepSeek V3 — **не downgrade, а upgrade** по качеству при цене в 17 раз ниже. Меняет всю экономику SaaS.
+| Модель | Input (cache miss) | Input (cache hit) | Output |
+|---|---|---|---|
+| **deepseek-v4-flash** | $0.14 / 1M | **$0.0028 / 1M (-98%)** | $0.28 / 1M |
+| **deepseek-v4-pro** (промо до **31.05.2026**) | $0.435 / 1M | $0.003625 / 1M | $0.87 / 1M |
+| deepseek-v4-pro (после 31.05) | $1.74 / 1M | $0.0145 / 1M | $3.48 / 1M |
+
+**Что важно:**
+- V3 deprecated — алиасы `deepseek-chat`/`deepseek-reasoner` теперь маршрутизируют на V4-flash (отключение 24.07.2026)
+- **V4-Pro бьёт GPT-4o** по заявленным бенчмаркам: MMLU 90.1, MMLU-Pro 87.5, GPQA Diamond 90.1 (источник — DeepSeek; независимая верификация ограничена)
+- В **17-35 раз дешевле GPT-4o** ($2.50/$10) при равном или лучшем качестве
+- Нативный JSON mode + structured outputs
+- Context window **1M tokens**, function calling до 128 параллельных вызовов
+
+**Cache-hit бонус — критичная фишка:** для V4-flash при cache-hit стоимость input падает в **×50 раз** ($0.0028 vs $0.14). Это означает, что если правильно структурировать system prompt + JSON schema (~3000 токенов одинаковые для всех товаров), реальная стоимость extraction падает почти до нуля на input стороне.
+
+**Через OpenRouter V4-flash дешевле прямого API:** $0.112 / $0.224 за 1M (~20% объёмная скидка маршрутизатора). Для основной нагрузки (parser, classifier, judges) — лучше OpenRouter. Для cache-heavy задач — лучше прямой API DeepSeek (cache-hit работает там).
+
+**Переход с GPT-4o на DeepSeek V4 — не downgrade, а upgrade** по качеству при цене в 17 раз ниже. Меняет всю экономику SaaS.
+
+⚠️ **Watch out:** V4-Pro в промо до **31.05.2026**. После цена вырастет ×4 (с $0.435 до $1.74). За 2 недели до этой даты — пересмотреть routing решения для тех этапов где использовался Pro.
 
 ---
 
@@ -27,7 +41,8 @@
 
 | Этап | Было | Стало | Экономия |
 |---|---|---|---|
-| Parser, Classifier, Knowledge, Judges | GPT-4o-mini | **DeepSeek V3** | ~2× input, цена сопоставимая. **Качество вырастает значительно** |
+| Parser, Classifier, Extraction после web/vision | GPT-4o/mini | **deepseek-v4-flash через OpenRouter** ($0.112/$0.224 за 1M) | **-95%**. С cache-hit ещё дешевле. Качество равно GPT-4o |
+| Knowledge, Judges (critical reasoning) | GPT-4o | **deepseek-v4-pro прямой API** ($0.435/$0.87 промо, $1.74/$3.48 после 31.05) | -65% (промо) / -30% (после). MMLU 90.1 vs GPT-4o ~88 |
 | Vision (описание фото) | GPT-4o Vision ($2.50/$10) | **Gemini 2.5 Flash** ($0.30/$2.50) | **-88%**, при этом Gemini 2.5 Flash **доминирует на e-commerce vision-задачах** по апрельскому 2026 бенчмарку |
 | Web search tool | OpenAI Responses API ($25/1k) | **Serper API** ($0.30-1/1k) | **-96-99%**. Serper — Google SERP, такое же качество для product search |
 
@@ -171,9 +186,10 @@ Continuous monitoring:
 
 | Задача | Рекомендуется | Цена /1M (in/out) | Почему |
 |---|---|---|---|
-| Основная extraction (classifier, knowledge, parser, judges) | **DeepSeek V3** | $0.14 / $0.28 | Бьёт GPT-4o на 22/26 бенчмарках, в 17× дешевле |
+| Parser, Classifier, Extraction после web/vision | **deepseek-v4-flash через OpenRouter** | $0.112 / $0.224 | Дешевле прямого API, ×17 от GPT-4o, JSON mode |
+| Knowledge, Judges | **deepseek-v4-pro прямой API (промо)** | $0.435 / $0.87 | До 31.05 — премиум reasoning за дёшево. После — пересмотр |
 | Vision (анализ фото товара) | **Gemini 2.5 Flash** | $0.30 / $2.50 | Лидер на e-commerce vision-задачах апреля 2026 |
-| Premium reasoning (опционально для сложных) | **Claude Sonnet 4.6** + caching | $0.30 (cached) / $15 | 1M context window, лучший structured output |
+| Premium reasoning fallback (если pro слишком дорог) | **Claude Sonnet 4.6** + prompt caching | $0.30 (cached) / $15 | 1M context window, лучший structured output, -90% на cache-hit |
 | Web search tool | **Serper API** | $0.30-1 / 1000 запросов | 25-80× дешевле OpenAI web_search |
 | Будущее self-host | **Qwen 3 32B INT4** на RunPod | $0.09-0.12 / 1M (при >25k req/день) | Open source, отличный JSON, helps with multilingual |
 
