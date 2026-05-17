@@ -2,11 +2,13 @@ import asyncio
 import json # <--- ДОБАВЛЕН ДЛЯ РАБОТЫ СО СЛОВАРЯМИ
 import logging
 import re
+from typing import Optional
 from .ai_pipeline import AiFeaturePipeline
 from .db_cache import DatabaseCacheManager
 from .matcher import MatcherService
 from .url_fetcher import fetch_all
-from ..models import ProductData, FeatureOption, ResearchMode
+from .enrichment import VisionProducer, WebSearchProducer, AttributeMerger, AttributeValue, Source
+from ..models import ProductData, FeatureOption, ResearchMode, BatchOptions
 from ..database import AsyncSessionLocal
 from ..config import VAGUE_FEATURE_PATTERNS
 
@@ -38,16 +40,107 @@ def is_vague_feature_name(name: str) -> bool:
     return False
 
 class JobProcessor:
-    def __init__(self, pipeline: AiFeaturePipeline, db_cache: DatabaseCacheManager, matcher: MatcherService,
-                 global_semaphore: asyncio.Semaphore):
+    def __init__(
+        self,
+        pipeline: AiFeaturePipeline,
+        db_cache: DatabaseCacheManager,
+        matcher: MatcherService,
+        global_semaphore: asyncio.Semaphore,
+        vision_producer: Optional[VisionProducer] = None,
+        websearch_producer: Optional[WebSearchProducer] = None,
+    ):
         self.pipeline = pipeline
         self.db_cache = db_cache
         self.matcher = matcher
         self.semaphore = global_semaphore
+        self.vision_producer = vision_producer
+        self.websearch_producer = websearch_producer
+        self.merger = AttributeMerger()
 
-    async def process_product(self, product: ProductData, schema: dict[str, FeatureOption], client_id: int,
-                              use_cache: bool = True,
-                              research_mode: ResearchMode = ResearchMode.OFF) -> dict:
+    # ------------------------------------------------------------------
+    # Enrichment helper: run basic extraction on arbitrary text (1 LLM call).
+    # Only the first extraction stage of the pipeline — no deduction /
+    # knowledge / web fallbacks — so each branch stays at exactly 1 call.
+    # ------------------------------------------------------------------
+    async def _extract_attrs_from_text(
+        self,
+        text: str,
+        product: ProductData,
+        schema: dict[str, FeatureOption],
+        source: Source,
+    ) -> list[AttributeValue]:
+        """Run extraction-only (no deduction/knowledge/web) on *text*.
+
+        Returns a list of AttributeValue for each feature in *schema* that
+        yielded a non-None result.
+        """
+        attrs: list[AttributeValue] = []
+        for f_name, f_schema in schema.items():
+            if is_vague_feature_name(f_name):
+                continue
+            suffix = getattr(f_schema, "suffix", "")
+            opts = getattr(f_schema, "options", [])
+
+            # One structured_request — extraction stage only.
+            try:
+                full_instruction, _router_debug, matched_leaf = await self.pipeline.router.find_instruction(
+                    text, f_name, unit=suffix
+                )
+                if matched_leaf is None:
+                    continue
+
+                TargetModel = matched_leaf.get_response_model(options=opts)
+                dynamic_instruction = matched_leaf.get_instruction(
+                    unit=suffix, options=opts, target_languages=product.languages
+                )
+                sys_msg = (
+                    f"{dynamic_instruction}\n\n"
+                    f"--- EXECUTION CONTEXT ---\n"
+                    f"TARGET FEATURE: '{f_name}'\n"
+                    f"TARGET UNIT/SUFFIX: '{suffix}'\n"
+                )
+
+                result, _tokens = await self.pipeline.llm.structured_request(
+                    system_prompt=sys_msg,
+                    user_text=text,
+                    response_model=TargetModel,
+                )
+
+                if result and result.confidence != "Low":
+                    val = self.pipeline._unpack_value(result)
+                    if val is not None:
+                        # Map pipeline confidence string to 0-1 float.
+                        conf_str = getattr(result, "confidence", "Low")
+                        conf = {"High": 0.9, "Medium": 0.6, "Low": 0.3}.get(conf_str, 0.5)
+                        attrs.append(
+                            AttributeValue(
+                                attribute_id=f_name,
+                                value=val,
+                                confidence=conf,
+                                source=source,
+                                reasoning=getattr(result, "analysis", None),
+                            )
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "_extract_attrs_from_text: error on feature %r (source=%s): %s",
+                    f_name,
+                    source,
+                    exc,
+                )
+                continue
+
+        return attrs
+
+    async def process_product(
+        self,
+        product: ProductData,
+        schema: dict[str, FeatureOption],
+        client_id: int,
+        use_cache: bool = True,
+        research_mode: ResearchMode = ResearchMode.OFF,
+        options: Optional[BatchOptions] = None,
+    ) -> dict:
         result_features = {}
         total_tokens_used = 0
         is_fully_cached = True
@@ -68,6 +161,53 @@ class JobProcessor:
 
         info = f"Title: {product.name}\nDescription: {description[:50000]}"
         context_hash = f"{product.name} {product.description}"
+
+        # ==============================================================
+        # ENRICHMENT BRANCHES (parallel, error-isolated)
+        # Each branch: producer → plain text → extraction (1 LLM call).
+        # Results are merged per-attribute by highest confidence / source
+        # priority before the main per-feature description branch runs.
+        # ==============================================================
+        opts = options or BatchOptions()
+        enrichment_branch_tasks = []
+
+        if opts.enable_vision and self.vision_producer and getattr(product, "image_urls", None):
+            async def _vision_branch(prod=product, sc=schema):
+                vision_text = await self.vision_producer.produce_description(
+                    prod.image_urls, prod.name
+                )
+                if not vision_text:
+                    return []
+                return await self._extract_attrs_from_text(vision_text, prod, sc, Source.VISION)
+            enrichment_branch_tasks.append(_vision_branch())
+
+        if opts.enable_web_search and self.websearch_producer:
+            async def _websearch_branch(prod=product, sc=schema):
+                ws_text = await self.websearch_producer.produce_summary(
+                    prod.name,
+                    brand=None,   # TODO: expose brand field on ProductData if needed
+                    ean=None,     # TODO: expose ean field on ProductData if needed
+                )
+                if not ws_text:
+                    return []
+                return await self._extract_attrs_from_text(ws_text, prod, sc, Source.WEB_SEARCH)
+            enrichment_branch_tasks.append(_websearch_branch())
+
+        # Collect enrichment attrs — branch failures are warned, not raised.
+        enrichment_attrs: list[AttributeValue] = []
+        if enrichment_branch_tasks:
+            branch_results = await asyncio.gather(*enrichment_branch_tasks, return_exceptions=True)
+            for br in branch_results:
+                if isinstance(br, Exception):
+                    logger.warning("Enrichment branch failed (isolated): %s", br)
+                elif isinstance(br, list):
+                    enrichment_attrs.extend(br)
+
+        # Build a lookup: attribute_id → best enrichment AttributeValue.
+        # Used below to possibly override description-branch results.
+        enrichment_best: dict[str, AttributeValue] = {
+            av.attribute_id: av for av in self.merger.merge([enrichment_attrs])
+        }
 
         async def process_feature(f_name, f_schema):
             async with self.semaphore:
@@ -103,7 +243,7 @@ class JobProcessor:
                             return (f_name, val_to_return, 0, True, {}, debug_reason, None, "cache", None)
 
                     suffix = getattr(f_schema, 'suffix', "")
-                    opts = getattr(f_schema, 'options', [])
+                    f_opts = getattr(f_schema, 'options', [])
 
                     # If the operator configured a prompt_hint for this feature (stored in
                     # admin_rules.settings and forwarded in the BatchFillRequest schema),
@@ -123,7 +263,7 @@ class JobProcessor:
                         product_text=effective_product_text,
                         feature_name=f_name,
                         suffix=suffix,
-                        options=opts,
+                        options=f_opts,
                         target_languages=product.languages,
                         research_mode=research_mode
                     )
@@ -177,6 +317,21 @@ class JobProcessor:
                 "source": source,
                 "source_urls": source_urls,
             }
+
+        # Merge enrichment attrs (vision / web_search) into description results.
+        # Enrichment wins only when description branch returned nothing for a feature
+        # OR when enrichment has strictly higher confidence (AttributeMerger rules).
+        for f_name, enrich_av in enrichment_best.items():
+            if f_name not in result_features:
+                # Description branch missed it — use enrichment value.
+                result_features[f_name] = enrich_av.value
+                debug_info.setdefault(f_name, {})["source"] = enrich_av.source.value
+                debug_info[f_name]["extraction_reasoning"] = (
+                    f"[ENRICHMENT branch={enrich_av.source.value} "
+                    f"conf={enrich_av.confidence:.2f}]: {enrich_av.reasoning or ''}"
+                )
+            # (If description already filled it, we keep description result — it has
+            # priority per Source.DESCRIPTION > all others in AttributeMerger.)
 
         final_result = {}
         for f_name, val in result_features.items():

@@ -37,6 +37,9 @@ class ProductData(BaseModel):
     context: ProductContext
     languages: List[str] = ["en"]
     source_urls: List[str] = Field(default_factory=list)
+    # Vision branch: up to 10 image URLs accepted here; VisionProducer
+    # will itself cap at its MAX_IMAGES limit (4) for cost control.
+    image_urls: List[str] = Field(default_factory=list)
 
     @field_validator("source_urls")
     @classmethod
@@ -48,6 +51,19 @@ class ProductData(BaseModel):
                 raise ValueError(f"source_urls: only HTTPS URLs allowed, got: {url!r}")
         return v
 
+    @field_validator("image_urls")
+    @classmethod
+    def validate_image_urls(cls, v: List[str]) -> List[str]:
+        if len(v) > 10:
+            raise ValueError("image_urls: maximum 10 URLs per product")
+        return v
+
+
+class BatchOptions(BaseModel):
+    """Feature-flag options for a batch request."""
+    enable_vision: bool = False
+    enable_web_search: bool = False
+
 
 class BatchPayload(BaseModel):
     client_id: int
@@ -55,3 +71,4 @@ class BatchPayload(BaseModel):
     schemas: Dict[Any, Dict[str, FeatureOption]]
     use_cache: bool = False
     research_mode: ResearchMode = ResearchMode.OFF
+    options: BatchOptions = Field(default_factory=BatchOptions)
