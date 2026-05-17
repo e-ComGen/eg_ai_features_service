@@ -5,11 +5,13 @@ from .openrouter_provider import OpenRouterProvider
 from .serper_client import SerperClient
 from .openai_adapter import OpenAIProviderAdapter
 from .structured_adapter import StructuredLlmManager
+from .fallback_provider import FallbackProvider
 from .factory import (
     get_main_manager,
     get_vision_provider,
     get_web_search_client,
     get_extraction_manager,
+    get_router_manager,
 )
 
 __all__ = [
@@ -20,8 +22,10 @@ __all__ = [
     "SerperClient",
     "OpenAIProviderAdapter",
     "StructuredLlmManager",
+    "FallbackProvider",
     "get_main_manager",
     "get_vision_provider",
     "get_web_search_client",
     "get_extraction_manager",
+    "get_router_manager",
 ]

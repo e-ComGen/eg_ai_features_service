@@ -25,6 +25,36 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Fallback helper
+# ---------------------------------------------------------------------------
+
+def _wrap_with_fallback(primary: LlmProvider, is_vision: bool = False) -> LlmProvider:
+    """Optionally wrap *primary* with FallbackProvider pointing at OpenAI.
+
+    Returns *primary* unchanged when:
+    - ENABLE_OPENAI_FALLBACK is False
+    - primary is already the OpenAI adapter (no point wrapping OpenAI with itself)
+    """
+    if not config.ENABLE_OPENAI_FALLBACK:
+        return primary
+    if primary.name == "openai":
+        return primary
+
+    from .fallback_provider import FallbackProvider
+    from .openai_adapter import OpenAIProviderAdapter
+    from ..llm_manager import OpenAIManager
+
+    openai_mgr = OpenAIManager(api_key=config.OPENAI_API_KEY)
+    fallback_provider = OpenAIProviderAdapter(openai_mgr)
+    model = config.OPENAI_FALLBACK_MODEL_VISION if is_vision else config.OPENAI_FALLBACK_MODEL
+    logger.debug(
+        "Wrapping %s with FallbackProvider → openai/%s (is_vision=%s)",
+        primary.name, model, is_vision,
+    )
+    return FallbackProvider(primary=primary, fallback=fallback_provider, fallback_model=model)
+
+
+# ---------------------------------------------------------------------------
 # Main LLM — used by AiPipeline (parser, deduction, judge, extraction)
 # Returns a StructuredLlmManager that exposes structured_request()
 # compatible with the existing pipeline interface.
@@ -53,6 +83,7 @@ def get_main_manager(openai_manager: "OpenAIManager | None" = None) -> "Structur
         return openai_manager
 
     provider = _make_raw_provider(provider_name)
+    provider = _wrap_with_fallback(provider, is_vision=False)
     logger.info("Main provider: %s, model: %s", provider_name, model)
     return StructuredLlmManager(provider=provider, model=model)
 
@@ -68,7 +99,8 @@ def get_vision_provider() -> LlmProvider:
 
     if provider_name == "openrouter":
         logger.info("Vision provider: openrouter, model: %s", config.VISION_MODEL)
-        return OpenRouterProvider()
+        provider = OpenRouterProvider()
+        return _wrap_with_fallback(provider, is_vision=True)
 
     if provider_name == "openai":
         # Wrap OpenAIManager client into a thin LlmProvider
@@ -94,12 +126,42 @@ def get_web_search_client() -> "SerperClient | None":
 
     When None is returned, WebSearchProducer falls back to the existing
     OpenAI Responses API path (web_search.py).
+
+    TODO: add Serper → OpenAI web_search fallback when Serper is unavailable.
     """
     if config.PROVIDER_WEB_SEARCH == "serper":
         logger.info("Web search provider: serper")
         return SerperClient()
     logger.info("Web search provider: openai (existing Responses API)")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Router LLM — used by TreeRouter for traversal decisions
+# By default shares PROVIDER_MAIN; can be overridden via PROVIDER_ROUTER env var.
+# ---------------------------------------------------------------------------
+
+def get_router_manager() -> "StructuredLlmManager":
+    """Return a StructuredLlmManager for TreeRouter traversal decisions.
+
+    Uses PROVIDER_MAIN backend unless PROVIDER_ROUTER is set explicitly.
+    Always returns a StructuredLlmManager (never a bare OpenAIManager).
+    Fallback wrapping applied identically to the main manager.
+    """
+    provider_name = config.PROVIDER_ROUTER
+    model = config.ROUTER_MODEL
+
+    if provider_name == "openai":
+        from ..llm_manager import OpenAIManager
+        from .openai_adapter import OpenAIProviderAdapter
+        mgr = OpenAIManager(api_key=config.OPENAI_API_KEY)
+        adapter = OpenAIProviderAdapter(mgr)
+        return StructuredLlmManager(provider=adapter, model=model)
+
+    provider = _make_raw_provider(provider_name)
+    provider = _wrap_with_fallback(provider, is_vision=False)
+    logger.info("Router provider: %s, model: %s", provider_name, model)
+    return StructuredLlmManager(provider=provider, model=model)
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +182,7 @@ def get_extraction_manager() -> "StructuredLlmManager | OpenAIManager":
         return OpenAIManager(api_key=config.OPENAI_API_KEY)
 
     provider = _make_raw_provider(provider_name)
+    provider = _wrap_with_fallback(provider, is_vision=False)
     return StructuredLlmManager(provider=provider, model=model)
 
 
