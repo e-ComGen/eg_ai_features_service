@@ -69,6 +69,15 @@ VAGUE_FEATURE_PATTERNS = [
     r"tbd",
 ]
 
+# ---------------------------------------------------------------------------
+# Feature flag: new cost-aware enrichment pipeline (PipelineOrchestrator)
+# ---------------------------------------------------------------------------
+# When True, job_processor routes attribute filling through PipelineOrchestrator
+# via PipelineAdapter instead of the legacy per-feature LLM flow.
+# Default OFF so existing behaviour is completely unchanged.
+# Enable via env: USE_NEW_PIPELINE=true (or "1" / "yes").
+USE_NEW_PIPELINE: bool = os.getenv("USE_NEW_PIPELINE", "false").lower() in ("1", "true", "yes")
+
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set in environment (.env)")
 if not INTERNAL_SERVICE_SECRET:

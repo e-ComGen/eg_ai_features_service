@@ -11,6 +11,35 @@ from .enrichment import VisionProducer, WebSearchProducer, AttributeMerger, Attr
 from ..models import ProductData, FeatureOption, ResearchMode, BatchOptions
 from ..database import AsyncSessionLocal
 from ..config import VAGUE_FEATURE_PATTERNS
+from .. import config as _config
+
+# ---------------------------------------------------------------------------
+# New pipeline integration (feature flag USE_NEW_PIPELINE)
+# ---------------------------------------------------------------------------
+# When config.USE_NEW_PIPELINE is True, process_product routes through
+# PipelineAdapter -> PipelineOrchestrator instead of the legacy per-feature flow.
+#
+# TODO(integration): Complete the wiring in process_product below.
+#   The adapter is imported and instantiated but the actual call to
+#   self._pipeline_adapter.run(...) is not yet connected to the full
+#   schema/product mapping because:
+#     1. legacy schema is Dict[str, FeatureOption] (name-keyed, no numeric id)
+#        while TargetAttribute expects an int id — need to decide id assignment
+#        strategy (use hash / DB lookup / positional index).
+#     2. legacy result is {feature_name: value} + debug_info + tokens_used
+#        while orchestrator returns List[base.AttributeValue] — the conversion
+#        helper PipelineAdapter.convert_to_legacy_dict handles value mapping
+#        but debug_info / tokens_used fields would be empty for the new path.
+#     3. caching: the new path bypasses db_cache entirely — decide if caching
+#        should be added at adapter level or removed for the new path.
+#   Until TODO is resolved, enabling USE_NEW_PIPELINE logs a warning and falls
+#   back to the legacy path so no existing behaviour is broken.
+try:
+    from .enrichment.pipeline_adapter import PipelineAdapter as _PipelineAdapter
+    _PIPELINE_ADAPTER_AVAILABLE = True
+except ImportError:
+    _PipelineAdapter = None  # type: ignore[assignment,misc]
+    _PIPELINE_ADAPTER_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +85,11 @@ class JobProcessor:
         self.vision_producer = vision_producer
         self.websearch_producer = websearch_producer
         self.merger = AttributeMerger()
+        # New pipeline adapter — only instantiated when the feature flag is on
+        # and the import succeeded, to avoid import-time cost when unused.
+        self._pipeline_adapter: Optional[_PipelineAdapter] = (
+            _PipelineAdapter() if _config.USE_NEW_PIPELINE and _PIPELINE_ADAPTER_AVAILABLE else None
+        )
 
     # ------------------------------------------------------------------
     # Enrichment helper: run basic extraction on arbitrary text (1 LLM call).
@@ -141,6 +175,47 @@ class JobProcessor:
         research_mode: ResearchMode = ResearchMode.OFF,
         options: Optional[BatchOptions] = None,
     ) -> dict:
+        # ------------------------------------------------------------------
+        # Feature flag: new PipelineOrchestrator path
+        # ------------------------------------------------------------------
+        # TODO(integration): replace this stub with a real call once the
+        #   schema-to-TargetAttribute mapping and result conversion are
+        #   finalised (see import-time TODO at top of this file).
+        if _config.USE_NEW_PIPELINE:
+            logger.warning(
+                "USE_NEW_PIPELINE=True but full wiring is not yet complete "
+                "(see TODO in job_processor.py). Falling back to legacy path."
+            )
+            # Future real call (uncomment when wiring is ready):
+            # if self._pipeline_adapter is not None:
+            #     targets_raw = [
+            #         {
+            #             "id": idx,
+            #             "name": f_name,
+            #             "type": getattr(f_schema, "type", "text"),
+            #             "allowed_values": getattr(f_schema, "options", None),
+            #             "semantic_type": None,
+            #         }
+            #         for idx, (f_name, f_schema) in enumerate(schema.items())
+            #     ]
+            #     av_list = await self._pipeline_adapter.run(
+            #         product_id=product.id,
+            #         product_name=product.name,
+            #         product_description=product.description,
+            #         category_id=product.category_id,
+            #         source_urls=getattr(product, "source_urls", None),
+            #         image_urls=getattr(product, "image_urls", None),
+            #         targets_raw=targets_raw,
+            #     )
+            #     filled = _PipelineAdapter.convert_to_legacy_dict(av_list, targets_raw)
+            #     return {
+            #         "product_id": product.id,
+            #         "filled_features": filled,
+            #         "debug_info": {},
+            #         "tokens_used": 0,
+            #         "is_cached": False,
+            #     }
+
         result_features = {}
         total_tokens_used = 0
         is_fully_cached = True
