@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pydantic
+redis
+openai>=2.0.0
+rapidfuzz
+sentence-transformers
+numpy
+python-dotenv

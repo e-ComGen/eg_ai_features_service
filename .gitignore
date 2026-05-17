@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual envs
+venv/
+.venv/
+env/
+ENV/
+
+# Env vars / secrets
+.env
+.env.local
+.env.*.local
+
+# Databases (SQLite + WAL/SHM)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+features_service.db
+
+# Generated logs / output (big)
+ai_service_output.csv
+deductions_log.csv
+tree_traversal_log.csv
+debug_inputs.csv
+ai_report.csv
+ai_report_test.csv
+
+# Binary caches / embeddings
+*.pkl
+vectors.pkl
+
+# Testing / linting cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build / dist
+build/
+dist/
+*.egg-info/
