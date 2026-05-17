@@ -21,6 +21,23 @@ SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
 WEB_SEARCH_MODEL = os.getenv("WEB_SEARCH_MODEL", "gpt-4o")
 WEB_SEARCH_MAX_CONCURRENT = int(os.getenv("WEB_SEARCH_MAX_CONCURRENT", "10"))
 
+# ---------------------------------------------------------------------------
+# Provider selection — config-driven, override via env vars
+# ---------------------------------------------------------------------------
+# Who handles what type of LLM call:
+#   "openai"      → existing OpenAIManager (gpt-4o-mini, structured parse)
+#   "deepseek"    → DeepSeekProvider (deepseek-v4-flash / pro, JSON mode)
+#   "openrouter"  → OpenRouterProvider (any model via OpenRouter gateway)
+PROVIDER_MAIN: str = os.getenv("PROVIDER_MAIN", "deepseek")       # parser, deduction, judge, extraction
+PROVIDER_VISION: str = os.getenv("PROVIDER_VISION", "openrouter") # vision producer (Gemini)
+PROVIDER_WEB_SEARCH: str = os.getenv("PROVIDER_WEB_SEARCH", "serper")  # web search: "openai" | "serper"
+
+# Model identifiers per stage (override via env)
+MAIN_MODEL: str = os.getenv("MAIN_MODEL", "deepseek-v4-flash")
+PREMIUM_MODEL: str = os.getenv("PREMIUM_MODEL", "deepseek-v4-pro")
+VISION_MODEL: str = os.getenv("VISION_MODEL", "google/gemini-2.5-flash")
+EXTRACTION_FROM_TEXT_MODEL: str = os.getenv("EXTRACTION_FROM_TEXT_MODEL", "deepseek-v4-flash")
+
 # Vague / placeholder feature names that must NEVER trigger an LLM call.
 # These are operator-defined placeholders (e.g. "NewFeature" from CS-Cart's
 # default schema templates) — extracting any value for them would be a
