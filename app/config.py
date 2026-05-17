@@ -9,7 +9,7 @@ INTERNAL_SERVICE_SECRET = os.getenv("INTERNAL_SERVICE_SECRET", "")
 # --- Cheap LLM providers (Tier 1 cost reduction) ---
 # DeepSeek: env var is DEEP_SEEK_API_KEY (user convention)
 DEEPSEEK_API_KEY = os.getenv("DEEP_SEEK_API_KEY", "")
-DEEPSEEK_DEFAULT_MODEL = os.getenv("DEEPSEEK_DEFAULT_MODEL", "deepseek-v4-flash")
+DEEPSEEK_DEFAULT_MODEL = os.getenv("DEEPSEEK_DEFAULT_MODEL", "deepseek-chat")
 DEEPSEEK_PRO_MODEL = os.getenv("DEEPSEEK_PRO_MODEL", "deepseek-v4-pro")
 
 # OpenRouter: env var is OPEN_ROUTER_API_KEY (user convention)
@@ -33,14 +33,14 @@ PROVIDER_VISION: str = os.getenv("PROVIDER_VISION", "openrouter") # vision produ
 PROVIDER_WEB_SEARCH: str = os.getenv("PROVIDER_WEB_SEARCH", "serper")  # web search: "openai" | "serper"
 
 # Model identifiers per stage (override via env)
-MAIN_MODEL: str = os.getenv("MAIN_MODEL", "deepseek-v4-flash")
-PREMIUM_MODEL: str = os.getenv("PREMIUM_MODEL", "deepseek-v4-pro")
+MAIN_MODEL: str = os.getenv("MAIN_MODEL", "deepseek-chat")
+PREMIUM_MODEL: str = os.getenv("PREMIUM_MODEL", "deepseek-reasoner")
 VISION_MODEL: str = os.getenv("VISION_MODEL", "google/gemini-2.5-flash")
-EXTRACTION_FROM_TEXT_MODEL: str = os.getenv("EXTRACTION_FROM_TEXT_MODEL", "deepseek-v4-flash")
+EXTRACTION_FROM_TEXT_MODEL: str = os.getenv("EXTRACTION_FROM_TEXT_MODEL", "deepseek-chat")
 
 # Tree routing — defaults to the same provider/model as PROVIDER_MAIN
 PROVIDER_ROUTER: str = os.getenv("PROVIDER_ROUTER", os.getenv("PROVIDER_MAIN", "deepseek"))
-ROUTER_MODEL: str = os.getenv("ROUTER_MODEL", os.getenv("MAIN_MODEL", "deepseek-v4-flash"))
+ROUTER_MODEL: str = os.getenv("ROUTER_MODEL", os.getenv("MAIN_MODEL", "deepseek-chat"))
 
 # ---------------------------------------------------------------------------
 # Fallback to OpenAI on transient provider errors

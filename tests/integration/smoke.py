@@ -5,6 +5,8 @@ from app.services.providers.deepseek_provider import DeepSeekProvider
 from app.services.providers.openrouter_provider import OpenRouterProvider
 from app.services.providers.serper_client import SerperClient
 from app.services.providers.openai_adapter import OpenAIProviderAdapter
+from app.services.llm_manager import OpenAIManager
+from app import config
 
 
 async def main():
@@ -13,34 +15,34 @@ async def main():
     # DeepSeek
     try:
         ds = DeepSeekProvider()
-        r = await ds.complete(messages=[{"role": "user", "content": "Reply: ok"}], model="deepseek-v4-flash", max_tokens=5)
-        print(f"✓ DeepSeek V4 flash: '{r.content.strip()}' (cost ${r.cost_usd:.6f})")
+        r = await ds.complete(messages=[{"role": "user", "content": "Say the word: hello"}], model="deepseek-chat", max_tokens=20)
+        print(f"[OK] DeepSeek V4 flash: '{r.content.strip()}' (cost ${r.cost_usd:.6f})")
     except Exception as e:
-        print(f"✗ DeepSeek: {e}")
+        print(f"[FAIL] DeepSeek: {e}")
 
     # OpenRouter
     try:
         orp = OpenRouterProvider()
-        r = await orp.complete(messages=[{"role": "user", "content": "Reply: ok"}], model="deepseek/deepseek-v4-flash", max_tokens=5)
-        print(f"✓ OpenRouter (DeepSeek): '{r.content.strip()}'")
+        r = await orp.complete(messages=[{"role": "user", "content": "Say the word: hello"}], model="deepseek/deepseek-chat", max_tokens=20)
+        print(f"[OK] OpenRouter (DeepSeek): '{r.content.strip()}'")
     except Exception as e:
-        print(f"✗ OpenRouter: {e}")
+        print(f"[FAIL] OpenRouter: {e}")
 
     # Serper
     try:
         sc = SerperClient()
         res = await sc.search(query="test query", num_results=1)
-        print(f"✓ Serper: {len(res.organic)} результатов")
+        print(f"[OK] Serper: {len(res.organic_results)} результатов")
     except Exception as e:
-        print(f"✗ Serper: {e}")
+        print(f"[FAIL] Serper: {e}")
 
     # OpenAI fallback
     try:
-        oa = OpenAIProviderAdapter()
-        r = await oa.complete(messages=[{"role": "user", "content": "Reply: ok"}], model="gpt-4o-mini", max_tokens=5)
-        print(f"✓ OpenAI gpt-4o-mini: '{r.content.strip()}'")
+        oa = OpenAIProviderAdapter(manager=OpenAIManager(api_key=config.OPENAI_API_KEY))
+        r = await oa.complete(messages=[{"role": "user", "content": "Say the word: hello"}], model="gpt-4o-mini", max_tokens=20)
+        print(f"[OK] OpenAI gpt-4o-mini: '{r.content.strip()}'")
     except Exception as e:
-        print(f"✗ OpenAI: {e}")
+        print(f"[FAIL] OpenAI: {e}")
 
     print("\nDone.")
 

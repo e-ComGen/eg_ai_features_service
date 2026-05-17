@@ -35,8 +35,14 @@ logger = logging.getLogger(__name__)
 # Cache hit pricing применяется автоматически когда DeepSeek распознаёт identical prefix.
 # ⚠️ V4-Pro в промо до 31.05.2026 — после цена вырастет ×4. Проверить и обновить.
 _PRICES: dict[str, dict[str, float]] = {
+    # Direct V4 names — на 17.05.2026 API возвращает HTTP 200 но пустой content.
+    # Возможно V4 в beta/preview. Используем алиасы которые маршрутизируются на V4 моделях
+    # до отключения алиасов 24.07.2026.
     "deepseek-v4-flash": {"input": 0.14, "output": 0.28},
     "deepseek-v4-pro":   {"input": 0.435, "output": 0.87},  # промо до 31.05.2026
+    # Production aliases (РАБОТАЮТ, default в config):
+    "deepseek-chat":     {"input": 0.14, "output": 0.28},  # → routes to V4-flash
+    "deepseek-reasoner": {"input": 0.55, "output": 2.19},  # V3.1 reasoning model
 }
 _DEFAULT_PRICE = {"input": 0.14, "output": 0.28}  # fallback (= flash, безопаснее занизить)
 
