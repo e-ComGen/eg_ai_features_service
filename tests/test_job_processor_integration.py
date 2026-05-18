@@ -4,6 +4,9 @@ Tests verify:
 1. Legacy path is used (and unchanged) when USE_NEW_PIPELINE=False.
 2. New path branch is entered when USE_NEW_PIPELINE=True and adapter is present.
 3. Structural test: legacy path result shape is unchanged.
+4. New path returns legacy-compatible result shape (debug_info + tokens_used present).
+5. New path id-mapping correctly maps positional index back to schema key names.
+6. New path handles empty schema gracefully.
 
 All external I/O (LLM, DB, URL fetcher, pipeline adapter) is mocked.
 """
@@ -14,6 +17,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app import config
+from app.services.enrichment.base import AttributeValue, Source
 from app.services.job_processor import JobProcessor
 from app.models import (
     BatchOptions,
@@ -118,38 +122,159 @@ async def test_legacy_path_used_when_flag_off(monkeypatch):
     assert result["filled_features"].get("colour") == "green"
 
 
+def _make_mock_adapter(av_list=None):
+    """Build a mock PipelineAdapter whose .run() coroutine returns av_list."""
+    adapter = MagicMock()
+    adapter.run = AsyncMock(return_value=av_list or [])
+    return adapter
+
+
 @pytest.mark.asyncio
 async def test_new_path_used_when_flag_on(monkeypatch):
-    """When USE_NEW_PIPELINE=True, the pipeline adapter branch is entered (logged warning).
+    """When USE_NEW_PIPELINE=True and adapter is set, the new path is entered.
 
-    The adapter stub currently falls through to the legacy path with a warning
-    (per spec: minimal integration until full wiring is complete).  We verify:
-    - The warning is logged.
-    - The result still has the standard shape (legacy fallback is working).
+    Verifies:
+    - Result has the standard legacy shape (product_id, filled_features, debug_info,
+      tokens_used, is_cached).
+    - The adapter.run() coroutine was called exactly once.
     """
     monkeypatch.setattr(config, "USE_NEW_PIPELINE", True)
 
+    # Adapter returns one AttributeValue for 'colour' (attribute_id=0, positional index)
+    mock_av = AttributeValue(
+        attribute_id=0,
+        value="blue",
+        confidence=0.9,
+        source=Source.DESCRIPTION,
+        evidence="found in description",
+        judge_validated=True,
+    )
+    mock_adapter = _make_mock_adapter([mock_av])
+
     processor = _make_processor()
-    with patch("app.services.job_processor.fetch_all", new=AsyncMock(return_value="")), \
-         patch("app.services.job_processor.AsyncSessionLocal") as mock_cls, \
-         patch("app.services.job_processor.logger") as mock_logger:
-        mock_cls.return_value = _session_patch()
+    processor._pipeline_adapter = mock_adapter
 
-        result = await processor.process_product(
-            product=_make_product(),
-            schema=_make_schema(),
-            client_id=1,
-        )
-
-    # Warning must have been emitted about new pipeline not fully wired
-    warning_calls = [str(call) for call in mock_logger.warning.call_args_list]
-    assert any("USE_NEW_PIPELINE" in wc for wc in warning_calls), (
-        "Expected a warning about USE_NEW_PIPELINE being set but wiring incomplete"
+    result = await processor.process_product(
+        product=_make_product(),
+        schema=_make_schema(),
+        client_id=1,
     )
 
-    # Result still has standard shape (fell back to legacy)
-    assert "product_id" in result
+    mock_adapter.run.assert_called_once()
+
+    # Standard legacy shape present
+    assert result["product_id"] == 99
     assert "filled_features" in result
+    assert "debug_info" in result
+    assert "tokens_used" in result
+    assert "is_cached" in result
+    # is_cached is False for new path
+    assert result["is_cached"] is False
+
+
+@pytest.mark.asyncio
+async def test_new_path_called_when_flag_on_returns_legacy_format(monkeypatch):
+    """New path adapter result is converted to the exact same dict shape as legacy.
+
+    Verifies debug_info and tokens_used are present and have the right types.
+    """
+    monkeypatch.setattr(config, "USE_NEW_PIPELINE", True)
+
+    mock_av = AttributeValue(
+        attribute_id=0,
+        value="red",
+        confidence=0.85,
+        source=Source.LLM_KNOWLEDGE,
+        evidence="from knowledge base",
+        judge_validated=False,
+    )
+    mock_adapter = _make_mock_adapter([mock_av])
+
+    processor = _make_processor()
+    processor._pipeline_adapter = mock_adapter
+
+    result = await processor.process_product(
+        product=_make_product(),
+        schema=_make_schema(),
+        client_id=1,
+    )
+
+    # All five legacy keys present
+    assert set(result.keys()) == {"product_id", "filled_features", "debug_info", "tokens_used", "is_cached"}
+
+    # tokens_used is int (0 for new path — see TODO Tier-2-cost-tracking)
+    assert isinstance(result["tokens_used"], int)
+
+    # debug_info is a dict keyed by feature name
+    assert isinstance(result["debug_info"], dict)
+    assert "colour" in result["debug_info"]
+    di = result["debug_info"]["colour"]
+    # debug_info entry has the expected sub-keys
+    for key in ("source", "confidence", "evidence", "judge_validated"):
+        assert key in di, f"debug_info missing key: {key}"
+
+    # filled_features has the mapped value
+    assert result["filled_features"]["colour"] == "red"
+
+
+@pytest.mark.asyncio
+async def test_new_path_id_mapping_matches_schema_keys(monkeypatch):
+    """Positional index id must map back to the correct schema key name.
+
+    Schema: {"colour": ..., "material": ...}
+    Adapter returns AttributeValue with attribute_id=1 → should map to "material".
+    """
+    monkeypatch.setattr(config, "USE_NEW_PIPELINE", True)
+
+    multi_schema = {
+        "colour": FeatureOption(type="text", options=[]),
+        "material": FeatureOption(type="text", options=[]),
+    }
+    # attribute_id=1 corresponds to index 1 → "material"
+    mock_av = AttributeValue(
+        attribute_id=1,
+        value="steel",
+        confidence=0.92,
+        source=Source.DESCRIPTION,
+        evidence=None,
+        judge_validated=True,
+    )
+    mock_adapter = _make_mock_adapter([mock_av])
+
+    processor = _make_processor()
+    processor._pipeline_adapter = mock_adapter
+
+    result = await processor.process_product(
+        product=_make_product(),
+        schema=multi_schema,
+        client_id=1,
+    )
+
+    assert result["filled_features"].get("material") == "steel"
+    assert "colour" not in result["filled_features"]  # attribute_id=0 not returned
+
+
+@pytest.mark.asyncio
+async def test_new_path_handles_empty_schema(monkeypatch):
+    """New path with an empty schema returns a valid result with empty filled_features."""
+    monkeypatch.setattr(config, "USE_NEW_PIPELINE", True)
+
+    mock_adapter = _make_mock_adapter([])  # adapter returns nothing
+
+    processor = _make_processor()
+    processor._pipeline_adapter = mock_adapter
+
+    result = await processor.process_product(
+        product=_make_product(),
+        schema={},
+        client_id=1,
+    )
+
+    assert result["product_id"] == 99
+    assert result["filled_features"] == {}
+    assert result["debug_info"] == {}
+    assert result["tokens_used"] == 0
+    assert result["is_cached"] is False
 
 
 @pytest.mark.asyncio

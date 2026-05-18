@@ -166,6 +166,65 @@ class JobProcessor:
 
         return attrs
 
+    def _values_to_legacy_format(
+        self,
+        values: list[AttributeValue],
+        schema: dict[str, FeatureOption],
+        targets_raw: list[dict],
+    ) -> dict:
+        """Convert orchestrator output (list[AttributeValue]) to the legacy process_product return format.
+
+        Legacy format:
+            {
+                "product_id": int,          # caller must set this
+                "filled_features": dict,    # feature_name -> value
+                "debug_info": dict,         # feature_name -> {source, confidence, evidence, judge_validated}
+                "tokens_used": int,         # approximate; exact tracking is TODO Tier 2
+                "is_cached": bool,          # new path never caches (TODO Tier 2)
+            }
+
+        Cost tracking note:
+            PipelineOrchestrator does not expose a per-call token count.
+            tokens_used is set to 0 here.
+            TODO(Tier-2-cost-tracking): Add a token counter to ExtractionContext
+            (e.g. ExtractionContext.tokens_used: int = 0) and increment it inside
+            each AttributeSource.extract() call. Expose via orchestrator and sum here.
+        """
+        # Build int-id -> feature_name lookup (mirrors adapter's id assignment logic)
+        id_to_name: dict[int, str] = {}
+        for idx, raw in enumerate(targets_raw):
+            raw_id = raw.get("id") or raw.get("attribute_id")
+            try:
+                attr_id = int(raw_id) if raw_id is not None else idx
+            except (TypeError, ValueError):
+                attr_id = idx
+            id_to_name[attr_id] = raw.get("name", str(attr_id))
+
+        filled_features: dict = {}
+        debug_info: dict = {}
+
+        for av in values:
+            f_name = id_to_name.get(av.attribute_id, str(av.attribute_id))
+            filled_features[f_name] = av.value
+            debug_info[f_name] = {
+                "source": av.source.value if av.source else None,
+                "confidence": av.confidence,
+                "evidence": av.evidence,
+                "judge_validated": av.judge_validated,
+                # Placeholders matching legacy debug_info shape so callers don't break
+                "router": {},
+                "extraction_reasoning": av.evidence or "",
+                "deduced_context": None,
+                "source_urls": None,
+            }
+
+        return {
+            "filled_features": filled_features,
+            "debug_info": debug_info,
+            "tokens_used": 0,  # TODO(Tier-2-cost-tracking): sum from ExtractionContext.tokens_used
+            "is_cached": False,  # TODO(Tier-2-cache): add product-fingerprint cache at adapter level
+        }
+
     async def process_product(
         self,
         product: ProductData,
@@ -178,43 +237,41 @@ class JobProcessor:
         # ------------------------------------------------------------------
         # Feature flag: new PipelineOrchestrator path
         # ------------------------------------------------------------------
-        # TODO(integration): replace this stub with a real call once the
-        #   schema-to-TargetAttribute mapping and result conversion are
-        #   finalised (see import-time TODO at top of this file).
-        if _config.USE_NEW_PIPELINE:
-            logger.warning(
-                "USE_NEW_PIPELINE=True but full wiring is not yet complete "
-                "(see TODO in job_processor.py). Falling back to legacy path."
+        if _config.USE_NEW_PIPELINE and self._pipeline_adapter is not None:
+            logger.info(
+                "USE_NEW_PIPELINE=True: routing product_id=%s through PipelineAdapter",
+                product.id,
             )
-            # Future real call (uncomment when wiring is ready):
-            # if self._pipeline_adapter is not None:
-            #     targets_raw = [
-            #         {
-            #             "id": idx,
-            #             "name": f_name,
-            #             "type": getattr(f_schema, "type", "text"),
-            #             "allowed_values": getattr(f_schema, "options", None),
-            #             "semantic_type": None,
-            #         }
-            #         for idx, (f_name, f_schema) in enumerate(schema.items())
-            #     ]
-            #     av_list = await self._pipeline_adapter.run(
-            #         product_id=product.id,
-            #         product_name=product.name,
-            #         product_description=product.description,
-            #         category_id=product.category_id,
-            #         source_urls=getattr(product, "source_urls", None),
-            #         image_urls=getattr(product, "image_urls", None),
-            #         targets_raw=targets_raw,
-            #     )
-            #     filled = _PipelineAdapter.convert_to_legacy_dict(av_list, targets_raw)
-            #     return {
-            #         "product_id": product.id,
-            #         "filled_features": filled,
-            #         "debug_info": {},
-            #         "tokens_used": 0,
-            #         "is_cached": False,
-            #     }
+            # Build targets_raw using positional index as id (mirrors adapter's fallback strategy).
+            # The schema is Dict[str, FeatureOption] — no numeric ids — so positional index is
+            # the stable id that both adapter and _values_to_legacy_format agree on.
+            targets_raw = [
+                {
+                    "id": idx,
+                    "name": f_name,
+                    "type": getattr(f_schema, "type", "text"),
+                    "allowed_values": getattr(f_schema, "options", None) or None,
+                    "semantic_type": None,  # TODO Tier 2: infer from feature name via classifier
+                }
+                for idx, (f_name, f_schema) in enumerate(schema.items())
+            ]
+            av_list = await self._pipeline_adapter.run(
+                product_id=product.id,
+                product_name=product.name,
+                product_description=product.description,
+                category_id=product.category_id,
+                category_path=getattr(product, "category_path", []),
+                brand=getattr(product, "brand", None),
+                ean=getattr(product, "ean", None),
+                source_urls=getattr(product, "source_urls", []),
+                image_urls=getattr(product, "image_urls", []),
+                targets_raw=targets_raw,
+            )
+            result_dict = self._values_to_legacy_format(av_list, schema, targets_raw)
+            return {
+                "product_id": product.id,
+                **result_dict,
+            }
 
         result_features = {}
         total_tokens_used = 0
