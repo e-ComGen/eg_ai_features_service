@@ -266,6 +266,7 @@ class JobProcessor:
                 source_urls=getattr(product, "source_urls", []),
                 image_urls=getattr(product, "image_urls", []),
                 targets_raw=targets_raw,
+                marketplace=options.marketplace if options else None,
             )
             result_dict = self._values_to_legacy_format(av_list, schema, targets_raw)
             return {

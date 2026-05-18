@@ -28,6 +28,7 @@ from app.services.enrichment.base import (
     TargetAttribute,
 )
 from app.services.enrichment.pipeline import PipelineOrchestrator
+from app.services.enrichment.strategies.factory import get_strategy
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ class PipelineAdapter:
         image_urls: list[str] | None = None,
         targets_raw: list[dict] | None = None,
         max_cost_usd: float = 0.10,
+        marketplace: Optional[str] = None,
     ) -> list[AttributeValue]:
         """Build context + targets and run orchestrator.
 
@@ -105,7 +107,14 @@ class PipelineAdapter:
                 )
             )
 
-        return await self._orch.enrich(context, targets)
+        # Select orchestrator: if marketplace specified, create one with the appropriate strategy.
+        # Otherwise reuse the default orchestrator (avoids unnecessary instantiation).
+        strategy = get_strategy(marketplace)
+        if marketplace:
+            orch = PipelineOrchestrator(strategy=strategy)
+        else:
+            orch = self._orch
+        return await orch.enrich(context, targets)
 
     # ------------------------------------------------------------------
     # Conversion helpers

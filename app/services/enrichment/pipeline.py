@@ -25,6 +25,8 @@ from app.services.enrichment.sources import (
 )
 from app.services.enrichment.intelligence import LlmClassifier, CostPredictor
 from app.services.enrichment.confidence_aware_judge import ConfidenceAwareJudgeWrapper
+from app.services.enrichment.strategies.base import MarketplaceStrategy
+from app.services.enrichment.strategies.default_strategy import DefaultStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,7 @@ class PipelineOrchestrator:
         websearch_source: Optional[WebSearchSource] = None,
         classifier: Optional[LlmClassifier] = None,
         cost_predictor: Optional[CostPredictor] = None,
+        strategy: Optional[MarketplaceStrategy] = None,
     ):
         self._sources: dict[Source, AttributeSource] = {
             Source.DESCRIPTION: description_source or DescriptionSource(),
@@ -57,18 +60,22 @@ class PipelineOrchestrator:
         }
         self._classifier = classifier or LlmClassifier()
         self._cost_predictor = cost_predictor or CostPredictor()
+        self._strategy: MarketplaceStrategy = strategy or DefaultStrategy()
 
     async def enrich(
         self, context: ExtractionContext, targets: list[TargetAttribute]
     ) -> list[AttributeValue]:
         """Run full pipeline. Returns merged final attributes (one per attribute_id)."""
+        # NEW: apply strategy.filter_unsupported_attributes before pipeline starts
+        targets = self._strategy.filter_unsupported_attributes(targets)
+
         all_values: list[AttributeValue] = []
 
         # Stage 0: DescriptionSource (always first, cheapest)
         all_values += await self._run_stage(Source.DESCRIPTION, context, targets)
         remaining = self._remaining_targets(targets, all_values)
         if not remaining:
-            return self._merge(all_values)
+            return self._finalize(all_values, targets, context)
 
         # Stage 1: Classifier — 1 LLM call for routing decisions
         routing = await self._classifier.classify(context, remaining)
@@ -83,7 +90,7 @@ class PipelineOrchestrator:
             all_values += await self._run_stage(Source.LLM_KNOWLEDGE, context, knowledge_targets)
             remaining = self._remaining_targets(targets, all_values)
             if not remaining:
-                return self._merge(all_values)
+                return self._finalize(all_values, targets, context)
 
         # Stage 3: VisionSource — attrs with VISION in suggested AND image_urls present
         vision_targets = [
@@ -95,7 +102,7 @@ class PipelineOrchestrator:
             all_values += await self._run_stage(Source.VISION, context, vision_targets)
             remaining = self._remaining_targets(targets, all_values)
             if not remaining:
-                return self._merge(all_values)
+                return self._finalize(all_values, targets, context)
 
         # Stage 4 gate: CostPredictor — check if web search is worth running
         websearch_targets = [
@@ -104,16 +111,43 @@ class PipelineOrchestrator:
             and self._sources[Source.WEB_SEARCH].is_applicable(context, t)
         ]
         if not websearch_targets:
-            return self._merge(all_values)
+            return self._finalize(all_values, targets, context)
 
         worth = await self._cost_predictor.is_web_search_worth(context, websearch_targets)
         if not worth:
-            return self._merge(all_values)
+            return self._finalize(all_values, targets, context)
 
         # Stage 4: WebSearchSource
         all_values += await self._run_stage(Source.WEB_SEARCH, context, websearch_targets)
 
-        return self._merge(all_values)
+        return self._finalize(all_values, targets, context)
+
+    def _finalize(
+        self,
+        all_values: list[AttributeValue],
+        targets: list[TargetAttribute],
+        context: ExtractionContext,
+    ) -> list[AttributeValue]:
+        """Merge + strategy post-process + strategy validation. Used at every early-exit point."""
+        merged = self._merge(all_values)
+
+        # Strategy post-processing (e.g. casing normalisation for known enums)
+        merged = self._strategy.post_process_values(merged, targets, context)
+
+        # Strategy validation — drop or normalise individual values
+        filtered: list[AttributeValue] = []
+        for v in merged:
+            target = next((t for t in targets if t.id == v.attribute_id), None)
+            if target:
+                result = self._strategy.validate_value(target, v.value, context)
+                if result.is_valid:
+                    if result.normalized_value is not None:
+                        v.value = result.normalized_value
+                    filtered.append(v)
+                # else: drop value (validation failed)
+            else:
+                filtered.append(v)
+        return filtered
 
     async def _run_stage(
         self, src: Source, context: ExtractionContext, targets: list[TargetAttribute]

@@ -63,6 +63,7 @@ class BatchOptions(BaseModel):
     """Feature-flag options for a batch request."""
     enable_vision: bool = False
     enable_web_search: bool = False
+    marketplace: Optional[str] = None  # "default" | "wb" | "ozon"
 
 
 class BatchPayload(BaseModel):
