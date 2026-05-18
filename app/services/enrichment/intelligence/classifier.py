@@ -23,7 +23,7 @@ class ClassifierDecision(BaseModel):
         description="Источники по приоритету (cheapest first). Может быть пустой для give-up.",
         validation_alias=AliasChoices("suggested_sources", "sources"),
     )
-    reasoning: str = Field(max_length=200)
+    reasoning: str = Field(default="", max_length=200)
 
     model_config = {"populate_by_name": True}
 
@@ -61,14 +61,19 @@ class LlmClassifier:
             "- 'llm_knowledge': cheapest, good for well-known products (Apple, Nike, etc) and standard specs\n"
             "- 'vision': for visually-determinable attributes (color, material appearance, shape, visible labels)\n"
             "- 'web_search': most expensive, best for precise specs (weight, dimensions) of known products\n\n"
-            "Rules:\n"
-            "- For visual attributes (color, material_visual, shape, packaging appearance): start with 'vision'\n"
-            "- For brand/model facts, manufacturer, country of manufacture, article/SKU of well-known products: "
-            "start with 'llm_knowledge'\n"
-            "- For precise numeric specs (weight, exact dimensions, battery capacity) of well-known products: "
-            "prefer 'llm_knowledge' first, then 'web_search'\n"
-            "- For precise specs of obscure/niche products: start with 'web_search'\n"
-            "- If nothing seems to fit: empty list = give up on this attribute\n"
+            "Rules (apply in order — first matching rule wins):\n"
+            "1. Strictly visual attributes (color, material appearance, shape, packaging design): ['vision'].\n"
+            "2. NEVER assign numeric/measurable attributes (weight, volume, calories, proteins, fats, "
+            "carbohydrates, vitamins, shelf life, dimensions, battery capacity) to 'vision' alone.\n"
+            "3. Product composition/ingredient facts (flavor, taste, ingredients, sugar content, "
+            "allergens, fat percentage): ['llm_knowledge'] — these are product definition facts.\n"
+            "4. Nutrition/food numeric facts (proteins g, fats g, carbohydrates g, calories kcal, shelf life): "
+            "['llm_knowledge', 'web_search'] — always include web_search as fallback.\n"
+            "5. Brand/manufacturer/country/article/SKU of well-known products: ['llm_knowledge'].\n"
+            "6. Precise numeric product specs (exact weight, dimensions, battery) of well-known products: "
+            "['llm_knowledge', 'web_search'].\n"
+            "7. Precise specs of obscure/niche products: ['web_search'].\n"
+            "8. Nothing fits: [] (give up).\n"
             "Return short reasoning (max 200 chars)."
         )
         user_text = (
@@ -90,4 +95,15 @@ class LlmClassifier:
             return {a.id: [Source.LLM_KNOWLEDGE] for a in unfilled_attributes}
 
         context.llm_calls_so_far += 1
-        return {d.attribute_id: d.suggested_sources for d in parsed.decisions}
+        result = {d.attribute_id: d.suggested_sources for d in parsed.decisions}
+
+        # Safety net: numeric attrs routed to llm_knowledge-only get web_search appended.
+        # LLM classifiers tend to over-trust knowledge for numeric food/product specs;
+        # web_search is cheap insurance for any numeric that knowledge misses.
+        numeric_ids = {a.id for a in unfilled_attributes if a.type == "numeric"}
+        for attr_id in numeric_ids:
+            sources = result.get(attr_id, [])
+            if sources and Source.WEB_SEARCH not in sources:
+                result[attr_id] = sources + [Source.WEB_SEARCH]
+
+        return result
