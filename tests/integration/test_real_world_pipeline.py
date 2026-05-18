@@ -109,6 +109,19 @@ async def test_real_world_product(fixture, orchestrator):
     print(f"Accuracy:  {accuracy_pct:.0f}% ({matched}/{total} match ground truth)")
     print(f"LLM calls: {context.llm_calls_so_far}")
     print(f"Sources:   {dict(source_count)}")
+    print(f"Filled attributes (with confidence + source + judge status):")
+    for target in targets:
+        gt = ground_truth.get(str(target.id))
+        extracted = by_id.get(target.id)
+        if extracted is None:
+            print(f"  ✗ [{target.id}] {target.name}: MISSING (expected: {gt['value'] if gt else 'n/a'})")
+            continue
+        match_mark = "✓" if (gt and value_matches(extracted.value, gt)) else "≈"
+        judge_mark = "J" if extracted.judge_validated else ("S" if extracted.is_confident() else "?")
+        expected_str = f" (expected: {gt['value']!r})" if gt and not value_matches(extracted.value, gt) else ""
+        print(f"  {match_mark} [{target.id}] {target.name}: {extracted.value!r}  "
+              f"conf={extracted.confidence:.2f} src={extracted.source.value} [{judge_mark}]"
+              f"{expected_str}")
     if mismatched:
         print(f"Mismatches:")
         for attr_id, name, got, expected in mismatched:
@@ -131,6 +144,9 @@ async def test_summary_all_products(orchestrator, capsys):
     total_accuracy = []
     total_calls = 0
     total_source_count = defaultdict(int)
+    conf_by_source_total = defaultdict(list)
+    total_judged_calls = 0
+    total_skipped_judges = 0
     per_product_results = []
 
     for fixture in fixtures:
@@ -166,6 +182,11 @@ async def test_summary_all_products(orchestrator, capsys):
 
         for v in result:
             total_source_count[v.source.value] += 1
+            conf_by_source_total[v.source.value].append(v.confidence)
+            if v.is_confident():
+                total_skipped_judges += 1
+            elif v.judge_validated:
+                total_judged_calls += 1
 
         per_product_results.append((fixture["id"], cov, acc, context.llm_calls_so_far))
 
@@ -181,6 +202,14 @@ async def test_summary_all_products(orchestrator, capsys):
     print(f"Total LLM calls:    {total_calls}")
     print(f"Avg calls/product:  {total_calls / len(fixtures):.1f}")
     print(f"Source distribution: {dict(total_source_count)}")
+    print(f"\nAverage confidence per source:")
+    for src, confs in conf_by_source_total.items():
+        avg_conf = sum(confs) / len(confs) if confs else 0
+        print(f"  {src}: avg {avg_conf:.2f} ({len(confs)} values)")
+    total_judge_events = total_judged_calls + total_skipped_judges
+    skip_rate = 100 * total_skipped_judges / total_judge_events if total_judge_events else 0
+    print(f"Judge calls: {total_judged_calls} validated, {total_skipped_judges} skipped (high conf)")
+    print(f"Judge skip rate: {skip_rate:.0f}%")
     print(f"\nPer-product:")
     for pid, cov, acc, calls in per_product_results:
         print(f"  {pid}: cov {cov:.0f}% acc {acc:.0f}% calls {calls}")
