@@ -8,6 +8,9 @@ from .base import MarketplaceStrategy, ValidationResult
 from app.services.enrichment.base import (
     AttributeValue, TargetAttribute, ExtractionContext,
 )
+from app.services.enrichment.strategies.dictionaries.loader import (
+    get_wb_characteristics_for_category,
+)
 
 
 # Атрибуты которые AI не должен заполнять на WB — селлер сам или WB генерит
@@ -59,4 +62,19 @@ class WildberriesStrategy(MarketplaceStrategy):
         # TODO: проверка лимитов длины (Tier 2)
         return ValidationResult(is_valid=True, normalized_value=value)
 
-    # post_process_values, normalize_target — TODO для будущих итераций
+    def normalize_target(self, target: TargetAttribute) -> TargetAttribute:
+        """Enrich allowed_values from WB dictionary when category is known.
+
+        TODO (Tier 2): TargetAttribute currently does not carry a category_id
+        field.  Once it does, look up the subject in the WB dictionary and
+        merge allowed_values so the AI can use them as enum hints.
+
+        Example (future):
+            if target.category_id:
+                chars = get_wb_characteristics_for_category(target.category_id)
+                char_map = {c["name"]: c for c in chars}
+                if target.name in char_map:
+                    # merge allowed_values ...
+        """
+        # Stub — returns target unchanged until category_id is available on target
+        return target
