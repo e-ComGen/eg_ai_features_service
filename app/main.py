@@ -1,6 +1,10 @@
 import asyncio
 import logging
-from fastapi import FastAPI, Depends
+import uuid
+import shutil
+from pathlib import Path
+from fastapi import FastAPI, Depends, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi.responses import FileResponse
 from .security import verify_internal_token
 from .models import BatchPayload
 from .database import init_db
@@ -12,6 +16,9 @@ from .services.matcher import MatcherService
 from .services.enrichment import VisionProducer, WebSearchProducer
 from .services.providers.factory import get_main_manager, get_vision_provider, get_web_search_client
 from .config import OPENAI_API_KEY, WEB_SEARCH_MODEL, WEB_SEARCH_MAX_CONCURRENT, PROVIDER_MAIN
+from .services.excel.wb_excel import WbExcelReader, WbExcelWriter
+from .services.excel.ozon_excel import OzonExcelReader, OzonExcelWriter
+from .services.enrichment.pipeline_adapter import PipelineAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -145,3 +152,151 @@ async def process_batch(payload: BatchPayload):
         print(f"⚠️ Failed to write CSV report: {e}")
 
     return {"status": "success", "data": clean_data}
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Excel bulk processing + Single product endpoint
+# ---------------------------------------------------------------------------
+
+UPLOAD_DIR = Path("/tmp/eg_uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# In-memory job registry (MVP — для production нужен Redis)
+_jobs: dict[str, dict] = {}
+
+
+@app.post("/fill-single")
+async def fill_single_product(
+    name: str,
+    description: str = "",
+    category_id: int = 0,
+    brand: str | None = None,
+    image_urls: list[str] | None = None,
+    source_urls: list[str] | None = None,
+    marketplace: str = "default",
+):
+    """Заполнить характеристики ОДНОГО товара (для quick demo).
+
+    targets_raw пустой — для single product caller может расширить endpoint позже,
+    передавая targets в payload или взяв стандартный набор из category dictionary.
+    """
+    adapter = PipelineAdapter()
+    targets_raw: list[dict] = []  # TODO: принять targets в payload или взять из category dictionary
+
+    values = await adapter.run(
+        product_id=0,
+        product_name=name,
+        product_description=description,
+        category_id=category_id,
+        brand=brand,
+        image_urls=image_urls or [],
+        source_urls=source_urls or [],
+        targets_raw=targets_raw,
+        marketplace=marketplace,
+    )
+    return {
+        "filled_attributes": [
+            {
+                "attribute_id": v.attribute_id,
+                "value": v.value,
+                "confidence": v.confidence,
+                "source": v.source.value,
+                "evidence": v.evidence,
+            }
+            for v in values
+        ]
+    }
+
+
+@app.post("/excel/upload")
+async def upload_excel(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    marketplace: str = "wb",  # 'wb' or 'ozon'
+):
+    """Принять Excel файл, запустить фоновую обработку, вернуть job_id."""
+    job_id = uuid.uuid4().hex
+    saved_path = UPLOAD_DIR / f"{job_id}_input.xlsx"
+    with open(saved_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    _jobs[job_id] = {"status": "queued", "progress": 0, "total": 0, "marketplace": marketplace}
+    background_tasks.add_task(_process_excel_job, job_id, saved_path, marketplace)
+    return {
+        "job_id": job_id,
+        "status_url": f"/excel/status/{job_id}",
+        "download_url": f"/excel/download/{job_id}",
+    }
+
+
+@app.get("/excel/status/{job_id}")
+async def excel_status(job_id: str):
+    """Получить статус обработки Excel-файла."""
+    if job_id not in _jobs:
+        raise HTTPException(404, "Job not found")
+    return _jobs[job_id]
+
+
+@app.get("/excel/download/{job_id}")
+async def excel_download(job_id: str):
+    """Скачать обработанный Excel-файл."""
+    if job_id not in _jobs:
+        raise HTTPException(404, "Job not found")
+    if _jobs[job_id]["status"] != "done":
+        raise HTTPException(425, "Not ready yet")
+    output_path = UPLOAD_DIR / f"{job_id}_output.xlsx"
+    return FileResponse(str(output_path), filename=f"filled_{job_id[:8]}.xlsx")
+
+
+async def _process_excel_job(job_id: str, input_path: Path, marketplace: str) -> None:
+    """Background job processor для Excel bulk enrichment."""
+    try:
+        if marketplace == "wb":
+            reader: WbExcelReader | OzonExcelReader = WbExcelReader(input_path)
+            writer: WbExcelWriter | OzonExcelWriter = WbExcelWriter(input_path)
+        elif marketplace == "ozon":
+            reader = OzonExcelReader(input_path)
+            writer = OzonExcelWriter(input_path)
+        else:
+            raise ValueError(f"Unknown marketplace: {marketplace}")
+
+        products = reader.read_products()
+        targets_raw = (
+            reader.get_target_attributes(products)
+            if hasattr(reader, "get_target_attributes")
+            else []
+        )
+
+        _jobs[job_id]["total"] = len(products)
+        _jobs[job_id]["status"] = "processing"
+
+        adapter = PipelineAdapter()
+        for i, product in enumerate(products):
+            try:
+                values = await adapter.run(
+                    product_id=product.get("row_index", i),
+                    product_name=product.get("name") or "",
+                    product_description=product.get("description"),
+                    category_id=0,  # TODO: extract from sheet if possible
+                    brand=product.get("brand"),
+                    targets_raw=targets_raw,
+                    marketplace=marketplace,
+                )
+                ai_filled: dict[str, str] = {}
+                for v in values:
+                    # Map attribute_id → column name
+                    target = next((t for t in targets_raw if t["id"] == v.attribute_id), None)
+                    if target:
+                        ai_filled[target["name"]] = str(v.value)
+                product["ai_filled"] = ai_filled
+            except Exception as exc:
+                product["ai_filled"] = {}
+                product["error"] = str(exc)
+            _jobs[job_id]["progress"] = i + 1
+
+        output_path = UPLOAD_DIR / f"{job_id}_output.xlsx"
+        writer.write_filled(output_path, products)
+        _jobs[job_id]["status"] = "done"
+    except Exception as exc:
+        _jobs[job_id]["status"] = "error"
+        _jobs[job_id]["error"] = str(exc)
