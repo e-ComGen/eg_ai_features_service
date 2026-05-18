@@ -7,7 +7,7 @@
 Spec: docs/architecture/pipeline.md, section "Stage 2 / LlmKnowledgeSource".
 """
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, AliasChoices
 from app.services.enrichment.base import (
     AttributeSource, AttributeValue, TargetAttribute, ExtractionContext,
     Source, LlmJudge,
@@ -18,10 +18,12 @@ from app.services.enrichment.judges.knowledge_judge import KnowledgeJudge
 
 
 class _KnowledgeAttr(BaseModel):
-    attribute_id: int
+    attribute_id: int = Field(..., validation_alias=AliasChoices("attribute_id", "id"))
     value: str | int | float | bool
-    confidence: float = Field(ge=0.0, le=1.0)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     reasoning: Optional[str] = Field(None, max_length=200, description="откуда LLM знает")
+
+    model_config = {"populate_by_name": True}
 
 
 class _KnowledgeResponse(BaseModel):

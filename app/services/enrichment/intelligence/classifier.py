@@ -7,7 +7,7 @@ Classifier решает где их искать. 1 LLM call возвращае�
 Spec: docs/architecture/pipeline.md, section "Stage 1 / LlmClassifier".
 """
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, AliasChoices
 from app.services.enrichment.base import (
     Source, TargetAttribute, ExtractionContext,
 )
@@ -20,9 +20,12 @@ class ClassifierDecision(BaseModel):
     attribute_id: int
     suggested_sources: list[Source] = Field(
         ..., min_length=1, max_length=3,
-        description="Источники по приоритету (cheapest first). Может быть пустой для give-up."
+        description="Источники по приоритету (cheapest first). Может быть пустой для give-up.",
+        validation_alias=AliasChoices("suggested_sources", "sources"),
     )
     reasoning: str = Field(max_length=200)
+
+    model_config = {"populate_by_name": True}
 
 
 class _ClassifierResponse(BaseModel):
