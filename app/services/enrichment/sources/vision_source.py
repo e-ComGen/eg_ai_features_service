@@ -112,6 +112,7 @@ class VisionSource(AttributeSource):
             return []
         context.llm_calls_so_far += 1
 
+        target_by_id = {t.id: t for t in targets}
         return [
             AttributeValue(
                 attribute_id=a.attribute_id,
@@ -119,6 +120,8 @@ class VisionSource(AttributeSource):
                 confidence=a.confidence,
                 source=Source.VISION,
                 evidence=a.evidence,
+                semantic_type=target_by_id[a.attribute_id].semantic_type
+                              if a.attribute_id in target_by_id else None,
             )
             for a in parsed.extracted
         ]

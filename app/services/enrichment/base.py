@@ -15,6 +15,28 @@ from typing import Any, Optional, Union
 from pydantic import BaseModel, Field, field_validator
 
 
+# Semantic types для которых hallucinations критичны (false positive имеет реальные последствия).
+# Для них ConfidenceAwareJudgeWrapper всегда вызывает judge, игнорируя confidence shortcut.
+CRITICAL_SEMANTIC_TYPES: frozenset[str] = frozenset({
+    "ean",          # European Article Number (штрихкод 13 цифр)
+    "upc",          # Universal Product Code (12 цифр, US)
+    "gtin",         # Global Trade Item Number
+    "barcode",      # generic
+    "article",      # артикул производителя
+    "sku",          # stock keeping unit
+    "serial",       # серийный номер
+    "imei",         # IMEI для электроники
+    "model_code",   # точный код модели
+})
+
+
+def is_critical_semantic_type(semantic_type: Optional[str]) -> bool:
+    """True если semantic_type требует обязательной проверки judge независимо от confidence."""
+    if not semantic_type:
+        return False
+    return semantic_type.lower() in CRITICAL_SEMANTIC_TYPES
+
+
 class Source(StrEnum):
     """Откуда пришло значение характеристики.
 
@@ -56,6 +78,7 @@ class AttributeValue(BaseModel):
     source: Source = Field(..., description="Откуда пришло значение")
     evidence: Optional[str] = Field(None, description="Цитата/URL/обоснование для audit")
     judge_validated: bool = Field(False, description="Прошёл ли через per-source judge")
+    semantic_type: Optional[str] = Field(None, description="copy из TargetAttribute.semantic_type для downstream решений")
 
     @field_validator("evidence")
     @classmethod
@@ -66,7 +89,12 @@ class AttributeValue(BaseModel):
         return v
 
     def is_confident(self) -> bool:
-        """True если confidence ≥ source-specific threshold (можно skip judge)."""
+        """True если confidence ≥ source-specific threshold AND attribute не критичный.
+
+        Critical attrs (EAN, UPC, article) НИКОГДА не считаются is_confident — всегда judge.
+        """
+        if is_critical_semantic_type(self.semantic_type):
+            return False  # критичные всегда требуют judge
         return self.confidence >= SOURCE_CONFIDENCE_THRESHOLDS[self.source]
 
 
@@ -163,6 +191,8 @@ __all__ = [
     "Source",
     "SOURCE_PRIORITY",
     "SOURCE_CONFIDENCE_THRESHOLDS",
+    "CRITICAL_SEMANTIC_TYPES",
+    "is_critical_semantic_type",
     "AttributeValue",
     "TargetAttribute",
     "ExtractionContext",

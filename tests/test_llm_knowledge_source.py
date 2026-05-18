@@ -25,8 +25,9 @@ def _make_context(**kwargs) -> ExtractionContext:
     return ExtractionContext(**defaults)
 
 
-def _make_target(attr_id: int = 1, name: str = "Color", type_: str = "text") -> TargetAttribute:
-    return TargetAttribute(id=attr_id, name=name, type=type_)
+def _make_target(attr_id: int = 1, name: str = "Color", type_: str = "text",
+                 semantic_type: str | None = None) -> TargetAttribute:
+    return TargetAttribute(id=attr_id, name=name, type=type_, semantic_type=semantic_type)
 
 
 def _make_llm_mock(parsed=None, tokens=100) -> AsyncMock:
@@ -157,3 +158,31 @@ def test_source_type_is_llm_knowledge():
     """source_type property must return Source.LLM_KNOWLEDGE."""
     src = LlmKnowledgeSource(llm_manager=_make_llm_mock())
     assert src.source_type == Source.LLM_KNOWLEDGE
+
+
+@pytest.mark.asyncio
+async def test_extract_copies_semantic_type_from_target():
+    """value.semantic_type must match the target's semantic_type."""
+    attr = _KnowledgeAttr(attribute_id=5, value="5702015595595", confidence=0.95, reasoning="known EAN")
+    parsed = _KnowledgeResponse(known_attributes=[attr])
+    src = LlmKnowledgeSource(llm_manager=_make_llm_mock(parsed=parsed))
+    ctx = _make_context()
+
+    result = await src.extract(ctx, [_make_target(5, name="EAN", semantic_type="ean")])
+
+    assert len(result) == 1
+    assert result[0].semantic_type == "ean"
+
+
+@pytest.mark.asyncio
+async def test_extract_semantic_type_none_when_target_has_no_semantic_type():
+    """value.semantic_type is None when target has no semantic_type."""
+    attr = _KnowledgeAttr(attribute_id=5, value="blue", confidence=0.95, reasoning="well known")
+    parsed = _KnowledgeResponse(known_attributes=[attr])
+    src = LlmKnowledgeSource(llm_manager=_make_llm_mock(parsed=parsed))
+    ctx = _make_context()
+
+    result = await src.extract(ctx, [_make_target(5, semantic_type=None)])
+
+    assert len(result) == 1
+    assert result[0].semantic_type is None

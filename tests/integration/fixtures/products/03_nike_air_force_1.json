@@ -17,7 +17,7 @@
   "targets": [
     {"id": 1, "name": "Бренд", "type": "text", "semantic_type": "brand"},
     {"id": 2, "name": "Модель", "type": "text"},
-    {"id": 3, "name": "Артикул", "type": "text"},
+    {"id": 3, "name": "Артикул", "type": "text", "semantic_type": "article"},
     {"id": 4, "name": "Цвет", "type": "text", "semantic_type": "color"},
     {"id": 5, "name": "Материал верха", "type": "text", "semantic_type": "material"},
     {"id": 6, "name": "Материал подошвы", "type": "text"},

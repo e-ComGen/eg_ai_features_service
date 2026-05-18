@@ -31,8 +31,9 @@ def _make_context(product_id: int = 1, product_name: str = "ACME Widget Pro") ->
     )
 
 
-def _make_target(attr_id: int = 42, name: str = "Weight", type_: str = "text") -> TargetAttribute:
-    return TargetAttribute(id=attr_id, name=name, type=type_)
+def _make_target(attr_id: int = 42, name: str = "Weight", type_: str = "text",
+                 semantic_type: str | None = None) -> TargetAttribute:
+    return TargetAttribute(id=attr_id, name=name, type=type_, semantic_type=semantic_type)
 
 
 def _make_extraction_response(
@@ -187,3 +188,31 @@ def test_get_judge_returns_websearch_judge():
     source, _, _ = _make_source()
     judge = source.get_judge()
     assert isinstance(judge, WebSearchJudge)
+
+
+# 10. extract copies semantic_type from target
+@pytest.mark.asyncio
+async def test_extract_copies_semantic_type_from_target():
+    """value.semantic_type must match the target's semantic_type."""
+    resp = _make_extraction_response(attr_id=42, value="0883412740906", confidence=0.9, evidence="EAN from specs")
+    source, _, _ = _make_source(summary="EAN is 0883412740906.", extraction_response=resp)
+    ctx = _make_context()
+    target = _make_target(attr_id=42, name="EAN", semantic_type="ean")
+
+    result = await source.extract(ctx, [target])
+
+    assert len(result) == 1
+    assert result[0].semantic_type == "ean"
+
+
+@pytest.mark.asyncio
+async def test_extract_semantic_type_none_when_target_has_no_semantic_type():
+    """value.semantic_type is None when target has no semantic_type."""
+    source, _, _ = _make_source(summary="Weight is 500g.")
+    ctx = _make_context()
+    target = _make_target(attr_id=42, name="Weight", semantic_type=None)
+
+    result = await source.extract(ctx, [target])
+
+    assert len(result) == 1
+    assert result[0].semantic_type is None

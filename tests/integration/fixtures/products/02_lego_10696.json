@@ -24,7 +24,7 @@
     {"id": 4, "name": "Серия", "type": "text"},
     {"id": 5, "name": "Возраст (от лет)", "type": "numeric"},
     {"id": 6, "name": "Вес упаковки (кг)", "type": "numeric", "semantic_type": "weight"},
-    {"id": 7, "name": "EAN", "type": "text"},
+    {"id": 7, "name": "EAN", "type": "text", "semantic_type": "ean"},
     {"id": 8, "name": "Количество цветов деталей", "type": "numeric"}
   ],
   "ground_truth": {

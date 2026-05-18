@@ -137,3 +137,26 @@ def test_source_property_delegates_to_judge():
     wrapper = ConfidenceAwareJudgeWrapper(judge)
 
     assert wrapper.source == Source.VISION
+
+
+@pytest.mark.asyncio
+async def test_critical_attr_forces_judge_call_even_at_high_confidence():
+    """A value with semantic_type='ean' and conf=0.99 must always call judge (not skip)."""
+    judge = _make_judge(source=Source.LLM_KNOWLEDGE)
+    judge.validate.return_value = True
+    wrapper = ConfidenceAwareJudgeWrapper(judge)
+
+    # EAN with very high confidence — normally would be skipped, but must not be
+    value = AttributeValue(
+        attribute_id=7, value="5702015595595", confidence=0.99,
+        source=Source.LLM_KNOWLEDGE, semantic_type="ean",
+    )
+    ctx = _make_ctx()
+
+    result = await wrapper.maybe_validate(value, ctx)
+
+    judge.validate.assert_called_once_with(value, ctx)
+    assert result is not None
+    assert result.judge_validated is True
+    assert wrapper.stats["skipped"] == 0
+    assert wrapper.stats["validated"] == 1

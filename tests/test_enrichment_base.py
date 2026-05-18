@@ -4,6 +4,7 @@ from pydantic import ValidationError
 
 from app.services.enrichment.base import (
     Source, SOURCE_PRIORITY, SOURCE_CONFIDENCE_THRESHOLDS,
+    CRITICAL_SEMANTIC_TYPES, is_critical_semantic_type,
     AttributeValue, TargetAttribute, ExtractionContext,
     LlmJudge, AttributeSource,
 )
@@ -152,3 +153,76 @@ def test_concrete_missing_method_cannot_be_instantiated():
 def test_llm_judge_cannot_be_instantiated_directly():
     with pytest.raises(TypeError):
         LlmJudge()
+
+
+# --- CRITICAL_SEMANTIC_TYPES and is_critical_semantic_type ---
+
+def test_is_critical_semantic_type_ean():
+    """EAN is a critical semantic type."""
+    assert is_critical_semantic_type("ean") is True
+
+
+def test_is_critical_semantic_type_lowercase_normalization():
+    """All case variants of EAN return True."""
+    assert is_critical_semantic_type("EAN") is True
+    assert is_critical_semantic_type("Ean") is True
+    assert is_critical_semantic_type("ean") is True
+
+
+def test_is_critical_semantic_type_all_critical_members():
+    """All members of CRITICAL_SEMANTIC_TYPES return True."""
+    for stype in CRITICAL_SEMANTIC_TYPES:
+        assert is_critical_semantic_type(stype) is True, f"{stype} should be critical"
+
+
+def test_is_critical_semantic_type_non_critical():
+    """Non-critical types (color, weight, brand) return False."""
+    assert is_critical_semantic_type("color") is False
+    assert is_critical_semantic_type("weight") is False
+    assert is_critical_semantic_type("brand") is False
+
+
+def test_is_critical_semantic_type_none():
+    """None returns False."""
+    assert is_critical_semantic_type(None) is False
+
+
+def test_is_critical_semantic_type_empty_string():
+    """Empty string returns False."""
+    assert is_critical_semantic_type("") is False
+
+
+# --- AttributeValue critical semantic_type interaction ---
+
+def test_attribute_value_critical_never_confident():
+    """Value with semantic_type='ean' + confidence=0.99 → is_confident() is False."""
+    av = AttributeValue(
+        attribute_id=1, value="5702015595595", confidence=0.99,
+        source=Source.LLM_KNOWLEDGE, semantic_type="ean",
+    )
+    assert av.is_confident() is False
+
+
+def test_attribute_value_non_critical_still_uses_threshold():
+    """Non-critical value with confidence above threshold → is_confident() is True."""
+    av = AttributeValue(
+        attribute_id=1, value="red", confidence=0.95,
+        source=Source.DESCRIPTION, semantic_type="color",
+    )
+    assert av.is_confident() is True
+
+
+def test_attribute_value_semantic_type_default_none():
+    """semantic_type defaults to None."""
+    av = AttributeValue(attribute_id=1, value="blue", confidence=0.9, source=Source.VISION)
+    assert av.semantic_type is None
+
+
+def test_attribute_value_critical_upc_never_confident():
+    """UPC at any confidence level → is_confident() is False."""
+    for source in Source:
+        av = AttributeValue(
+            attribute_id=1, value="012345678901", confidence=1.0,
+            source=source, semantic_type="upc",
+        )
+        assert av.is_confident() is False, f"UPC should not be confident for source {source}"

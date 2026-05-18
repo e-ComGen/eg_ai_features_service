@@ -183,3 +183,33 @@ def test_get_judge_returns_vision_judge():
     source, _, _ = _make_vision_source()
     judge = source.get_judge()
     assert isinstance(judge, VisionJudge)
+
+
+@pytest.mark.asyncio
+async def test_extract_copies_semantic_type_from_target():
+    """value.semantic_type must match the target's semantic_type."""
+    from app.services.enrichment.sources.vision_source import _VisionExtractedAttr
+    extracted = [_VisionExtractedAttr(attribute_id=101, value="red", confidence=0.88, evidence="red surface")]
+    source, _, _ = _make_vision_source(vision_text="Red surface.", extracted=extracted)
+    ctx = _make_context()
+    target = _make_target(attr_id=101, name="Color", semantic_type="color")
+
+    result = await source.extract(ctx, [target])
+
+    assert len(result) == 1
+    assert result[0].semantic_type == "color"
+
+
+@pytest.mark.asyncio
+async def test_extract_semantic_type_none_when_target_has_no_semantic_type():
+    """value.semantic_type is None when target has no semantic_type."""
+    from app.services.enrichment.sources.vision_source import _VisionExtractedAttr
+    extracted = [_VisionExtractedAttr(attribute_id=101, value="red", confidence=0.88, evidence="red surface")]
+    source, _, _ = _make_vision_source(vision_text="Red surface.", extracted=extracted)
+    ctx = _make_context()
+    target = _make_target(attr_id=101, name="Color", semantic_type=None)
+
+    result = await source.extract(ctx, [target])
+
+    assert len(result) == 1
+    assert result[0].semantic_type is None

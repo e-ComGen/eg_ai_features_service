@@ -26,8 +26,10 @@ def _make_context(description: str | None = "This product has red color and weig
     )
 
 
-def _make_target(attr_id: int = 10, name: str = "Color", attr_type: str = "enum") -> TargetAttribute:
-    return TargetAttribute(id=attr_id, name=name, type=attr_type, allowed_values=["red", "blue", "green"])
+def _make_target(attr_id: int = 10, name: str = "Color", attr_type: str = "enum",
+                 semantic_type: str | None = None) -> TargetAttribute:
+    return TargetAttribute(id=attr_id, name=name, type=attr_type, allowed_values=["red", "blue", "green"],
+                           semantic_type=semantic_type)
 
 
 def _make_mock_llm(extracted_attrs: list[_ExtractedAttr] | None = None) -> AsyncMock:
@@ -160,3 +162,35 @@ def test_get_judge_returns_description_judge():
     source = DescriptionSource(llm_manager=MagicMock())
     judge = source.get_judge()
     assert isinstance(judge, DescriptionJudge)
+
+
+@pytest.mark.asyncio
+async def test_extract_copies_semantic_type_from_target():
+    """value.semantic_type must match the target's semantic_type."""
+    mock_llm = _make_mock_llm([
+        _ExtractedAttr(attribute_id=10, value="red", confidence=0.9, evidence="red color"),
+    ])
+    source = DescriptionSource(llm_manager=mock_llm)
+    ctx = _make_context()
+    target = _make_target(attr_id=10, name="Color", semantic_type="color")
+
+    result = await source.extract(ctx, [target])
+
+    assert len(result) == 1
+    assert result[0].semantic_type == "color"
+
+
+@pytest.mark.asyncio
+async def test_extract_semantic_type_none_when_target_has_no_semantic_type():
+    """value.semantic_type is None when target has no semantic_type."""
+    mock_llm = _make_mock_llm([
+        _ExtractedAttr(attribute_id=10, value="red", confidence=0.9, evidence="red color"),
+    ])
+    source = DescriptionSource(llm_manager=mock_llm)
+    ctx = _make_context()
+    target = _make_target(attr_id=10, name="Color", semantic_type=None)
+
+    result = await source.extract(ctx, [target])
+
+    assert len(result) == 1
+    assert result[0].semantic_type is None
