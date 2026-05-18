@@ -1,0 +1,50 @@
+{
+  "id": "05_wb_cosmetics",
+  "product": {
+    "name": "Тональный крем MAYBELLINE FIT ME Matte+Poreless, оттенок 110, 30 мл",
+    "description": "",
+    "category_id": 5,
+    "category_path": ["Красота", "Макияж", "Тональные средства"],
+    "brand": "Maybelline New York",
+    "ean": null,
+    "product_url": "https://www.wildberries.ru/catalog/164016471/detail.aspx",
+    "image_urls": [
+      "https://basket-11.wbbasket.ru/vol1640/part164016/164016471/images/big/1.webp",
+      "https://basket-11.wbbasket.ru/vol1640/part164016/164016471/images/big/2.webp"
+    ],
+    "source_urls": []
+  },
+  "targets": [
+    {"id": 1, "name": "Бренд", "type": "text", "semantic_type": "brand"},
+    {"id": 2, "name": "Линейка", "type": "text"},
+    {"id": 3, "name": "Оттенок", "type": "text"},
+    {"id": 4, "name": "Объём (мл)", "type": "numeric"},
+    {"id": 5, "name": "Тип кожи", "type": "text"},
+    {"id": 6, "name": "Эффект", "type": "text"},
+    {"id": 7, "name": "Формула", "type": "text"},
+    {"id": 8, "name": "Степень покрытия", "type": "text"}
+  ],
+  "ground_truth": {
+    "1": {"value": "Maybelline New York", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Maybelline New York", "Maybelline", "MAYBELLINE", "мэйбеллин"]},
+    "2": {"value": "Fit Me Matte+Poreless", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Fit Me Matte+Poreless", "Fit Me", "Fit Me Matte & Poreless", "FIT ME"]},
+    "3": {"value": "110", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["110", "110 Porcelain", "оттенок 110", "тон 110"]},
+    "4": {"value": 30, "tolerance": 1, "best_source": "knowledge"},
+    "5": {"value": "Нормальная и жирная", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Нормальная и жирная", "Normal to oily", "нормальная", "жирная", "нормальная/жирная"]},
+    "6": {"value": "Матирование", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Матирование", "Matte", "матирующий", "матовый", "матирующий эффект"]},
+    "7": {"value": "Жидкая", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Жидкая", "Liquid", "жидкая", "жидкий"]},
+    "8": {"value": "Среднее", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Среднее", "Medium", "среднее", "Medium coverage"]}
+  },
+  "metadata": {
+    "source": "Wildberries",
+    "nm_id": "164016471",
+    "fetched_at": "2026-05-14",
+    "note": "Description deliberately empty to force vision/knowledge/websearch. Maybelline Fit Me Matte+Poreless shade 110, 30ml."
+  }
+}

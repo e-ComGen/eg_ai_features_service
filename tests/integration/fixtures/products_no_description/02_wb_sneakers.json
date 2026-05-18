@@ -1,0 +1,51 @@
+{
+  "id": "02_wb_sneakers",
+  "product": {
+    "name": "Кроссовки SUPERSTAR FOUNDATION adidas Белый/Чёрный",
+    "description": "",
+    "category_id": 2,
+    "category_path": ["Обувь", "Кроссовки и кеды", "Adidas"],
+    "brand": "Adidas",
+    "ean": null,
+    "product_url": "https://www.wildberries.ru/catalog/1977304/detail.aspx",
+    "image_urls": [
+      "https://basket-01.wbbasket.ru/vol19/part1977/1977304/images/big/1.webp",
+      "https://basket-01.wbbasket.ru/vol19/part1977/1977304/images/big/2.webp"
+    ],
+    "source_urls": []
+  },
+  "targets": [
+    {"id": 1, "name": "Бренд", "type": "text", "semantic_type": "brand"},
+    {"id": 2, "name": "Модель", "type": "text"},
+    {"id": 3, "name": "Артикул производителя", "type": "text"},
+    {"id": 4, "name": "Цвет", "type": "text", "semantic_type": "color"},
+    {"id": 5, "name": "Материал верха", "type": "text", "semantic_type": "material"},
+    {"id": 6, "name": "Материал подошвы", "type": "text"},
+    {"id": 7, "name": "Тип застёжки", "type": "text"},
+    {"id": 8, "name": "Высота кроссовок", "type": "text"}
+  ],
+  "ground_truth": {
+    "1": {"value": "Adidas", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Adidas", "adidas", "ADIDAS"]},
+    "2": {"value": "Superstar", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Superstar", "SUPERSTAR", "Superstar Foundation"]},
+    "3": {"value": "EG4958", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["EG4958", "eg4958"]},
+    "4": {"value": "Белый", "tolerance": null, "best_source": "vision",
+          "accept_values": ["Белый", "Белый/Чёрный", "White", "White/Black", "белый"]},
+    "5": {"value": "Кожа", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Кожа", "Натуральная кожа", "Leather", "кожа", "натуральная кожа"]},
+    "6": {"value": "Резина", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Резина", "Rubber", "резина"]},
+    "7": {"value": "Шнуровка", "tolerance": null, "best_source": "vision",
+          "accept_values": ["Шнуровка", "Шнурки", "Lace", "шнуровка"]},
+    "8": {"value": "Низкие", "tolerance": null, "best_source": "vision",
+          "accept_values": ["Низкие", "Low", "Low-top", "низкие"]}
+  },
+  "metadata": {
+    "source": "Wildberries",
+    "nm_id": "1977304",
+    "fetched_at": "2026-05-14",
+    "note": "Description deliberately empty to force vision/knowledge/websearch. Adidas Superstar EG4958 classic white/black."
+  }
+}

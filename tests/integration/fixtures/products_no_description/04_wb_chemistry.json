@@ -1,0 +1,49 @@
+{
+  "id": "04_wb_chemistry",
+  "product": {
+    "name": "Порошок стиральный Автомат Color 20 стирок 3 кг, Ariel",
+    "description": "",
+    "category_id": 4,
+    "category_path": ["Бытовая химия", "Стиральные порошки"],
+    "brand": "Ariel",
+    "ean": null,
+    "product_url": "https://www.wildberries.ru/catalog/2776861/detail.aspx",
+    "image_urls": [
+      "https://basket-01.wbbasket.ru/vol27/part2776/2776861/images/big/1.webp",
+      "https://basket-01.wbbasket.ru/vol27/part2776/2776861/images/big/2.webp"
+    ],
+    "source_urls": []
+  },
+  "targets": [
+    {"id": 1, "name": "Бренд", "type": "text", "semantic_type": "brand"},
+    {"id": 2, "name": "Назначение", "type": "text"},
+    {"id": 3, "name": "Тип", "type": "text"},
+    {"id": 4, "name": "Масса (кг)", "type": "numeric", "semantic_type": "weight"},
+    {"id": 5, "name": "Количество стирок", "type": "numeric"},
+    {"id": 6, "name": "Страна производства", "type": "text"},
+    {"id": 7, "name": "Производитель", "type": "text"},
+    {"id": 8, "name": "Тип упаковки", "type": "text"}
+  ],
+  "ground_truth": {
+    "1": {"value": "Ariel", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Ariel", "ARIEL", "Ариэль"]},
+    "2": {"value": "Для цветного белья", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Для цветного белья", "Color", "Для цветных и тёмных вещей", "для цветного белья"]},
+    "3": {"value": "Порошок-автомат", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Порошок-автомат", "Стиральный порошок", "Автомат", "порошок"]},
+    "4": {"value": 3, "tolerance": 0.1, "best_source": "knowledge"},
+    "5": {"value": 20, "tolerance": 2, "best_source": "knowledge"},
+    "6": {"value": "Россия", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Россия", "Russia", "россия"]},
+    "7": {"value": "Procter & Gamble", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Procter & Gamble", "P&G", "Проктер энд Гэмбл"]},
+    "8": {"value": "Пакет", "tolerance": null, "best_source": "vision",
+          "accept_values": ["Пакет", "Полиэтиленовый пакет", "пакет", "упаковка"]}
+  },
+  "metadata": {
+    "source": "Wildberries",
+    "nm_id": "2776861",
+    "fetched_at": "2026-05-14",
+    "note": "Description deliberately empty to force vision/knowledge/websearch. Ariel Color 3kg, 20 washes, manufacturer Procter & Gamble Russia."
+  }
+}

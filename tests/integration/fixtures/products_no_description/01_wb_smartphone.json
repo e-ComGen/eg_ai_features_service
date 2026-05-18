@@ -1,0 +1,52 @@
+{
+  "id": "01_wb_smartphone",
+  "product": {
+    "name": "Смартфон Samsung Galaxy S24 Ultra 12/256 GB Black",
+    "description": "",
+    "category_id": 1,
+    "category_path": ["Электроника", "Смартфоны и телефоны", "Смартфоны"],
+    "brand": "Samsung",
+    "ean": null,
+    "product_url": "https://www.wildberries.ru/catalog/219073456/detail.aspx",
+    "image_urls": [
+      "https://basket-15.wbbasket.ru/vol2190/part219073/219073456/images/big/1.webp",
+      "https://basket-15.wbbasket.ru/vol2190/part219073/219073456/images/big/2.webp"
+    ],
+    "source_urls": []
+  },
+  "targets": [
+    {"id": 1, "name": "Бренд", "type": "text", "semantic_type": "brand"},
+    {"id": 2, "name": "Модель", "type": "text"},
+    {"id": 3, "name": "Объём оперативной памяти (ГБ)", "type": "numeric"},
+    {"id": 4, "name": "Объём встроенной памяти (ГБ)", "type": "numeric"},
+    {"id": 5, "name": "Цвет", "type": "text", "semantic_type": "color"},
+    {"id": 6, "name": "Вес (г)", "type": "numeric", "semantic_type": "weight"},
+    {"id": 7, "name": "Диагональ экрана (дюймы)", "type": "numeric", "semantic_type": "screen_size"},
+    {"id": 8, "name": "Основная камера (МП)", "type": "numeric"},
+    {"id": 9, "name": "Ёмкость аккумулятора (мАч)", "type": "numeric"},
+    {"id": 10, "name": "Операционная система", "type": "text"}
+  ],
+  "ground_truth": {
+    "1": {"value": "Samsung", "tolerance": null, "best_source": "knowledge"},
+    "2": {"value": "Galaxy S24 Ultra", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Galaxy S24 Ultra", "Samsung Galaxy S24 Ultra", "S24 Ultra"]},
+    "3": {"value": 12, "tolerance": 0, "best_source": "knowledge"},
+    "4": {"value": 256, "tolerance": 0, "best_source": "knowledge",
+          "accept_values": [256, "256", "256 ГБ", "256GB"]},
+    "5": {"value": "Чёрный", "tolerance": null, "best_source": "vision",
+          "accept_values": ["Чёрный", "Black", "Onyx Black", "чёрный", "черный"]},
+    "6": {"value": 232, "tolerance": 3, "best_source": "knowledge"},
+    "7": {"value": 6.8, "tolerance": 0.1, "best_source": "knowledge"},
+    "8": {"value": 200, "tolerance": 0, "best_source": "knowledge",
+          "accept_values": [200, "200", "200 МП", "200MP"]},
+    "9": {"value": 5000, "tolerance": 100, "best_source": "knowledge"},
+    "10": {"value": "Android", "tolerance": null, "best_source": "knowledge",
+           "accept_values": ["Android", "Android 14", "Android 15", "One UI"]}
+  },
+  "metadata": {
+    "source": "Wildberries",
+    "nm_id": "219073456",
+    "fetched_at": "2026-05-14",
+    "note": "Description deliberately empty to force vision/knowledge/websearch. Samsung Galaxy S24 Ultra official specs."
+  }
+}

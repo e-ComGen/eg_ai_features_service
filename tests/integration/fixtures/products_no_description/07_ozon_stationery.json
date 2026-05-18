@@ -1,0 +1,49 @@
+{
+  "id": "07_ozon_stationery",
+  "product": {
+    "name": "Ручка шариковая Pilot BPS-GP-EF, синяя, 0,32 мм, 2 шт",
+    "description": "",
+    "category_id": 7,
+    "category_path": ["Канцтовары", "Ручки", "Шариковые ручки"],
+    "brand": "Pilot",
+    "ean": null,
+    "product_url": "https://www.ozon.ru/product/pilot-ruchka-sharikovaya-tolshchina-linii-0-32-mm-tsvet-siniy-2-sht-1174156937/",
+    "image_urls": [
+      "https://ir.ozone.ru/s3/multimedia-j/wc1000/6716861779.jpg",
+      "https://picsum.photos/seed/pilotbps/400/400"
+    ],
+    "source_urls": []
+  },
+  "targets": [
+    {"id": 1, "name": "Бренд", "type": "text", "semantic_type": "brand"},
+    {"id": 2, "name": "Модель", "type": "text"},
+    {"id": 3, "name": "Цвет чернил", "type": "text", "semantic_type": "color"},
+    {"id": 4, "name": "Толщина линии (мм)", "type": "numeric"},
+    {"id": 5, "name": "Количество в упаковке (шт)", "type": "numeric"},
+    {"id": 6, "name": "Тип наконечника", "type": "text"},
+    {"id": 7, "name": "Страна бренда", "type": "text"},
+    {"id": 8, "name": "Тип ручки", "type": "text"}
+  ],
+  "ground_truth": {
+    "1": {"value": "Pilot", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Pilot", "PILOT", "пилот"]},
+    "2": {"value": "BPS-GP-EF", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["BPS-GP-EF", "BPS-GP", "BPS GP EF"]},
+    "3": {"value": "Синий", "tolerance": null, "best_source": "vision",
+          "accept_values": ["Синий", "Blue", "синий", "синие чернила"]},
+    "4": {"value": 0.32, "tolerance": 0.05, "best_source": "knowledge"},
+    "5": {"value": 2, "tolerance": 0, "best_source": "knowledge"},
+    "6": {"value": "Шарик", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Шарик", "Шариковый", "Ball", "шариковый наконечник"]},
+    "7": {"value": "Япония", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Япония", "Japan", "япония"]},
+    "8": {"value": "Шариковая", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Шариковая", "Ballpoint", "шариковая"]}
+  },
+  "metadata": {
+    "source": "Ozon",
+    "ozon_id": "1174156937",
+    "fetched_at": "2026-05-14",
+    "note": "Description deliberately empty to force vision/knowledge/websearch. Pilot BPS-GP-EF ballpoint pen 0.32mm blue, 2-pack."
+  }
+}

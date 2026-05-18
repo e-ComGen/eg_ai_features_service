@@ -18,10 +18,15 @@ from app.services.enrichment.pipeline import PipelineOrchestrator
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "products"
+NO_DESC_FIXTURES_DIR = Path(__file__).parent / "fixtures" / "products_no_description"
 
 
 def load_all_fixtures() -> list[dict]:
     return [json.loads(f.read_text(encoding="utf-8")) for f in sorted(FIXTURES_DIR.glob("*.json"))]
+
+
+def load_no_desc_fixtures() -> list[dict]:
+    return [json.loads(f.read_text(encoding="utf-8")) for f in sorted(NO_DESC_FIXTURES_DIR.glob("*.json"))]
 
 
 def value_matches(extracted, expected_entry) -> bool:
@@ -214,3 +219,92 @@ async def test_summary_all_products(orchestrator, capsys):
     for pid, cov, acc, calls in per_product_results:
         print(f"  {pid}: cov {cov:.0f}% acc {acc:.0f}% calls {calls}")
     print(f"{'='*70}")
+
+
+@skip_unless_live
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fixture", load_no_desc_fixtures(), ids=lambda f: f["id"])
+async def test_no_description_pipeline(fixture, orchestrator):
+    """Прогон fixtures без description — должны активироваться vision/knowledge/websearch.
+
+    Этот тест специально создан чтобы проверить ветки pipeline, которые НЕ активируются
+    при наличии description. Fixture файлы из products_no_description/ имеют пустой
+    product_description что вынуждает pipeline использовать vision, knowledge и web_search
+    вместо description source.
+    """
+    p = fixture["product"]
+    context = ExtractionContext(
+        product_id=hash(fixture["id"]) & 0xFFFFFF,
+        product_name=p["name"],
+        product_description=p.get("description", "") or None,
+        category_id=p["category_id"],
+        category_path=p.get("category_path", []),
+        brand=p.get("brand"),
+        ean=p.get("ean"),
+        source_urls=p.get("source_urls", []),
+        image_urls=p.get("image_urls", []),
+        max_cost_usd=0.30,
+    )
+    targets = [TargetAttribute(**t) for t in fixture["targets"]]
+    ground_truth = fixture["ground_truth"]
+
+    result = await orchestrator.enrich(context, targets)
+
+    # Metrics
+    by_id = {v.attribute_id: v for v in result}
+    matched = 0
+    mismatched = []
+    missing = []
+    source_count = defaultdict(int)
+
+    for target in targets:
+        gt = ground_truth.get(str(target.id))
+        if gt is None:
+            continue
+        extracted = by_id.get(target.id)
+        if extracted is None:
+            missing.append((target.id, target.name, gt["value"]))
+            continue
+        source_count[extracted.source.value] += 1
+        if value_matches(extracted.value, gt):
+            matched += 1
+        else:
+            mismatched.append((target.id, target.name, extracted.value, gt["value"]))
+
+    total = len(ground_truth)
+    coverage_pct = 100 * (total - len(missing)) / total if total else 0
+    accuracy_pct = 100 * matched / total if total else 0
+
+    print(f"\n{'='*70}")
+    print(f"Product (no-desc): {fixture['id']}")
+    print(f"Coverage:  {coverage_pct:.0f}% ({total - len(missing)}/{total} filled)")
+    print(f"Accuracy:  {accuracy_pct:.0f}% ({matched}/{total} match ground truth)")
+    print(f"LLM calls: {context.llm_calls_so_far}")
+    print(f"Sources:   {dict(source_count)}")
+    # Flag if description source was used (should NOT be for these fixtures)
+    desc_used = source_count.get("description", 0)
+    if desc_used:
+        print(f"  WARNING: description source used {desc_used} times despite empty description!")
+    print(f"Filled attributes (with confidence + source + judge status):")
+    for target in targets:
+        gt = ground_truth.get(str(target.id))
+        extracted = by_id.get(target.id)
+        if extracted is None:
+            print(f"  x [{target.id}] {target.name}: MISSING (expected: {gt['value'] if gt else 'n/a'})")
+            continue
+        match_mark = "v" if (gt and value_matches(extracted.value, gt)) else "~"
+        judge_mark = "J" if extracted.judge_validated else ("S" if extracted.is_confident() else "?")
+        expected_str = f" (expected: {gt['value']!r})" if gt and not value_matches(extracted.value, gt) else ""
+        print(f"  {match_mark} [{target.id}] {target.name}: {extracted.value!r}  "
+              f"conf={extracted.confidence:.2f} src={extracted.source.value} [{judge_mark}]"
+              f"{expected_str}")
+    if mismatched:
+        print(f"Mismatches:")
+        for attr_id, name, got, expected in mismatched:
+            print(f"  - {name}: got {got!r}, expected {expected!r}")
+    if missing:
+        print(f"Missing: {[name for _, name, _ in missing]}")
+    print(f"{'='*70}")
+
+    # Lenient assertion — coverage should be non-zero even without description
+    assert coverage_pct >= 30, f"Coverage too low: {coverage_pct}%"

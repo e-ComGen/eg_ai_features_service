@@ -1,0 +1,51 @@
+{
+  "id": "06_ozon_food",
+  "product": {
+    "name": "Йогурт питьевой Активиа, с яблоком и персиком, без сахара, 2%, 260 г",
+    "description": "",
+    "category_id": 6,
+    "category_path": ["Продукты питания", "Молочные продукты", "Йогурты"],
+    "brand": "Активиа",
+    "ean": null,
+    "product_url": "https://www.ozon.ru/product/yogurt-pitevoy-aktivia-yabloko-persik-bez-sahara-2-260-g-169058896/",
+    "image_urls": [
+      "https://ir.ozone.ru/s3/multimedia-1-q/wc1000/7165551290.jpg",
+      "https://picsum.photos/seed/activia260/400/400"
+    ],
+    "source_urls": []
+  },
+  "targets": [
+    {"id": 1, "name": "Бренд", "type": "text", "semantic_type": "brand"},
+    {"id": 2, "name": "Вкус", "type": "text"},
+    {"id": 3, "name": "Жирность (%)", "type": "numeric"},
+    {"id": 4, "name": "Объём/масса (г)", "type": "numeric", "semantic_type": "weight"},
+    {"id": 5, "name": "Белки (г на 100г)", "type": "numeric"},
+    {"id": 6, "name": "Жиры (г на 100г)", "type": "numeric"},
+    {"id": 7, "name": "Углеводы (г на 100г)", "type": "numeric"},
+    {"id": 8, "name": "Калорийность (ккал на 100г)", "type": "numeric"},
+    {"id": 9, "name": "Содержит сахар", "type": "text"},
+    {"id": 10, "name": "Срок хранения", "type": "text"}
+  ],
+  "ground_truth": {
+    "1": {"value": "Активиа", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Активиа", "Activia", "АКТИВИА", "Danone Activia"]},
+    "2": {"value": "Яблоко-персик", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Яблоко-персик", "Яблоко и персик", "Apple Peach", "яблоко персик"]},
+    "3": {"value": 2.0, "tolerance": 0.5, "best_source": "knowledge"},
+    "4": {"value": 260, "tolerance": 5, "best_source": "knowledge"},
+    "5": {"value": 3.0, "tolerance": 0.5, "best_source": "knowledge"},
+    "6": {"value": 2.0, "tolerance": 0.5, "best_source": "knowledge"},
+    "7": {"value": 10.1, "tolerance": 1.0, "best_source": "knowledge"},
+    "8": {"value": 70, "tolerance": 5, "best_source": "knowledge"},
+    "9": {"value": "Нет", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Нет", "Без сахара", "No sugar", "нет", "без сахара"]},
+    "10": {"value": "26 дней", "tolerance": null, "best_source": "knowledge",
+           "accept_values": ["26 дней", "26 суток", "до 26 дней"]}
+  },
+  "metadata": {
+    "source": "Ozon",
+    "ozon_id": "169058896",
+    "fetched_at": "2026-05-14",
+    "note": "Description deliberately empty to force vision/knowledge/websearch. Activia drinking yogurt apple-peach, no sugar, 2%, 260g."
+  }
+}

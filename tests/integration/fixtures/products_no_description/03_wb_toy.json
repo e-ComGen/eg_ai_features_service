@@ -1,0 +1,49 @@
+{
+  "id": "03_wb_toy",
+  "product": {
+    "name": "Конструктор LEGO DUPLO Creative Play 10847 Поезд «Считай и играй»",
+    "description": "",
+    "category_id": 3,
+    "category_path": ["Игрушки", "Конструкторы", "LEGO DUPLO"],
+    "brand": "LEGO",
+    "ean": null,
+    "product_url": "https://by.wildberries.ru/catalog/3577001/detail.aspx",
+    "image_urls": [
+      "https://basket-01.wbbasket.ru/vol35/part3577/3577001/images/big/1.webp",
+      "https://basket-01.wbbasket.ru/vol35/part3577/3577001/images/big/2.webp"
+    ],
+    "source_urls": []
+  },
+  "targets": [
+    {"id": 1, "name": "Бренд", "type": "text", "semantic_type": "brand"},
+    {"id": 2, "name": "Серия", "type": "text"},
+    {"id": 3, "name": "Артикул набора", "type": "text"},
+    {"id": 4, "name": "Количество деталей", "type": "numeric"},
+    {"id": 5, "name": "Рекомендуемый возраст (лет)", "type": "text"},
+    {"id": 6, "name": "Материал", "type": "text", "semantic_type": "material"},
+    {"id": 7, "name": "Цвет упаковки", "type": "text", "semantic_type": "color"},
+    {"id": 8, "name": "Тематика", "type": "text"}
+  ],
+  "ground_truth": {
+    "1": {"value": "LEGO", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["LEGO", "Lego", "lego"]},
+    "2": {"value": "DUPLO", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["DUPLO", "Duplo", "LEGO DUPLO"]},
+    "3": {"value": "10847", "tolerance": null, "best_source": "knowledge"},
+    "4": {"value": 23, "tolerance": 0, "best_source": "knowledge"},
+    "5": {"value": "от 1,5 лет", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["от 1,5 лет", "1.5+", "1,5+", "от 18 месяцев", "от 2 лет"]},
+    "6": {"value": "Пластик", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Пластик", "Plastic", "пластик", "ABS-пластик"]},
+    "7": {"value": "Разноцветный", "tolerance": null, "best_source": "vision",
+          "accept_values": ["Разноцветный", "Multicolor", "разноцветный", "Цветной"]},
+    "8": {"value": "Поезд", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Поезд", "Train", "поезд", "Транспорт"]}
+  },
+  "metadata": {
+    "source": "Wildberries",
+    "nm_id": "3577001",
+    "fetched_at": "2026-05-14",
+    "note": "Description deliberately empty to force vision/knowledge/websearch. LEGO DUPLO 10847 Number Train — 23 pcs, ages 1.5+."
+  }
+}
