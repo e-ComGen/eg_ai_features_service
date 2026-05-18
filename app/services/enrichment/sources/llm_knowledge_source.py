@@ -19,7 +19,7 @@ from app.services.enrichment.judges.knowledge_judge import KnowledgeJudge
 
 class _KnowledgeAttr(BaseModel):
     attribute_id: int = Field(..., validation_alias=AliasChoices("attribute_id", "id"))
-    value: str | int | float | bool
+    value: str | int | float | bool = Field(..., validation_alias=AliasChoices("value", "attribute_value", "extracted_value"))
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     reasoning: Optional[str] = Field(None, max_length=200, description="откуда LLM знает")
 

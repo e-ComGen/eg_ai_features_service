@@ -7,7 +7,7 @@
 Spec: docs/architecture/pipeline.md, section "Stage 0 / DescriptionSource".
 """
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, AliasChoices
 from app.services.enrichment.base import (
     AttributeSource, AttributeValue, TargetAttribute, ExtractionContext,
     Source, LlmJudge,
@@ -19,9 +19,10 @@ from app.services.enrichment.judges.description_judge import DescriptionJudge
 
 class _ExtractedAttr(BaseModel):
     """Schema для LLM structured output."""
-    attribute_id: int
-    value: str | int | float | bool
-    confidence: float = Field(ge=0.0, le=1.0)
+    model_config = {"populate_by_name": True}
+    attribute_id: int = Field(..., validation_alias=AliasChoices("attribute_id", "id"))
+    value: str | int | float | bool = Field(..., validation_alias=AliasChoices("value", "attribute_value", "extracted_value"))
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     evidence: Optional[str] = None  # цитата из description
 
 
