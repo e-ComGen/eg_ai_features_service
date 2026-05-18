@@ -1,0 +1,37 @@
+{
+  "id": "09_etsy_handmade_candle",
+  "product": {
+    "name": "Handmade Lavender Vanilla Soy Candle — Relaxing Aromatherapy Gift",
+    "description": "Ароматическая соевая свеча ручной работы, аромат «лаванда и ваниль». 100% натуральный соевый воск, хлопковый фитиль без свинца. Объём 16 oz (455 г), время горения 100 часов. Идеальный подарок.",
+    "category_id": 8,
+    "category_path": ["Товары для дома", "Свечи", "Ароматические"],
+    "brand": "LCCandleCottage",
+    "ean": null,
+    "product_url": "https://www.etsy.com/listing/593118903/lavender-vanilla-soy-candle-relaxing",
+    "image_urls": [
+      "https://picsum.photos/seed/soycandlelavender/400/400",
+      "https://picsum.photos/seed/soycandlejar/400/500"
+    ],
+    "source_urls": ["https://www.etsy.com/listing/593118903/lavender-vanilla-soy-candle-relaxing"]
+  },
+  "targets": [
+    {"id": 1, "name": "Тип изделия", "type": "text"},
+    {"id": 2, "name": "Аромат", "type": "text"},
+    {"id": 3, "name": "Тип воска", "type": "text", "semantic_type": "material"},
+    {"id": 4, "name": "Тип фитиля", "type": "text"},
+    {"id": 5, "name": "Вес нетто (г)", "type": "numeric", "semantic_type": "weight"},
+    {"id": 6, "name": "Время горения (ч)", "type": "numeric"}
+  ],
+  "ground_truth": {
+    "1": {"value": "Свеча", "tolerance": null, "best_source": "description",
+          "accept_values": ["Свеча", "Ароматическая свеча", "Candle"]},
+    "2": {"value": "Лаванда и ваниль", "tolerance": null, "best_source": "description",
+          "accept_values": ["Лаванда и ваниль", "Lavender Vanilla", "Лаванда & ваниль", "Лаванда, ваниль"]},
+    "3": {"value": "Соевый", "tolerance": null, "best_source": "description",
+          "accept_values": ["Соевый", "Соевый воск", "Soy", "Soy wax"]},
+    "4": {"value": "Хлопковый", "tolerance": null, "best_source": "description",
+          "accept_values": ["Хлопковый", "Хлопок", "Cotton", "Cotton wick"]},
+    "5": {"value": 455, "tolerance": 20, "best_source": "description"},
+    "6": {"value": 100, "tolerance": 10, "best_source": "description"}
+  }
+}

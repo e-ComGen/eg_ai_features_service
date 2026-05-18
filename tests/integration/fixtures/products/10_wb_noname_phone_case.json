@@ -1,0 +1,35 @@
+{
+  "id": "10_wb_noname_phone_case",
+  "product": {
+    "name": "Чехол для телефона (iPhone 13/14/15) прозрачный силиконовый",
+    "description": "Чехол. Хорошая вещь, подходит для телефона. Прозрачный. Советую!",
+    "category_id": 9,
+    "category_path": ["Аксессуары", "Чехлы для телефонов"],
+    "brand": null,
+    "ean": null,
+    "product_url": "https://www.wildberries.ru/catalog/0/search.aspx?search=чехол+силиконовый+прозрачный+iphone",
+    "image_urls": [
+      "https://picsum.photos/seed/phonecase/300/500"
+    ],
+    "source_urls": []
+  },
+  "targets": [
+    {"id": 1, "name": "Тип изделия", "type": "text"},
+    {"id": 2, "name": "Цвет", "type": "text", "semantic_type": "color"},
+    {"id": 3, "name": "Материал", "type": "text", "semantic_type": "material"},
+    {"id": 4, "name": "Совместимые модели", "type": "text"},
+    {"id": 5, "name": "Бренд", "type": "text", "semantic_type": "brand"}
+  ],
+  "ground_truth": {
+    "1": {"value": "Чехол", "tolerance": null, "best_source": "description",
+          "accept_values": ["Чехол", "Чехол для телефона", "Phone case", "Case"]},
+    "2": {"value": "Прозрачный", "tolerance": null, "best_source": "vision",
+          "accept_values": ["Прозрачный", "Transparent", "Clear", "прозрачный"]},
+    "3": {"value": "Силикон", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Силикон", "Силиконовый", "Silicone", "силикон"]},
+    "4": {"value": "iPhone 13, iPhone 14, iPhone 15", "tolerance": null, "best_source": "description",
+          "accept_values": ["iPhone 13, iPhone 14, iPhone 15", "iPhone 13/14/15", "iPhone 13, 14, 15"]},
+    "5": {"value": "NoName / Без бренда", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["NoName / Без бренда", "NoName", "Без бренда", "Нет бренда", "No brand"]}
+  }
+}

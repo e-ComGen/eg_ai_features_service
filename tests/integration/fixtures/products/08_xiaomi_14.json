@@ -1,0 +1,47 @@
+{
+  "id": "08_xiaomi_14",
+  "product": {
+    "name": "Xiaomi 14 12GB+256GB Black",
+    "description": "Xiaomi 14, смартфон. Процессор Snapdragon 8 Gen 3, камера Leica 50 МП (тройная), дисплей LTPO OLED 6.36\" 120 Гц. Аккумулятор 4610 мАч, IP68. Цвет: чёрный.",
+    "category_id": 1,
+    "category_path": ["Электроника", "Смартфоны", "Xiaomi"],
+    "brand": "Xiaomi",
+    "ean": null,
+    "product_url": "https://www.mi.com/global/product/xiaomi-14/specs/",
+    "image_urls": [
+      "https://picsum.photos/seed/xiaomi14/400/400"
+    ],
+    "source_urls": [
+      "https://www.mi.com/global/product/xiaomi-14/specs/",
+      "https://www.gsmarena.com/xiaomi_14-12626.php"
+    ]
+  },
+  "targets": [
+    {"id": 1, "name": "Бренд", "type": "text", "semantic_type": "brand"},
+    {"id": 2, "name": "Модель", "type": "text"},
+    {"id": 3, "name": "Процессор", "type": "text"},
+    {"id": 4, "name": "Диагональ экрана (дюймы)", "type": "numeric", "semantic_type": "screen_size"},
+    {"id": 5, "name": "Тип экрана", "type": "text"},
+    {"id": 6, "name": "Основная камера (МП)", "type": "numeric"},
+    {"id": 7, "name": "Ёмкость аккумулятора (мАч)", "type": "numeric"},
+    {"id": 8, "name": "Вес (г)", "type": "numeric", "semantic_type": "weight"},
+    {"id": 9, "name": "Влагозащита", "type": "text"},
+    {"id": 10, "name": "Цвет", "type": "text", "semantic_type": "color"}
+  ],
+  "ground_truth": {
+    "1": {"value": "Xiaomi", "tolerance": null, "best_source": "knowledge"},
+    "2": {"value": "Xiaomi 14", "tolerance": null, "best_source": "description",
+          "accept_values": ["Xiaomi 14", "14"]},
+    "3": {"value": "Snapdragon 8 Gen 3", "tolerance": null, "best_source": "web_search",
+          "accept_values": ["Snapdragon 8 Gen 3", "Qualcomm Snapdragon 8 Gen 3"]},
+    "4": {"value": 6.36, "tolerance": 0.05, "best_source": "web_search"},
+    "5": {"value": "LTPO OLED", "tolerance": null, "best_source": "web_search",
+          "accept_values": ["LTPO OLED", "OLED", "AMOLED"]},
+    "6": {"value": 50, "tolerance": 0, "best_source": "description"},
+    "7": {"value": 4610, "tolerance": 10, "best_source": "web_search"},
+    "8": {"value": 193, "tolerance": 3, "best_source": "web_search"},
+    "9": {"value": "IP68", "tolerance": null, "best_source": "web_search"},
+    "10": {"value": "Чёрный", "tolerance": null, "best_source": "vision",
+           "accept_values": ["Чёрный", "Black", "чёрный"]}
+  }
+}

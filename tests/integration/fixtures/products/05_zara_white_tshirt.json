@@ -1,0 +1,43 @@
+{
+  "id": "05_zara_white_tshirt",
+  "product": {
+    "name": "BASIC COTTON T-SHIRT White",
+    "description": "Zara базовая хлопковая футболка, белая. Круглый вырез, короткий рукав, свободный крой. Состав: 100% хлопок.",
+    "category_id": 5,
+    "category_path": ["Одежда", "Женские футболки", "Базовые"],
+    "brand": "Zara",
+    "ean": null,
+    "product_url": "https://www.zara.com/us/en/basic-cotton-t-shirt-p03253332.html",
+    "image_urls": [
+      "https://picsum.photos/seed/zaratshirt/400/600"
+    ],
+    "source_urls": ["https://www.zara.com/us/en/basic-cotton-t-shirt-p03253332.html"]
+  },
+  "targets": [
+    {"id": 1, "name": "Бренд", "type": "text", "semantic_type": "brand"},
+    {"id": 2, "name": "Цвет", "type": "text", "semantic_type": "color"},
+    {"id": 3, "name": "Состав ткани", "type": "text", "semantic_type": "material"},
+    {"id": 4, "name": "Тип выреза", "type": "text"},
+    {"id": 5, "name": "Тип рукава", "type": "text"},
+    {"id": 6, "name": "Крой", "type": "text"},
+    {"id": 7, "name": "Пол", "type": "text"},
+    {"id": 8, "name": "Тип изделия", "type": "text"}
+  ],
+  "ground_truth": {
+    "1": {"value": "Zara", "tolerance": null, "best_source": "vision"},
+    "2": {"value": "Белый", "tolerance": null, "best_source": "vision",
+          "accept_values": ["Белый", "White", "белый"]},
+    "3": {"value": "100% хлопок", "tolerance": null, "best_source": "description",
+          "accept_values": ["100% хлопок", "100% Cotton", "хлопок 100%", "Хлопок"]},
+    "4": {"value": "Круглый", "tolerance": null, "best_source": "vision",
+          "accept_values": ["Круглый", "Круглый вырез", "Round neck", "Round"]},
+    "5": {"value": "Короткий", "tolerance": null, "best_source": "vision",
+          "accept_values": ["Короткий", "Короткий рукав", "Short sleeve", "Short"]},
+    "6": {"value": "Свободный (regular)", "tolerance": null, "best_source": "description",
+          "accept_values": ["Свободный (regular)", "Свободный", "Regular", "Regular fit"]},
+    "7": {"value": "Женский", "tolerance": null, "best_source": "description",
+          "accept_values": ["Женский", "Women", "женский", "Female"]},
+    "8": {"value": "Футболка", "tolerance": null, "best_source": "vision",
+          "accept_values": ["Футболка", "T-shirt", "футболка", "Tshirt"]}
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "id": "03_nike_air_force_1",
+  "product": {
+    "name": "Nike Air Force 1 '07 Men's Shoes White/White",
+    "description": "Nike Air Force 1 '07, белые/белые. Натуральная кожа, перфорированный носок. Подошва с воздушной подушкой Nike Air. Культовый баскетбольный силуэт 1982 года.",
+    "category_id": 3,
+    "category_path": ["Обувь", "Кроссовки", "Nike"],
+    "brand": "Nike",
+    "ean": "0883412740906",
+    "product_url": "https://www.nike.com/t/air-force-1-07-mens-shoes-jBrhbr",
+    "image_urls": [
+      "https://static.nike.com/a/images/t_PDP_1728_v1/f_auto,q_auto:eco/af2e4099-87be-4f49-9f1f-36c7c1eb97ee/air-force-1-07-shoes-WrLlWX.png",
+      "https://picsum.photos/seed/nikeaf1/400/400"
+    ],
+    "source_urls": ["https://www.nike.com/t/air-force-1-07-mens-shoes-jBrhbr"]
+  },
+  "targets": [
+    {"id": 1, "name": "Бренд", "type": "text", "semantic_type": "brand"},
+    {"id": 2, "name": "Модель", "type": "text"},
+    {"id": 3, "name": "Артикул", "type": "text"},
+    {"id": 4, "name": "Цвет", "type": "text", "semantic_type": "color"},
+    {"id": 5, "name": "Материал верха", "type": "text", "semantic_type": "material"},
+    {"id": 6, "name": "Материал подошвы", "type": "text"},
+    {"id": 7, "name": "Тип застёжки", "type": "text"},
+    {"id": 8, "name": "Высота", "type": "text"}
+  ],
+  "ground_truth": {
+    "1": {"value": "Nike", "tolerance": null, "best_source": "knowledge"},
+    "2": {"value": "Air Force 1 '07", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Air Force 1 '07", "Air Force 1", "AF1", "Air Force 1 07"]},
+    "3": {"value": "CW2288-111", "tolerance": null, "best_source": "description"},
+    "4": {"value": "Белый", "tolerance": null, "best_source": "vision",
+          "accept_values": ["Белый", "Белый/Белый", "White", "White/White", "белый"]},
+    "5": {"value": "Кожа", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Кожа", "Натуральная кожа", "Leather", "кожа"]},
+    "6": {"value": "Резина", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Резина", "Rubber", "резина"]},
+    "7": {"value": "Шнуровка", "tolerance": null, "best_source": "vision",
+          "accept_values": ["Шнуровка", "Шнурки", "Laces", "шнуровка"]},
+    "8": {"value": "Низкие (Low)", "tolerance": null, "best_source": "knowledge+vision",
+          "accept_values": ["Низкие (Low)", "Low", "Низкие", "низкие"]}
+  }
+}

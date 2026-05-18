@@ -1,0 +1,45 @@
+{
+  "id": "06_airpods_pro_2",
+  "product": {
+    "name": "Apple AirPods Pro (2nd Generation) with MagSafe Case (USB-C) White",
+    "description": "Apple AirPods Pro 2 с MagSafe зарядным кейсом USB-C. Чип H2, активное шумоподавление в 2× лучше предыдущего поколения. До 6 часов прослушивания, всего до 30 часов с кейсом. IPX4, Bluetooth 5.3.",
+    "category_id": 6,
+    "category_path": ["Электроника", "Наушники", "True Wireless"],
+    "brand": "Apple",
+    "ean": null,
+    "product_url": "https://support.apple.com/en-us/111851",
+    "image_urls": [
+      "https://m.media-amazon.com/images/I/61SUj2aKoEL._AC_SX679_.jpg",
+      "https://picsum.photos/seed/airpodspro2/400/400"
+    ],
+    "source_urls": ["https://support.apple.com/en-us/111851"]
+  },
+  "targets": [
+    {"id": 1, "name": "Бренд", "type": "text", "semantic_type": "brand"},
+    {"id": 2, "name": "Модель", "type": "text"},
+    {"id": 3, "name": "Вес одного наушника (г)", "type": "numeric", "semantic_type": "weight"},
+    {"id": 4, "name": "Вес кейса (г)", "type": "numeric", "semantic_type": "weight"},
+    {"id": 5, "name": "Чип", "type": "text"},
+    {"id": 6, "name": "Версия Bluetooth", "type": "text"},
+    {"id": 7, "name": "Время работы от зарядки (ч)", "type": "numeric"},
+    {"id": 8, "name": "Суммарное время с кейсом (ч)", "type": "numeric"},
+    {"id": 9, "name": "Влагозащита", "type": "text"},
+    {"id": 10, "name": "Цвет", "type": "text", "semantic_type": "color"}
+  ],
+  "ground_truth": {
+    "1": {"value": "Apple", "tolerance": null, "best_source": "knowledge"},
+    "2": {"value": "AirPods Pro (2nd Generation)", "tolerance": null, "best_source": "description",
+          "accept_values": ["AirPods Pro (2nd Generation)", "AirPods Pro 2", "AirPods Pro Gen 2", "AirPods Pro 2nd Gen"]},
+    "3": {"value": 5.3, "tolerance": 0.2, "best_source": "web_search"},
+    "4": {"value": 50.8, "tolerance": 1.0, "best_source": "web_search"},
+    "5": {"value": "H2", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["H2", "Apple H2"]},
+    "6": {"value": "5.3", "tolerance": null, "best_source": "web_search",
+          "accept_values": ["5.3", "Bluetooth 5.3"]},
+    "7": {"value": 6, "tolerance": 0.5, "best_source": "description"},
+    "8": {"value": 30, "tolerance": 1, "best_source": "description"},
+    "9": {"value": "IPX4", "tolerance": null, "best_source": "web_search"},
+    "10": {"value": "Белый", "tolerance": null, "best_source": "vision",
+           "accept_values": ["Белый", "White", "белый"]}
+  }
+}

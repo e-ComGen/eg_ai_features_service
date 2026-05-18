@@ -1,0 +1,42 @@
+{
+  "id": "02_lego_10696",
+  "product": {
+    "name": "LEGO Classic Medium Creative Brick Box 10696",
+    "description": "LEGO Classic 10696, 484 детали, 35 цветов кирпичиков. Набор для свободного творчества в пластиковом контейнере со съёмной крышкой. Для детей от 4 лет.",
+    "category_id": 2,
+    "category_path": ["Игрушки", "Конструкторы", "LEGO Classic"],
+    "brand": "LEGO",
+    "ean": "5702015357180",
+    "product_url": "https://www.lego.com/en-us/product/lego-medium-creative-brick-box-10696",
+    "image_urls": [
+      "https://m.media-amazon.com/images/I/81ZNaZ7WEFL._AC_SX425_.jpg",
+      "https://picsum.photos/seed/lego10696/400/400"
+    ],
+    "source_urls": [
+      "https://www.lego.com/en-us/product/lego-medium-creative-brick-box-10696",
+      "https://brickset.com/sets/10696-1/Medium-Creative-Brick-Box"
+    ]
+  },
+  "targets": [
+    {"id": 1, "name": "Бренд", "type": "text", "semantic_type": "brand"},
+    {"id": 2, "name": "Номер набора", "type": "text"},
+    {"id": 3, "name": "Количество деталей", "type": "numeric"},
+    {"id": 4, "name": "Серия", "type": "text"},
+    {"id": 5, "name": "Возраст (от лет)", "type": "numeric"},
+    {"id": 6, "name": "Вес упаковки (кг)", "type": "numeric", "semantic_type": "weight"},
+    {"id": 7, "name": "EAN", "type": "text"},
+    {"id": 8, "name": "Количество цветов деталей", "type": "numeric"}
+  ],
+  "ground_truth": {
+    "1": {"value": "LEGO", "tolerance": null, "best_source": "description"},
+    "2": {"value": "10696", "tolerance": null, "best_source": "description"},
+    "3": {"value": 484, "tolerance": 0, "best_source": "description"},
+    "4": {"value": "Classic", "tolerance": null, "best_source": "description",
+          "accept_values": ["Classic", "LEGO Classic"]},
+    "5": {"value": 4, "tolerance": 0, "best_source": "description"},
+    "6": {"value": 1.04, "tolerance": 0.05, "best_source": "web_search"},
+    "7": {"value": "5702015357180", "tolerance": null, "best_source": "web_search",
+          "accept_values": ["5702015357180", "673419233590"]},
+    "8": {"value": 35, "tolerance": 2, "best_source": "description"}
+  }
+}

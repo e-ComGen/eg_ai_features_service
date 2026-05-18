@@ -1,0 +1,45 @@
+{
+  "id": "07_dyson_v15",
+  "product": {
+    "name": "Dyson V15 Detect Cordless Vacuum Cleaner Yellow/Iron",
+    "description": "Dyson V15 Detect, беспроводной пылесос. Мощность всасывания 240 AW, двигатель Hyperdymium 125 000 об/мин. До 60 минут работы, объём контейнера 0.76 л, фильтрация HEPA, лазерная подсветка пыли.",
+    "category_id": 7,
+    "category_path": ["Бытовая техника", "Пылесосы", "Беспроводные"],
+    "brand": "Dyson",
+    "ean": null,
+    "product_url": "https://www.dyson.com/vacuum-cleaners/cordless/v15/detect-yellow",
+    "image_urls": [
+      "https://m.media-amazon.com/images/I/71OtNc2IAWL._AC_SX679_.jpg",
+      "https://picsum.photos/seed/dysonv15/400/400"
+    ],
+    "source_urls": [
+      "https://www.dyson.com/vacuum-cleaners/cordless/v15/detect-yellow",
+      "https://www.manua.ls/dyson/v15-detect/specifications"
+    ]
+  },
+  "targets": [
+    {"id": 1, "name": "Бренд", "type": "text", "semantic_type": "brand"},
+    {"id": 2, "name": "Модель", "type": "text"},
+    {"id": 3, "name": "Мощность всасывания (AW)", "type": "numeric"},
+    {"id": 4, "name": "Время работы (мин)", "type": "numeric"},
+    {"id": 5, "name": "Объём контейнера (л)", "type": "numeric"},
+    {"id": 6, "name": "Вес (кг)", "type": "numeric", "semantic_type": "weight"},
+    {"id": 7, "name": "Скорость двигателя (об/мин)", "type": "numeric"},
+    {"id": 8, "name": "Тип фильтрации", "type": "text"},
+    {"id": 9, "name": "Цвет", "type": "text", "semantic_type": "color"}
+  ],
+  "ground_truth": {
+    "1": {"value": "Dyson", "tolerance": null, "best_source": "knowledge"},
+    "2": {"value": "V15 Detect", "tolerance": null, "best_source": "description",
+          "accept_values": ["V15 Detect", "Dyson V15 Detect", "V15"]},
+    "3": {"value": 240, "tolerance": 5, "best_source": "web_search"},
+    "4": {"value": 60, "tolerance": 5, "best_source": "web_search"},
+    "5": {"value": 0.76, "tolerance": 0.05, "best_source": "web_search"},
+    "6": {"value": 2.96, "tolerance": 0.1, "best_source": "web_search"},
+    "7": {"value": 125000, "tolerance": 1000, "best_source": "web_search"},
+    "8": {"value": "HEPA", "tolerance": null, "best_source": "description",
+          "accept_values": ["HEPA", "HEPA-фильтрация", "HEPA filter"]},
+    "9": {"value": "Жёлтый/Железо", "tolerance": null, "best_source": "vision",
+          "accept_values": ["Жёлтый/Железо", "Yellow/Iron", "Жёлтый", "Yellow"]}
+  }
+}

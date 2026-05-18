@@ -1,0 +1,44 @@
+{
+  "id": "04_sony_wh1000xm5",
+  "product": {
+    "name": "Sony WH-1000XM5 Wireless Noise Cancelling Headphones Black",
+    "description": "Sony WH-1000XM5, беспроводные наушники с ANC. Bluetooth 5.2, кодеки SBC/AAC/LDAC. 30 часов автономной работы. Вес 250 г, складная конструкция.",
+    "category_id": 4,
+    "category_path": ["Электроника", "Наушники", "Беспроводные"],
+    "brand": "Sony",
+    "ean": null,
+    "product_url": "https://helpguide.sony.net/mdr/wh1000xm5/v1/en/contents/TP1000541014.html",
+    "image_urls": [
+      "https://m.media-amazon.com/images/I/71o8Q5XJS5L._AC_SX679_.jpg",
+      "https://picsum.photos/seed/sonywh1000xm5/400/400"
+    ],
+    "source_urls": ["https://helpguide.sony.net/mdr/wh1000xm5/v1/en/contents/TP1000541014.html"]
+  },
+  "targets": [
+    {"id": 1, "name": "Бренд", "type": "text", "semantic_type": "brand"},
+    {"id": 2, "name": "Модель", "type": "text"},
+    {"id": 3, "name": "Вес (г)", "type": "numeric", "semantic_type": "weight"},
+    {"id": 4, "name": "Версия Bluetooth", "type": "text"},
+    {"id": 5, "name": "Поддерживаемые кодеки", "type": "text"},
+    {"id": 6, "name": "Время зарядки (ч)", "type": "numeric"},
+    {"id": 7, "name": "Время работы (ч)", "type": "numeric"},
+    {"id": 8, "name": "Шумоподавление", "type": "text"},
+    {"id": 9, "name": "Конструкция", "type": "text"}
+  ],
+  "ground_truth": {
+    "1": {"value": "Sony", "tolerance": null, "best_source": "knowledge"},
+    "2": {"value": "WH-1000XM5", "tolerance": null, "best_source": "description",
+          "accept_values": ["WH-1000XM5", "WH1000XM5"]},
+    "3": {"value": 250, "tolerance": 5, "best_source": "web_search"},
+    "4": {"value": "5.2", "tolerance": null, "best_source": "web_search",
+          "accept_values": ["5.2", "Bluetooth 5.2"]},
+    "5": {"value": "SBC, AAC, LDAC", "tolerance": null, "best_source": "web_search",
+          "accept_values": ["SBC, AAC, LDAC", "SBC/AAC/LDAC", "LDAC, AAC, SBC"]},
+    "6": {"value": 3.5, "tolerance": 0.2, "best_source": "web_search"},
+    "7": {"value": 30, "tolerance": 1, "best_source": "knowledge"},
+    "8": {"value": "Активное (ANC)", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Активное (ANC)", "ANC", "Активное шумоподавление", "Active Noise Cancelling"]},
+    "9": {"value": "Накладные (Over-ear)", "tolerance": null, "best_source": "vision",
+          "accept_values": ["Накладные (Over-ear)", "Over-ear", "Накладные", "Over Ear"]}
+  }
+}

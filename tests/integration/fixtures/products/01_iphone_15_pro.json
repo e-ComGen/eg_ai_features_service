@@ -1,0 +1,46 @@
+{
+  "id": "01_iphone_15_pro",
+  "product": {
+    "name": "Apple iPhone 15 Pro 256GB Natural Titanium",
+    "description": "Apple iPhone 15 Pro 256GB, цвет «натуральный титан». Чип A17 Pro, камера 48 Мп с трёхкратным оптическим зумом. Корпус из авиационного титана, экран 6.1\" Super Retina XDR ProMotion 120 Гц.",
+    "category_id": 1,
+    "category_path": ["Электроника", "Смартфоны"],
+    "brand": "Apple",
+    "ean": null,
+    "product_url": "https://support.apple.com/en-us/111829",
+    "image_urls": [
+      "https://fdn2.gsmarena.com/vv/bigpic/apple-iphone-15-pro.jpg",
+      "https://picsum.photos/seed/iphone15pro/400/400"
+    ],
+    "source_urls": ["https://support.apple.com/en-us/111829"]
+  },
+  "targets": [
+    {"id": 1, "name": "Бренд", "type": "text", "semantic_type": "brand"},
+    {"id": 2, "name": "Модель", "type": "text"},
+    {"id": 3, "name": "Объём памяти", "type": "text"},
+    {"id": 4, "name": "Цвет", "type": "text", "semantic_type": "color"},
+    {"id": 5, "name": "Вес (г)", "type": "numeric", "semantic_type": "weight"},
+    {"id": 6, "name": "Диагональ экрана (дюймы)", "type": "numeric", "semantic_type": "screen_size"},
+    {"id": 7, "name": "Чип", "type": "text"},
+    {"id": 8, "name": "Материал корпуса", "type": "text", "semantic_type": "material"},
+    {"id": 9, "name": "Основная камера (МП)", "type": "numeric"},
+    {"id": 10, "name": "Тип экрана", "type": "text"}
+  ],
+  "ground_truth": {
+    "1": {"value": "Apple", "tolerance": null, "best_source": "description"},
+    "2": {"value": "iPhone 15 Pro", "tolerance": null, "best_source": "description",
+          "accept_values": ["iPhone 15 Pro", "Apple iPhone 15 Pro"]},
+    "3": {"value": "256GB", "tolerance": null, "best_source": "description",
+          "accept_values": ["256GB", "256 ГБ", "256 GB"]},
+    "4": {"value": "Натуральный титан", "tolerance": null, "best_source": "description+vision",
+          "accept_values": ["Натуральный титан", "Titanium Natural", "Natural Titanium", "натуральный титан"]},
+    "5": {"value": 187, "tolerance": 3, "best_source": "web_search"},
+    "6": {"value": 6.1, "tolerance": 0.1, "best_source": "description"},
+    "7": {"value": "A17 Pro", "tolerance": null, "best_source": "description"},
+    "8": {"value": "Титан", "tolerance": null, "best_source": "knowledge",
+          "accept_values": ["Титан", "Titanium", "титан", "Авиационный титан"]},
+    "9": {"value": 48, "tolerance": 0, "best_source": "description"},
+    "10": {"value": "OLED", "tolerance": null, "best_source": "knowledge",
+           "accept_values": ["OLED", "Super Retina XDR", "LTPO OLED"]}
+  }
+}
