@@ -92,6 +92,8 @@ class VisionSource(AttributeSource):
         system_prompt = (
             "You extract visual attributes from a description of what's visible on product photos. "
             "Only include attributes that are CLEARLY visible. If unsure, skip. "
+            "When an attribute has 'allowed' values listed, you MUST choose your answer from that list "
+            "(use the closest matching option). Do not invent values outside the allowed list. "
             "Evidence should quote the relevant phrase from the vision description."
         )
         user_text = (

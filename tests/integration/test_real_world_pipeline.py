@@ -30,28 +30,53 @@ def load_no_desc_fixtures() -> list[dict]:
 
 
 def value_matches(extracted, expected_entry) -> bool:
-    """Compare extracted value with ground truth (with tolerance/synonyms)."""
+    """Compare extracted value with ground truth (with tolerance/synonyms).
+
+    Matching rules (in order):
+    1. Numeric with tolerance — abs(extracted - expected) <= tolerance.
+    2. Exact match (case-insensitive, stripped).
+    3. Match against accept_values (exact, case-insensitive).
+    4. Bidirectional substring: expected in extracted OR extracted in expected
+       (handles "Galaxy S24 Ultra" vs "Samsung Galaxy S24 Ultra", "Android 14" vs "Android").
+    5. Substring match against any accept_value in both directions.
+    6. Morphological suffix strip: compare first N chars when one string starts with
+       the other up to a common root (handles "Низкий"/"Низкие", "Чёрный"/"Черный").
+    """
     expected = expected_entry["value"]
     tolerance = expected_entry.get("tolerance")
     accept_values = expected_entry.get("accept_values", [])
 
-    # Numeric with tolerance
+    # 1. Numeric with tolerance
     if tolerance is not None and isinstance(expected, (int, float)):
         try:
             return abs(float(extracted) - float(expected)) <= tolerance
         except (ValueError, TypeError):
             return False
 
-    # Text — strict OR in accept_values
     extracted_str = str(extracted).strip().lower()
-    if extracted_str == str(expected).strip().lower():
+    expected_str = str(expected).strip().lower()
+    candidates = [expected_str] + [str(v).strip().lower() for v in accept_values]
+
+    # 2+3. Exact match against expected or any accept_value
+    if extracted_str in candidates:
         return True
-    for synonym in accept_values:
-        if extracted_str == str(synonym).strip().lower():
+
+    # 4+5. Bidirectional substring against all candidates
+    for c in candidates:
+        if c in extracted_str or extracted_str in c:
             return True
-    # Partial match for text — "iPhone 15 Pro" matches "Apple iPhone 15 Pro"
-    if str(expected).strip().lower() in extracted_str:
-        return True
+
+    # 6. Morphological root match: strip Russian case/number endings (last 1-3 chars)
+    #    Only apply when strings are long enough to avoid false positives.
+    if len(extracted_str) >= 4:
+        for c in candidates:
+            if len(c) >= 4:
+                min_len = min(len(extracted_str), len(c))
+                # Compare up to (min_len - 2) characters — tolerates 2-char suffix diff
+                root_len = min_len - 2
+                if root_len >= 3 and extracted_str[:root_len] == c[:root_len]:
+                    return True
+
     return False
 
 

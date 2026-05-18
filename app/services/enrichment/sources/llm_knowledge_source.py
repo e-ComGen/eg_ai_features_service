@@ -71,8 +71,12 @@ class LlmKnowledgeSource(AttributeSource):
             "You are a product knowledge expert. Given a product name (and optional brand), "
             "you provide attribute values that you confidently KNOW from your training data. "
             "If you are NOT sure about an attribute — DO NOT include it. Better to skip than guess. "
-            "Confidence ≥0.92 means 'I am sure'. Confidence 0.5-0.91 means 'I might be wrong'. "
-            "Brief reasoning helps audit (e.g., 'standard for this model line')."
+            "Confidence scale: 0.95-1.0 = industry-standard or official spec (e.g. Samsung S24 Ultra "
+            "camera is 200MP, Adidas Superstar sole is rubber — these are well-known facts); "
+            "0.92-0.94 = highly likely but minor variation possible; "
+            "below 0.92 = uncertain, DO NOT include. "
+            "Set confidence=0.95 for facts you know with certainty from official specs or brand history. "
+            "Brief reasoning helps audit (e.g., 'official Samsung spec', 'Adidas classic model')."
         )
         user_text = (
             f"Product: {context.product_name}\n"
