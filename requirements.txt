@@ -16,6 +16,8 @@ pandas
 python-multipart
 # Ozon dictionary builder (headless browser for Cloudflare bypass)
 playwright>=1.40.0
+# WB dictionary builder — offline HuggingFace seed
+datasets
 # Test dependencies
 pytest
 pytest-asyncio

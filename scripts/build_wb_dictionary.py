@@ -22,7 +22,7 @@ from collections import defaultdict
 sys.path.insert(0, str(Path(__file__).parent))
 
 from build_wb_dictionary_lib.menu_fetcher import fetch_main_menu, extract_all_subjects
-from build_wb_dictionary_lib.catalog_fetcher import fetch_sample_nm_ids
+from build_wb_dictionary_lib.hf_seed import build_seed_from_hf
 from build_wb_dictionary_lib.card_parser import fetch_characteristics
 from build_wb_dictionary_lib.aggregator import aggregate_characteristics_by_subject
 
@@ -45,21 +45,15 @@ async def main(args):
         completed_subjects = set(characteristics_by_subj.keys())
         print(f"      [RESUME] Already processed {len(completed_subjects)} subjects")
 
-    print(f"[2/4] Fetching sample nm_ids per subject ({args.samples} samples each)...")
-    samples_per_subj = {}
-    for i, subj in enumerate(subjects):
-        if subj["id"] in completed_subjects:
-            continue
-        try:
-            nm_ids = await fetch_sample_nm_ids(
-                subj["id"], subj.get("shard"), limit=args.samples
-            )
-            samples_per_subj[subj["id"]] = nm_ids
-        except Exception as e:
-            print(f"      [WARN] Failed to fetch samples for subj {subj['id']}: {e}")
-        await asyncio.sleep(0.3)
-        if (i + 1) % 50 == 0:
-            print(f"      Progress: {i+1}/{len(subjects)} subjects sampled")
+    print(f"[2/4] Loading sample nm_ids from HuggingFace dataset (offline)...")
+    hf_seed = build_seed_from_hf(samples_per_subj=args.samples)
+    print(f"      Got {len(hf_seed)} subjects from HF dataset")
+    # Filter to only subjects present in the menu, skip already-completed ones
+    samples_per_subj = {
+        subj["id"]: hf_seed[subj["id"]]
+        for subj in subjects
+        if subj["id"] in hf_seed and subj["id"] not in completed_subjects
+    }
 
     print(f"[3/4] Parsing card characteristics...")
     total = sum(len(v) for v in samples_per_subj.values())
