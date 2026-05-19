@@ -29,12 +29,32 @@ sys.path.insert(0, str(Path(__file__).parent))
 from build_ozon_dictionary_lib.seed_loader import load_seed_categories
 from build_ozon_dictionary_lib.product_parser import parse_product_characteristics
 from build_ozon_dictionary_lib.aggregator import aggregate_by_category
+from build_ozon_dictionary_lib.category_fetcher import fetch_sample_product_urls
 
 
 async def main(args: argparse.Namespace) -> None:
     print("[1/3] Loading category seed...")
     categories = load_seed_categories()
     print(f"      {len(categories)} categories loaded")
+
+    # Step 1.5: Fetch sample product URLs for categories that have none
+    print("[1.5/3] Fetching sample product URLs per category...")
+    for i, cat in enumerate(categories):
+        if cat.get("sample_urls"):
+            continue
+        try:
+            urls = await fetch_sample_product_urls(cat, limit=args.samples)
+            cat["sample_urls"] = urls
+            if (i + 1) % 5 == 0:
+                total_urls = sum(len(c.get("sample_urls", [])) for c in categories)
+                print(f"      {i + 1}/{len(categories)} categories: {total_urls} total URLs")
+        except Exception as e:
+            print(f"      [WARN] Failed for cat {cat.get('id')}: {e}")
+            cat["sample_urls"] = []
+        await asyncio.sleep(2)  # polite rate
+
+    total_urls = sum(len(c.get("sample_urls", [])) for c in categories)
+    print(f"      Total: {total_urls} product URLs across {len(categories)} categories")
 
     # Resume support — read partial progress if flag is set
     partial_path = Path(str(args.output) + ".partial")

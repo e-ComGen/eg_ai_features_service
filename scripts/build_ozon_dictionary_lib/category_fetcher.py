@@ -37,32 +37,40 @@ _DEFAULT_USER_AGENT = (
 
 
 async def fetch_sample_product_urls(
-    category_id: int,
-    category_slug: str = "",
-    n: int = 20,
+    category: dict,
+    limit: int = 20,
 ) -> list[str]:
-    """Fetch N sample product URLs from an Ozon category page via Playwright.
+    """Fetch up to *limit* sample product URLs from an Ozon category page.
+
+    Accepts a category dict (as returned by seed_loader.load_seed_categories)
+    with any of the following fields used to determine the category page URL,
+    tried in priority order:
+
+    1. ``url``   — full URL, e.g. "https://www.ozon.ru/category/smartfony-15502/"
+    2. ``slug``  — slug only,  e.g. "smartfony-15502"
+    3. ``id``    — numeric ID, e.g. 502
 
     Args:
-        category_id: Ozon category numeric ID.
-        category_slug: URL slug of the category (e.g. "smartfony-15502").
-        n: How many product URLs to collect.
+        category: dict with at least one of ``url``, ``slug``, or ``id``.
+        limit: Maximum number of product URLs to return.
 
     Returns:
-        List of absolute Ozon product page URLs, possibly fewer than n on error.
+        List of absolute Ozon product page URLs (https://www.ozon.ru/product/...),
+        deduplicated, query-params stripped.  May be shorter than *limit* on error.
     """
     if not PLAYWRIGHT_AVAILABLE:
         raise RuntimeError(
             "playwright is not installed.  Run: pip install playwright && playwright install chromium"
         )
 
-    slug = category_slug or str(category_id)
-    url = f"https://www.ozon.ru/category/{slug}/"
+    cat_url = _resolve_category_url(category)
+    if not cat_url:
+        return []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
         )
         context = await browser.new_context(
             user_agent=_DEFAULT_USER_AGENT,
@@ -71,11 +79,34 @@ async def fetch_sample_product_urls(
         )
         page = await context.new_page()
         try:
-            urls = await _collect_product_urls(page, url, n)
+            urls = await _collect_product_urls(page, cat_url, limit)
         finally:
             await browser.close()
 
     return urls
+
+
+def _resolve_category_url(category: dict) -> str:
+    """Build the Ozon category page URL from a category dict.
+
+    Priority: ``url`` > ``slug`` > ``id``.
+    Returns an empty string if none of those fields are present.
+    """
+    url = category.get("url", "")
+    if url:
+        if not url.startswith("http"):
+            url = f"https://www.ozon.ru{url}"
+        return url
+
+    slug = category.get("slug", "")
+    if slug:
+        return f"https://www.ozon.ru/category/{slug}/"
+
+    cat_id = category.get("id")
+    if cat_id is not None:
+        return f"https://www.ozon.ru/category/{cat_id}/"
+
+    return ""
 
 
 async def _collect_product_urls(page: Any, category_url: str, n: int) -> list[str]:
