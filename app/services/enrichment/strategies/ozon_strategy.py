@@ -8,6 +8,12 @@ from .base import MarketplaceStrategy, ValidationResult
 from app.services.enrichment.base import (
     AttributeValue, TargetAttribute, ExtractionContext,
 )
+from app.services.enrichment.strategies.dictionaries.ozon_loader import (
+    get_ozon_characteristics_for_category,
+    get_ozon_category_name,
+)
+# TODO (Tier 2): use get_ozon_characteristics_for_category in normalize_target
+#   to inject Ozon allowed_values into TargetAttribute before enrichment.
 
 
 # TODO (Tier 2): заполнить из реальных Ozon API данных
