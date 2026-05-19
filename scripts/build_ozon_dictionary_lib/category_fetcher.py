@@ -1,10 +1,10 @@
-"""Ozon category fetcher — Playwright-based fallback.
+"""Ozon category fetcher — Wayback Machine primary, Playwright fallback.
 
-Uses Ozon's internal categoryChildV3 endpoint (accessed via headless Chromium)
-to build/enrich the category tree and collect sample product URLs per category.
+Uses archive.org Wayback Machine as the primary source to bypass DataDome
+(archive.org fetches from its own IPs; DataDome has no effect).
 
-This module is a fallback when welel/ozon-scraper seed data is unavailable or
-when sample_urls are missing from the seed.
+Falls back to Playwright-based headless Chromium when no Wayback snapshot
+is available or when the snapshot is too old.
 
 TODO: Verify real Ozon API endpoint path and response schema.
       Ozon updates their internal API sporadically — the URL below may need
@@ -13,6 +13,9 @@ TODO: Verify real Ozon API endpoint path and response schema.
 """
 import asyncio
 import json
+import re
+import urllib.parse
+import urllib.request
 from typing import Any
 
 try:
@@ -36,9 +39,113 @@ _DEFAULT_USER_AGENT = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Wayback Machine helpers
+# ---------------------------------------------------------------------------
+
+def _wayback_snapshot_url(ozon_url: str) -> str | None:
+    """Return the most recent Wayback Machine snapshot URL for *ozon_url*, or None."""
+    # Try the simple availability API first (fast)
+    api = f"https://archive.org/wayback/available?url={urllib.parse.quote(ozon_url, safe=':/')}"
+    try:
+        try:
+            from curl_cffi import requests as _cffi
+            resp = _cffi.get(api, timeout=12)
+            data = resp.json()
+        except ImportError:
+            with urllib.request.urlopen(api, timeout=12) as r:
+                data = json.loads(r.read())
+
+        snapshot = data.get("archived_snapshots", {}).get("closest", {})
+        if snapshot.get("available"):
+            return snapshot["url"]
+    except Exception:
+        pass
+
+    # Fall back to CDX API (slower but more complete)
+    cdx = (
+        "https://web.archive.org/cdx/search/cdx"
+        f"?url={urllib.parse.quote(ozon_url, safe=':/')}"
+        "&output=json&limit=1&fl=timestamp,original&filter=statuscode:200&fastLatest=true"
+    )
+    try:
+        try:
+            from curl_cffi import requests as _cffi
+            resp = _cffi.get(cdx, timeout=15)
+            rows = resp.json()
+        except ImportError:
+            with urllib.request.urlopen(cdx, timeout=15) as r:
+                rows = json.loads(r.read())
+
+        if len(rows) > 1:
+            ts, orig = rows[1][0], rows[1][1]
+            return f"https://web.archive.org/web/{ts}/{orig}"
+    except Exception:
+        pass
+
+    return None
+
+
+def _fetch_wayback_product_urls(ozon_url: str, limit: int = 20) -> list[str]:
+    """Fetch *limit* product URLs from the latest Wayback Machine snapshot.
+
+    Returns an empty list when no snapshot is found or on any network error.
+    Category dictionaries on Ozon change slowly, so a snapshot from the past
+    year is usually still valid for attribute/category work.
+    """
+    snapshot_url = _wayback_snapshot_url(ozon_url)
+    if not snapshot_url:
+        return []
+
+    try:
+        try:
+            from curl_cffi import requests as _cffi
+            resp = _cffi.get(snapshot_url, timeout=30, impersonate="chrome120")
+            html = resp.text
+        except ImportError:
+            req = urllib.request.Request(
+                snapshot_url,
+                headers={"User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )},
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                html = r.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        print(f"[category_fetcher] Wayback fetch failed for {ozon_url}: {exc}")
+        return []
+
+    raw_links = re.findall(r'href=["\']([^"\']*?/product/[^"\']+)["\']', html)
+    seen: set[str] = set()
+    result: list[str] = []
+    for lnk in raw_links:
+        # Strip Wayback Machine wrapper prefix if present
+        m = re.search(r"/(https?://[^/]*/product/[^?\"']+)", lnk)
+        if m:
+            clean = m.group(1).split("?")[0]
+        elif "/product/" in lnk and "ozon.ru" in lnk:
+            clean = lnk.split("?")[0]
+        else:
+            continue
+        if clean not in seen:
+            seen.add(clean)
+            result.append(clean)
+        if len(result) >= limit:
+            break
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 async def fetch_sample_product_urls(
     category: dict,
     limit: int = 20,
+    use_wayback: bool = True,
 ) -> list[str]:
     """Fetch up to *limit* sample product URLs from an Ozon category page.
 
@@ -50,22 +157,39 @@ async def fetch_sample_product_urls(
     2. ``slug``  — slug only,  e.g. "smartfony-15502"
     3. ``id``    — numeric ID, e.g. 502
 
+    Strategy (DataDome bypass):
+    - Primary:  archive.org Wayback Machine (``use_wayback=True``, default).
+                Wayback fetches from its own IPs; DataDome has no effect.
+                Category structures on Ozon change slowly, so a cached snapshot
+                from the past year is valid for attribute/dictionary work.
+    - Fallback: headless Playwright (may be blocked by DataDome on datacenter IPs).
+
     Args:
-        category: dict with at least one of ``url``, ``slug``, or ``id``.
-        limit: Maximum number of product URLs to return.
+        category:     dict with at least one of ``url``, ``slug``, or ``id``.
+        limit:        Maximum number of product URLs to return.
+        use_wayback:  Try archive.org first (default True).
 
     Returns:
         List of absolute Ozon product page URLs (https://www.ozon.ru/product/...),
         deduplicated, query-params stripped.  May be shorter than *limit* on error.
     """
+    cat_url = _resolve_category_url(category)
+    if not cat_url:
+        return []
+
+    # --- Primary: Wayback Machine ---
+    if use_wayback:
+        urls = _fetch_wayback_product_urls(cat_url, limit)
+        if urls:
+            print(f"[category_fetcher] Wayback: got {len(urls)} URLs for {cat_url}")
+            return urls
+        print(f"[category_fetcher] Wayback returned nothing for {cat_url}, falling back to Playwright")
+
+    # --- Fallback: Playwright ---
     if not PLAYWRIGHT_AVAILABLE:
         raise RuntimeError(
             "playwright is not installed.  Run: pip install playwright && playwright install chromium"
         )
-
-    cat_url = _resolve_category_url(category)
-    if not cat_url:
-        return []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
