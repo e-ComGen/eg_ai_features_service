@@ -1,7 +1,11 @@
-"""Парсит __NEXT_DATA__ из Ozon product страниц через Playwright.
+"""Парсит __NEXT_DATA__ из Ozon product страниц.
+
+Primary source: archive.org Wayback Machine (обходит DataDome/Cloudflare — архив
+фетчит с собственных IP, антибот не срабатывает).
+Fallback: Playwright headless Chromium.
 
 Ozon отдаёт данные товара в JSON-блоке <script id="__NEXT_DATA__">, встроенном
-в HTML страницы.  Playwright нужен для обхода Cloudflare и JS-рендеринга.
+в HTML страницы.
 
 TODO: Структура __NEXT_DATA__ регулярно меняется — возможно потребуется
       адаптация walk-логики под актуальный формат Ozon.
@@ -10,7 +14,9 @@ TODO: Структура __NEXT_DATA__ регулярно меняется — �
 """
 import json
 import re
-from typing import Any
+import urllib.parse
+import urllib.request
+from typing import Any, Optional
 
 try:
     from playwright.async_api import async_playwright
@@ -32,15 +38,87 @@ _NEXT_DATA_RE = re.compile(
 )
 
 
-async def parse_product_characteristics(product_url: str) -> list[dict]:
-    """Load an Ozon product page and extract characteristics from __NEXT_DATA__.
+# ---------------------------------------------------------------------------
+# Wayback Machine helpers
+# ---------------------------------------------------------------------------
 
-    Args:
-        product_url: Full URL of the Ozon product page.
+def _fetch_via_wayback(product_url: str) -> Optional[str]:
+    """Fetch an Ozon product page HTML from archive.org Wayback Machine.
 
-    Returns:
-        List of dicts with keys: key, display_name, value.
-        Returns [] on any failure (network error, CF block, missing data).
+    Steps:
+    1. Query the availability API to get the latest snapshot URL.
+    2. Download the snapshot via curl_cffi (impersonate=chrome120) or stdlib urllib.
+
+    Returns raw HTML string, or None if no snapshot is found / any error occurs.
+    """
+    # Step 1: resolve snapshot URL
+    api = (
+        "https://archive.org/wayback/available"
+        f"?url={urllib.parse.quote(product_url, safe=':/')}"
+    )
+    snapshot_url: Optional[str] = None
+    try:
+        try:
+            from curl_cffi import requests as _cffi
+            resp = _cffi.get(api, timeout=12)
+            data = resp.json()
+        except ImportError:
+            with urllib.request.urlopen(api, timeout=12) as r:
+                data = json.loads(r.read())
+
+        snapshot = data.get("archived_snapshots", {}).get("closest", {})
+        if snapshot.get("available"):
+            snapshot_url = snapshot["url"]
+    except Exception as exc:
+        print(f"[product_parser] Wayback availability check failed for {product_url}: {exc}")
+
+    # Fall back to CDX API when availability API returns nothing
+    if not snapshot_url:
+        cdx = (
+            "https://web.archive.org/cdx/search/cdx"
+            f"?url={urllib.parse.quote(product_url, safe=':/')}"
+            "&output=json&limit=1&fl=timestamp,original&filter=statuscode:200&fastLatest=true"
+        )
+        try:
+            try:
+                from curl_cffi import requests as _cffi
+                resp = _cffi.get(cdx, timeout=15)
+                rows = resp.json()
+            except ImportError:
+                with urllib.request.urlopen(cdx, timeout=15) as r:
+                    rows = json.loads(r.read())
+
+            if len(rows) > 1:
+                ts, orig = rows[1][0], rows[1][1]
+                snapshot_url = f"https://web.archive.org/web/{ts}/{orig}"
+        except Exception as exc:
+            print(f"[product_parser] Wayback CDX lookup failed for {product_url}: {exc}")
+
+    if not snapshot_url:
+        return None
+
+    # Step 2: download the snapshot
+    try:
+        try:
+            from curl_cffi import requests as _cffi
+            resp = _cffi.get(snapshot_url, timeout=30, impersonate="chrome120")
+            return resp.text
+        except ImportError:
+            req = urllib.request.Request(
+                snapshot_url,
+                headers={"User-Agent": _DEFAULT_USER_AGENT},
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        print(f"[product_parser] Wayback snapshot download failed ({snapshot_url}): {exc}")
+        return None
+
+
+async def _fetch_via_playwright(product_url: str) -> Optional[str]:
+    """Fetch an Ozon product page HTML via headless Playwright (Cloudflare fallback).
+
+    Returns raw HTML string, or None on any failure.
     """
     if not PLAYWRIGHT_AVAILABLE:
         raise RuntimeError(
@@ -60,12 +138,39 @@ async def parse_product_characteristics(product_url: str) -> list[dict]:
         page = await context.new_page()
         try:
             await page.goto(product_url, wait_until="networkidle", timeout=30_000)
-            html = await page.content()
+            return await page.content()
         except Exception as exc:
-            print(f"[product_parser] Navigation failed for {product_url}: {exc}")
-            return []
+            print(f"[product_parser] Playwright navigation failed for {product_url}: {exc}")
+            return None
         finally:
             await browser.close()
+
+
+async def parse_product_characteristics(product_url: str) -> list[dict]:
+    """Load an Ozon product page and extract characteristics from __NEXT_DATA__.
+
+    Strategy (DataDome/Cloudflare bypass):
+    - Primary:  archive.org Wayback Machine via curl_cffi (no antibot exposure).
+    - Fallback: headless Playwright (may be blocked on datacenter IPs).
+
+    Args:
+        product_url: Full URL of the Ozon product page.
+
+    Returns:
+        List of dicts with keys: key, display_name, value.
+        Returns [] on any failure (network error, CF block, missing data).
+    """
+    # Try Wayback first
+    html = _fetch_via_wayback(product_url)
+    if html:
+        print(f"[product_parser] Wayback: fetched snapshot for {product_url}")
+    else:
+        print(f"[product_parser] Wayback returned nothing for {product_url}, falling back to Playwright")
+        # Fallback to Playwright
+        html = await _fetch_via_playwright(product_url)
+
+    if not html:
+        return []
 
     return _extract_from_html(html)
 
