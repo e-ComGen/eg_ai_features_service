@@ -25,6 +25,24 @@ SAMPLE_DICT = {
     }
 }
 
+# New schema_version format with a "categories" wrapper
+SAMPLE_DICT_V2 = {
+    "schema_version": 1,
+    "source": "manual_seed_top30",
+    "generated_at": "2026-05-14",
+    "categories": {
+        "502": {
+            "name": "Смартфоны",
+            "path": ["Электроника", "Смартфоны"],
+            "characteristics": [
+                {"id": 9048, "name": "Бренд"},
+                {"id": 4180, "name": "Цвет товара"},
+                {"id": 5076, "name": "Объём встроенной памяти, ГБ"},
+            ],
+        }
+    },
+}
+
 
 def _reset_cache() -> None:
     """Clear lru_cache on load_ozon_dictionary between tests."""
@@ -73,6 +91,44 @@ class TestLoadOzonDictionary:
         assert "502" in result
         assert result["502"]["name"] == "Смартфоны"
         assert result["502"]["path"] == ["Электроника", "Смартфоны"]
+
+    def test_load_schema_version_format_unwraps_categories(self, tmp_path):
+        """load_ozon_dictionary unwraps 'categories' key from new schema format."""
+        (tmp_path / "ozon_dictionary.json").write_text(
+            json.dumps(SAMPLE_DICT_V2), encoding="utf-8"
+        )
+        with patch(
+            "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+            tmp_path,
+        ):
+            _reset_cache()
+            from app.services.enrichment.strategies.dictionaries.ozon_loader import (
+                load_ozon_dictionary,
+            )
+            result = load_ozon_dictionary()
+        # The result should be the categories dict, NOT the top-level object
+        assert "502" in result
+        assert "schema_version" not in result
+        assert "categories" not in result
+        assert result["502"]["name"] == "Смартфоны"
+
+    def test_load_schema_version_format_characteristics_have_id(self, tmp_path):
+        """Characteristics in new format use 'id' field, not 'key'."""
+        (tmp_path / "ozon_dictionary.json").write_text(
+            json.dumps(SAMPLE_DICT_V2), encoding="utf-8"
+        )
+        with patch(
+            "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+            tmp_path,
+        ):
+            _reset_cache()
+            from app.services.enrichment.strategies.dictionaries.ozon_loader import (
+                load_ozon_dictionary,
+            )
+            result = load_ozon_dictionary()
+        chars = result["502"]["characteristics"]
+        assert len(chars) == 3
+        assert chars[0] == {"id": 9048, "name": "Бренд"}
 
     def test_load_cached(self, tmp_path):
         """Repeated calls to load_ozon_dictionary do not re-read the file."""
