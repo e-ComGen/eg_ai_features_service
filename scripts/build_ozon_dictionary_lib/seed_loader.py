@@ -2,11 +2,31 @@
 
 Если нет интернета — fallback на встроенный мини-seed (топ-50 категорий).
 
-TODO: Реальная структура welel/ozon-scraper требует ручной проверки:
-      https://github.com/welel/ozon-scraper/tree/main/data/categories
-      Файлы там хранятся по номерам — потребуется листинг через GitHub API.
+welel/ozon-scraper schema (verified 2026-05):
+  Each file is named <id>.json and has the shape:
+    {
+      "data": {
+        "id": "15500",
+        "title": "...",
+        "url": "/category/elektronika-15500/",
+        "columns": [
+          {
+            "categories": [
+              {
+                "title": "...",
+                "url": "/category/slug-id/",
+                "categories": [ ... ]   # nested, same shape
+              }
+            ]
+          }
+        ]
+      }
+    }
+  Titles may contain replacement characters (Cyrillic corrupted in the repo);
+  the `url` field is always ASCII and carries the slug+id.
 """
 import json
+import re
 import httpx
 from pathlib import Path
 
@@ -58,7 +78,8 @@ def load_seed_categories() -> list[dict]:
     if _CACHE_PATH.exists():
         try:
             cats = json.loads(_CACHE_PATH.read_text(encoding="utf-8"))
-            if cats:
+            # Reject poisoned cache: require at least one entry with a valid url or id
+            if cats and any(c.get("url") or c.get("id") is not None for c in cats):
                 return cats
         except Exception:
             pass
@@ -107,12 +128,75 @@ def _fetch_from_welel() -> list[dict]:
             if r.status_code != 200:
                 continue
             try:
-                tree = r.json()
-                categories.extend(_flatten_tree(tree))
+                file_json = r.json()
+                # Real schema: {"data": {"id": "...", "url": "...", "columns": [{"categories": [...]}]}}
+                data_node = file_json.get("data", {}) if isinstance(file_json, dict) else {}
+                columns = data_node.get("columns") or []
+                # Flatten every category subtree in every column
+                for col in columns:
+                    for cat_node in (col.get("categories") or []):
+                        categories.extend(_flatten_welel_node(cat_node, path=[]))
+                # If no columns, fall back to legacy recursive flatten
+                if not columns:
+                    categories.extend(_flatten_tree(file_json))
             except Exception:
                 continue
 
     return categories
+
+
+def _id_from_url(url: str) -> int | None:
+    """Extract numeric category id from an Ozon category URL slug.
+
+    Examples:
+      /category/smartfony-15502/  -> 15502
+      /category/15500/            -> 15500
+    """
+    m = re.search(r"-(\d+)/?$", url.rstrip("/"))
+    if m:
+        return int(m.group(1))
+    m = re.search(r"/category/(\d+)/?$", url.rstrip("/"))
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _flatten_welel_node(node: dict, path: list[str]) -> list[dict]:
+    """Recursively flatten a welel/ozon-scraper category node.
+
+    Schema: {"title": "...", "url": "/category/slug-id/", "categories": [...]}
+    """
+    nodes: list[dict] = []
+    if not isinstance(node, dict):
+        return nodes
+
+    url = node.get("url", "")
+    title = node.get("title", "")
+    children = node.get("categories") or []
+
+    # Titles may be garbled; fall back to slug extracted from url
+    if title and "�" not in title:
+        name = title
+    else:
+        # Derive readable name from url slug (e.g. "smartfony-15502" -> "smartfony")
+        slug_match = re.search(r"/category/([^/]+)/?$", url.rstrip("/"))
+        name = slug_match.group(1) if slug_match else title
+
+    current_path = path + [name] if name else path
+    cat_id = _id_from_url(url) if url else None
+
+    if not children:
+        nodes.append({
+            "id": cat_id,
+            "name": name,
+            "path": current_path,
+            "url": url,
+        })
+    else:
+        for child in children:
+            nodes.extend(_flatten_welel_node(child, current_path))
+
+    return nodes
 
 
 def _flatten_tree(tree: dict | list, path: list[str] | None = None) -> list[dict]:

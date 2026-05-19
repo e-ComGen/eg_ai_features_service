@@ -110,10 +110,27 @@ def _resolve_category_url(category: dict) -> str:
 
 
 async def _collect_product_urls(page: Any, category_url: str, n: int) -> list[str]:
-    """Navigate to category page and scrape product hrefs."""
+    """Navigate to category page and scrape product hrefs.
+
+    Uses domcontentloaded (not networkidle) to avoid hanging on antibot challenge
+    pages that keep XHR activity alive indefinitely.  If the server returns a
+    non-2xx status the page is skipped immediately.
+    """
     product_urls: list[str] = []
     try:
-        await page.goto(category_url, wait_until="networkidle", timeout=45_000)
+        response = await page.goto(category_url, wait_until="domcontentloaded", timeout=30_000)
+        status_code = getattr(response, "status", 200)
+        if response is None or (isinstance(status_code, int) and status_code >= 400):
+            print(
+                f"[category_fetcher] Skipping {category_url}: "
+                f"HTTP {status_code if response else 'no-response'}"
+            )
+            return product_urls
+
+        # Give JS rendering a short fixed window (3 s) — enough for SSR/hydration
+        # but doesn't block forever if the page is a challenge/captcha.
+        await page.wait_for_timeout(3_000)
+
         # Ozon product links contain "/product/" in their href
         links = await page.eval_on_selector_all(
             "a[href*='/product/']",
