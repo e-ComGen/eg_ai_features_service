@@ -25,7 +25,7 @@ SAMPLE_DICT = {
     }
 }
 
-# New schema_version format with a "categories" wrapper
+# schema_version=1 с categories-оберткой (legacy compound-like, но ключи простые)
 SAMPLE_DICT_V2 = {
     "schema_version": 1,
     "source": "manual_seed_top30",
@@ -40,6 +40,47 @@ SAMPLE_DICT_V2 = {
                 {"id": 5076, "name": "Объём встроенной памяти, ГБ"},
             ],
         }
+    },
+}
+
+# schema_version=2: compound-ключи "<description_category_id>:<type_id>"
+SAMPLE_DICT_V2_COMPOUND = {
+    "schema_version": 2,
+    "source": "ozon_seller_api",
+    "generated_at": "2026-05-20",
+    "categories": {
+        "200001175:970671325": {
+            "description_category_id": 200001175,
+            "type_id": 970671325,
+            "name": "Смартфоны",
+            "path": ["Электроника", "Смартфоны"],
+            "characteristics": [
+                {"id": 9048, "name": "Бренд", "type": "String",
+                 "is_required": True, "is_collection": False, "description": "Бренд товара"},
+                {"id": 4180, "name": "Цвет товара", "type": "Option",
+                 "is_required": False, "is_collection": False, "description": "Цвет"},
+            ],
+        },
+        "200001175:970671326": {
+            "description_category_id": 200001175,
+            "type_id": 970671326,
+            "name": "Смартфоны (Б/У)",
+            "path": ["Электроника", "Смартфоны"],
+            "characteristics": [
+                {"id": 9048, "name": "Бренд", "type": "String",
+                 "is_required": True, "is_collection": False, "description": "Бренд товара"},
+            ],
+        },
+        "300000002:111111111": {
+            "description_category_id": 300000002,
+            "type_id": 111111111,
+            "name": "Ноутбуки",
+            "path": ["Электроника", "Ноутбуки"],
+            "characteristics": [
+                {"id": 7777, "name": "Объём ОЗУ", "type": "Integer",
+                 "is_required": True, "is_collection": False, "description": "RAM"},
+            ],
+        },
     },
 }
 
@@ -255,3 +296,102 @@ class TestGetOzonCategoryName:
                 get_ozon_category_name,
             )
             assert get_ozon_category_name(0) is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: schema_version=2 compound keys ("<cat_id>:<type_id>")
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaV2CompoundKeys:
+    """Проверяем поддержку v2 словаря с compound-ключами '<cat_id>:<type_id>'."""
+
+    def setup_method(self):
+        _reset_cache()
+
+    def test_get_characteristics_for_type_known_pair(self, tmp_path):
+        """get_ozon_characteristics_for_type возвращает характеристики для известной пары."""
+        (tmp_path / "ozon_dictionary.json").write_text(
+            json.dumps(SAMPLE_DICT_V2_COMPOUND), encoding="utf-8"
+        )
+        with patch(
+            "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+            tmp_path,
+        ):
+            _reset_cache()
+            from app.services.enrichment.strategies.dictionaries.ozon_loader import (
+                get_ozon_characteristics_for_type,
+            )
+            result = get_ozon_characteristics_for_type(200001175, 970671325)
+        assert len(result) == 2
+        assert result[0]["id"] == 9048
+        assert result[0]["name"] == "Бренд"
+        assert result[0]["type"] == "String"
+        assert result[0]["is_required"] is True
+
+    def test_get_characteristics_for_type_unknown_pair_returns_empty(self, tmp_path):
+        """get_ozon_characteristics_for_type возвращает [] для неизвестной пары."""
+        (tmp_path / "ozon_dictionary.json").write_text(
+            json.dumps(SAMPLE_DICT_V2_COMPOUND), encoding="utf-8"
+        )
+        with patch(
+            "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+            tmp_path,
+        ):
+            _reset_cache()
+            from app.services.enrichment.strategies.dictionaries.ozon_loader import (
+                get_ozon_characteristics_for_type,
+            )
+            result = get_ozon_characteristics_for_type(200001175, 999999999)
+        assert result == []
+
+    def test_get_characteristics_for_category_fallback_on_compound(self, tmp_path):
+        """get_ozon_characteristics_for_category находит данные по category_id без type_id."""
+        (tmp_path / "ozon_dictionary.json").write_text(
+            json.dumps(SAMPLE_DICT_V2_COMPOUND), encoding="utf-8"
+        )
+        with patch(
+            "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+            tmp_path,
+        ):
+            _reset_cache()
+            from app.services.enrichment.strategies.dictionaries.ozon_loader import (
+                get_ozon_characteristics_for_category,
+            )
+            result = get_ozon_characteristics_for_category(200001175)
+        # Должен вернуть характеристики хотя бы одного из type_id для этой категории
+        assert len(result) >= 1
+        char_ids = [c["id"] for c in result]
+        assert 9048 in char_ids  # Бренд есть в обоих type
+
+    def test_get_characteristics_for_category_unknown_returns_empty(self, tmp_path):
+        """get_ozon_characteristics_for_category возвращает [] для неизвестной категории."""
+        (tmp_path / "ozon_dictionary.json").write_text(
+            json.dumps(SAMPLE_DICT_V2_COMPOUND), encoding="utf-8"
+        )
+        with patch(
+            "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+            tmp_path,
+        ):
+            _reset_cache()
+            from app.services.enrichment.strategies.dictionaries.ozon_loader import (
+                get_ozon_characteristics_for_category,
+            )
+            result = get_ozon_characteristics_for_category(999999)
+        assert result == []
+
+    def test_get_category_name_from_compound_key(self, tmp_path):
+        """get_ozon_category_name работает с compound-ключами v2."""
+        (tmp_path / "ozon_dictionary.json").write_text(
+            json.dumps(SAMPLE_DICT_V2_COMPOUND), encoding="utf-8"
+        )
+        with patch(
+            "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+            tmp_path,
+        ):
+            _reset_cache()
+            from app.services.enrichment.strategies.dictionaries.ozon_loader import (
+                get_ozon_category_name,
+            )
+            name = get_ozon_category_name(300000002)
+        assert name == "Ноутбуки"

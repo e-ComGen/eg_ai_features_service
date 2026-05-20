@@ -48,6 +48,22 @@ class MarketplaceStrategy(ABC):
         """
         return ValidationResult(is_valid=True, normalized_value=value)
 
+    def filter_by_dictionary(
+        self,
+        targets: list[TargetAttribute],
+        context: "ExtractionContext",
+    ) -> list[TargetAttribute]:
+        """Оставить только targets известных словарю. Default: no-op."""
+        return targets
+
+    def normalize_target_with_context(
+        self,
+        target: TargetAttribute,
+        context: "ExtractionContext",
+    ) -> TargetAttribute:
+        """Обогатить target метаданными из словаря. Default: no-op."""
+        return target
+
     def filter_unsupported_attributes(
         self, targets: list[TargetAttribute],
     ) -> list[TargetAttribute]:
@@ -70,3 +86,11 @@ class MarketplaceStrategy(ABC):
         Например WB: приведение casing 'хлопок' → 'Хлопок' для известных enum.
         """
         return values
+
+    def resolve_value_ids(
+        self,
+        attribute_value: AttributeValue,
+        context: "ExtractionContext",
+    ) -> AttributeValue:
+        """Привязать словарные value_id(s). Default: no-op (pass-through)."""
+        return attribute_value

@@ -48,12 +48,13 @@ async def main(args):
     print(f"[2/4] Loading sample nm_ids from HuggingFace dataset (offline)...")
     hf_seed = build_seed_from_hf(samples_per_subj=args.samples)
     print(f"      Got {len(hf_seed)} subjects from HF dataset")
-    # Filter to only subjects present in the menu, skip already-completed ones
+    # HF dataset keys = subj_name (string). Map name→id via menu, skip already-completed.
     samples_per_subj = {
-        subj["id"]: hf_seed[subj["id"]]
+        subj["id"]: hf_seed[subj["name"]]
         for subj in subjects
-        if subj["id"] in hf_seed and subj["id"] not in completed_subjects
+        if subj["name"] in hf_seed and subj["id"] not in completed_subjects
     }
+    print(f"      Matched {len(samples_per_subj)} subjects (menu ∩ HF) to parse")
 
     print(f"[3/4] Parsing card characteristics...")
     total = sum(len(v) for v in samples_per_subj.values())

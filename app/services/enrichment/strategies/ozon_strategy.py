@@ -1,54 +1,144 @@
-"""OzonStrategy — STUB. Заполнить когда будут реальные Ozon API access.
+"""OzonStrategy — marketplace-specific логика для Ozon.
 
-Текущий behavior — почти то же что Default, но с Ozon-specific skips
-для атрибутов которые AI не должен заполнять на Ozon.
+Использует ozon_dictionary.json (203MB, 9227 leaf type_id, 343356 характеристик)
+для авторитетной схемы характеристик: normalize_target подмешивает метаданные
+из словаря, validate_value проверяет банлист и (будущее) enum-значения.
 """
-from typing import Any
+from typing import Any, Optional
 from .base import MarketplaceStrategy, ValidationResult
 from app.services.enrichment.base import (
     AttributeValue, TargetAttribute, ExtractionContext,
 )
 from app.services.enrichment.strategies.dictionaries.ozon_loader import (
+    get_ozon_characteristics_for_type,
     get_ozon_characteristics_for_category,
     get_ozon_category_name,
+    resolve_value_id,
+    is_truncated,
 )
-# TODO (Tier 2): use get_ozon_characteristics_for_category in normalize_target
-#   to inject Ozon allowed_values into TargetAttribute before enrichment.
+from app.services.enrichment.strategies.dictionaries.ozon_runtime_lookup import (
+    search_value as _runtime_search_value,
+)
 
 
-# TODO (Tier 2): заполнить из реальных Ozon API данных
-# Атрибуты которые Ozon генерит или требует от продавца напрямую
+# Атрибуты которые Ozon требует от продавца напрямую или генерит сам
 OZON_SKIP_SEMANTIC_TYPES = frozenset({
     "ean", "upc", "gtin", "barcode",  # Ozon требует от продавца в отдельном поле
-    "imei", "serial",                  # specific для каждого экземпляра
-    # TODO (Tier 2): расширить список на основе Ozon Content API docs
+    "imei", "serial",                  # специфично для каждого экземпляра
 })
 
-# TODO (Tier 2): заполнить реальным банлистом Ozon модерации
+# Банлист фраз (placeholder — расширить из модерации Ozon)
 OZON_BANNED_PHRASES: frozenset[str] = frozenset({
-    # Placeholder — реальный банлист подтянуть из Ozon модерации guidelines
     "лучший", "№1", "номер один",
 })
 
+# Маппинг Ozon type → TargetAttribute.type
+_OZON_TYPE_MAP: dict[str, str] = {
+    "String": "text",
+    "Integer": "numeric",
+    "Decimal": "numeric",
+    "Boolean": "bool",
+    "Option": "enum",
+    "MultiOption": "enum",
+    "ImageUrl": "text",
+    "Url": "text",
+}
+
+
+def _ozon_type_to_attr_type(ozon_type: str) -> str:
+    """Перевести Ozon API type string в TargetAttribute.type."""
+    return _OZON_TYPE_MAP.get(ozon_type, "text")
+
+
+def _build_char_index(characteristics: list[dict]) -> dict[int, dict]:
+    """Построить индекс {char_id: char_dict} из списка характеристик."""
+    return {c["id"]: c for c in characteristics if "id" in c}
+
 
 class OzonStrategy(MarketplaceStrategy):
-    """Ozon-specific overrides. STUB — заполнить когда будут реальные Ozon API access."""
+    """Ozon-specific overrides с поддержкой ozon_dictionary.json."""
 
     @property
     def name(self) -> str:
         return "ozon"
 
+    def _get_char_index(
+        self,
+        context: ExtractionContext,
+    ) -> dict[int, dict]:
+        """Получить индекс характеристик для категории из контекста.
+
+        Использует (description_category_id, type_id) если оба доступны,
+        иначе fallback на один category_id (перебор по первому type).
+        """
+        if context.ozon_type_id is not None:
+            chars = get_ozon_characteristics_for_type(context.category_id, context.ozon_type_id)
+        else:
+            # Fallback: берём первый подходящий type для category_id
+            chars = get_ozon_characteristics_for_category(context.category_id)
+        return _build_char_index(chars)
+
+    def normalize_target(self, target: TargetAttribute) -> TargetAttribute:
+        """normalize_target без контекста — no-op (контекст нужен для словаря).
+
+        Для обогащения метаданными используй normalize_target_with_context.
+        """
+        return target
+
+    def normalize_target_with_context(
+        self,
+        target: TargetAttribute,
+        context: ExtractionContext,
+    ) -> TargetAttribute:
+        """Обогатить TargetAttribute метаданными из Ozon dictionary.
+
+        Если характеристика с таким id есть в словаре:
+        - подставляем официальное name из словаря
+        - уточняем type через _ozon_type_to_attr_type
+        - подставляем description если у target его нет
+        Если характеристика не найдена — возвращаем target без изменений.
+        """
+        char_index = self._get_char_index(context)
+        char_meta = char_index.get(target.id)
+        if not char_meta:
+            return target
+
+        # Строим обновлённый target с метаданными из словаря
+        ozon_type = char_meta.get("type", "")
+        return TargetAttribute(
+            id=target.id,
+            name=char_meta.get("name", target.name),
+            type=_ozon_type_to_attr_type(ozon_type) if ozon_type else target.type,
+            allowed_values=target.allowed_values,
+            semantic_type=target.semantic_type,
+            description=target.description or char_meta.get("description"),
+            is_collection=bool(char_meta.get("is_collection", False)),
+        )
+
     def filter_unsupported_attributes(
         self, targets: list[TargetAttribute],
     ) -> list[TargetAttribute]:
-        """Skip атрибуты которые Ozon требует от продавца напрямую или генерит сам.
-
-        TODO (Tier 2): расширить на основе Ozon Content API категорийных словарей.
-        """
+        """Skip атрибуты которые Ozon требует от продавца напрямую или генерит сам."""
         return [
             t for t in targets
             if not t.semantic_type or t.semantic_type not in OZON_SKIP_SEMANTIC_TYPES
         ]
+
+    def filter_by_dictionary(
+        self,
+        targets: list[TargetAttribute],
+        context: ExtractionContext,
+    ) -> list[TargetAttribute]:
+        """Оставить только те targets, чей id есть в словаре для данной категории.
+
+        Если словарь не содержит категорию — возвращаем все targets без фильтрации
+        (graceful degradation: словарь может быть неполным).
+        """
+        char_index = self._get_char_index(context)
+        if not char_index:
+            # Словарь пуст или категория не найдена — не фильтруем
+            return targets
+        return [t for t in targets if t.id in char_index]
 
     def validate_value(
         self,
@@ -56,12 +146,7 @@ class OzonStrategy(MarketplaceStrategy):
         value: Any,
         context: ExtractionContext,
     ) -> ValidationResult:
-        """Базовая проверка на банлист.
-
-        TODO (Tier 2): проверка enum словарей категорий Ozon (Ozon Content API).
-        TODO (Tier 2): проверка лимитов длины по типу атрибута.
-        TODO (Tier 2): валидация форматов (цвет в RGB/hex, размеры в конкретных единицах).
-        """
+        """Проверка банлиста. В будущем: enum-словари категорий и лимиты длины."""
         if target.type == "text" and isinstance(value, str):
             v_lower = value.lower()
             for phrase in OZON_BANNED_PHRASES:
@@ -72,6 +157,94 @@ class OzonStrategy(MarketplaceStrategy):
                     )
         return ValidationResult(is_valid=True, normalized_value=value)
 
-    # normalize_target, post_process_values — TODO для будущих итераций
-    # TODO (Tier 2): normalize_target для подмешивания Ozon category dictionary allowed_values
-    # TODO (Tier 2): post_process_values для casing и форматирования enum значений Ozon
+    def resolve_value_ids(
+        self,
+        attribute_value: AttributeValue,
+        context: ExtractionContext,
+    ) -> AttributeValue:
+        """Привязать словарные value_id(s) к AttributeValue через ozon_loader.
+
+        Если у характеристики нет values-списка — возвращает без изменений.
+        Для атрибутов с values_truncated=True используй resolve_value_ids_async.
+        """
+        cat_id = context.category_id
+        type_id = context.ozon_type_id
+        attr_id = attribute_value.attribute_id
+
+        if type_id is None:
+            return attribute_value
+
+        if attribute_value.is_collection and isinstance(attribute_value.value, list):
+            ids = [
+                resolve_value_id(cat_id, type_id, attr_id, str(v))
+                for v in attribute_value.value
+            ]
+            resolved = [i for i in ids if i is not None]
+            if resolved:
+                attribute_value.value_ids = resolved
+        else:
+            vid = resolve_value_id(cat_id, type_id, attr_id, str(attribute_value.value))
+            if vid is not None:
+                attribute_value.value_id = vid
+
+        return attribute_value
+
+    async def resolve_value_ids_async(
+        self,
+        attribute_value: AttributeValue,
+        context: ExtractionContext,
+        *,
+        client_id: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ) -> AttributeValue:
+        """Async variant: resolve value ids with runtime API fallback for truncated dicts.
+
+        Algorithm per value:
+        1. Try static dictionary lookup (resolve_value_id). Fast, no network.
+        2. If not found AND is_truncated(attr) → call search_value API.
+        3. If still not found → leave value_id/value_ids unset.
+
+        Args:
+            attribute_value: The extracted value to annotate with Ozon dict ids.
+            context: Extraction context with category_id and ozon_type_id.
+            client_id: Ozon Client-Id for runtime lookups (falls back to env var).
+            api_key: Ozon Api-Key for runtime lookups (falls back to env var).
+
+        Returns:
+            The same AttributeValue object, mutated in-place with value_id / value_ids.
+        """
+        cat_id = context.category_id
+        type_id = context.ozon_type_id
+        attr_id = attribute_value.attribute_id
+
+        if type_id is None:
+            return attribute_value
+
+        truncated = is_truncated(cat_id, type_id, attr_id)
+
+        async def _resolve_one(raw_value: str) -> Optional[int]:
+            # 1. Static lookup
+            vid = resolve_value_id(cat_id, type_id, attr_id, raw_value)
+            if vid is not None:
+                return vid
+            # 2. Runtime fallback for truncated dictionaries
+            if truncated:
+                hit = await _runtime_search_value(
+                    cat_id, type_id, attr_id, raw_value,
+                    client_id=client_id, api_key=api_key,
+                )
+                if hit:
+                    return hit["id"]
+            return None
+
+        if attribute_value.is_collection and isinstance(attribute_value.value, list):
+            ids = [await _resolve_one(str(v)) for v in attribute_value.value]
+            resolved = [i for i in ids if i is not None]
+            if resolved:
+                attribute_value.value_ids = resolved
+        else:
+            vid = await _resolve_one(str(attribute_value.value))
+            if vid is not None:
+                attribute_value.value_id = vid
+
+        return attribute_value

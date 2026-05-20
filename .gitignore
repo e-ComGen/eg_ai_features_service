@@ -57,3 +57,13 @@ Thumbs.db
 build/
 dist/
 *.egg-info/
+
+# Marketplace dictionaries — генерируются через scripts/build_ozon_*.py и build_wb_*.py
+# Скрипты в репо, данные собираем на деплое (большие файлы, ~140MB+)
+app/services/enrichment/strategies/dictionaries/data/*.json
+app/services/enrichment/strategies/dictionaries/data/*.json.gz
+app/services/enrichment/strategies/dictionaries/data/*.partial
+app/services/enrichment/strategies/dictionaries/data/*.values_partial
+
+# Runtime logs
+logs/

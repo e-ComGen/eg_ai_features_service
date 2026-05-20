@@ -70,15 +70,21 @@ SOURCE_CONFIDENCE_THRESHOLDS: dict[Source, float] = {
 }
 
 
+_Scalar = Union[str, int, float, bool]
+
+
 class AttributeValue(BaseModel):
     """Одно извлечённое значение характеристики от какого-то source."""
     attribute_id: int = Field(..., description="ID характеристики в схеме CS-Cart")
-    value: Union[str, int, float, bool] = Field(..., description="Извлечённое значение")
+    value: Union[_Scalar, list[_Scalar]] = Field(..., description="Извлечённое значение (скаляр или список для is_collection)")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Уверенность 0-1")
     source: Source = Field(..., description="Откуда пришло значение")
     evidence: Optional[str] = Field(None, description="Цитата/URL/обоснование для audit")
     judge_validated: bool = Field(False, description="Прошёл ли через per-source judge")
     semantic_type: Optional[str] = Field(None, description="copy из TargetAttribute.semantic_type для downstream решений")
+    is_collection: bool = Field(False, description="Характеристика-массив (из is_collection словаря)")
+    value_id: Optional[int] = Field(None, description="Словарный ID для одиночного значения (Ozon)")
+    value_ids: Optional[list[int]] = Field(None, description="Словарные ID для массива значений (Ozon is_collection)")
 
     @field_validator("evidence")
     @classmethod
@@ -106,6 +112,7 @@ class TargetAttribute(BaseModel):
     allowed_values: Optional[list[str]] = None
     semantic_type: Optional[str] = Field(None, description="color | weight | material_visual | brand | etc — подсказка для classifier")
     description: Optional[str] = None
+    is_collection: bool = Field(False, description="Характеристика принимает массив значений")
 
 
 class ExtractionContext(BaseModel):
@@ -123,6 +130,10 @@ class ExtractionContext(BaseModel):
     ean: Optional[str] = None
     source_urls: list[str] = Field(default_factory=list)
     image_urls: list[str] = Field(default_factory=list)
+
+    # Marketplace-specific fields
+    marketplace: Optional[str] = None          # "ozon" | "wb" | None
+    ozon_type_id: Optional[int] = None         # Ozon type_id для точного словарного поиска
 
     # Cost tracking
     cost_so_far_usd: float = 0.0

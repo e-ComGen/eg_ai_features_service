@@ -25,7 +25,7 @@ from app.services.enrichment.judges.websearch_judge import WebSearchJudge
 class _WebExtractedAttr(BaseModel):
     model_config = {"populate_by_name": True}
     attribute_id: int = Field(..., validation_alias=AliasChoices("attribute_id", "id"))
-    value: str | int | float | bool = Field(..., validation_alias=AliasChoices("value", "attribute_value", "extracted_value"))
+    value: str | int | float | bool | list[str | int | float | bool] = Field(..., validation_alias=AliasChoices("value", "attribute_value", "extracted_value"))
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     source_url: Optional[str] = None
     evidence: Optional[str] = Field(None, max_length=200)
@@ -78,15 +78,17 @@ class WebSearchSource(AttributeSource):
 
         # Step 3: extraction from summary
         targets_block = "\n".join([
-            f"- id={t.id}, name={t.name!r}, type={t.type}" +
-            (f", allowed={t.allowed_values}" if t.allowed_values else "")
+            f"- id={t.id}, name={t.name!r}, type={t.type}"
+            + (f", allowed={t.allowed_values}" if t.allowed_values else "")
+            + (", is_collection=true" if t.is_collection else "")
             for t in targets
         ])
 
         system_prompt = (
             "You extract product characteristics from a summary of web search results. "
             "Prefer values from authoritative sources (manufacturer site, well-known retailers). "
-            "Include source URL if mentioned in the summary. Evidence should be a brief quote."
+            "Include source URL if mentioned in the summary. Evidence should be a brief quote. "
+            "If the target has is_collection=true, return a JSON array of values; otherwise a single scalar."
         )
         user_text = (
             f"Product: {context.product_name}\n"
@@ -115,6 +117,8 @@ class WebSearchSource(AttributeSource):
                 evidence=f"[{a.source_url}] {a.evidence}" if a.source_url else a.evidence,
                 semantic_type=target_by_id[a.attribute_id].semantic_type
                               if a.attribute_id in target_by_id else None,
+                is_collection=target_by_id[a.attribute_id].is_collection
+                              if a.attribute_id in target_by_id else False,
             )
             for a in parsed.extracted
         ]

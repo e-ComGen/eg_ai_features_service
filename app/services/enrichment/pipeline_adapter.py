@@ -85,6 +85,8 @@ class PipelineAdapter:
             source_urls=source_urls or [],
             image_urls=image_urls or [],
             max_cost_usd=max_cost_usd,
+            marketplace=marketplace,
+            # ozon_type_id: нет источника на стороне адаптера — проставляется выше (addon/job)
         )
 
         targets: list[TargetAttribute] = []

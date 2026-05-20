@@ -66,8 +66,15 @@ class PipelineOrchestrator:
         self, context: ExtractionContext, targets: list[TargetAttribute]
     ) -> list[AttributeValue]:
         """Run full pipeline. Returns merged final attributes (one per attribute_id)."""
-        # NEW: apply strategy.filter_unsupported_attributes before pipeline starts
+        # Шаг 0a: убираем атрибуты которые marketplace не поддерживает
         targets = self._strategy.filter_unsupported_attributes(targets)
+        # Шаг 0b: убираем атрибуты неизвестные словарю (Ozon: только словарные char_id)
+        targets = self._strategy.filter_by_dictionary(targets, context)
+        # Шаг 0c: обогащаем оставшиеся targets метаданными из словаря (name, type, description)
+        targets = [
+            self._strategy.normalize_target_with_context(t, context)
+            for t in targets
+        ]
 
         all_values: list[AttributeValue] = []
 
@@ -130,6 +137,9 @@ class PipelineOrchestrator:
     ) -> list[AttributeValue]:
         """Merge + strategy post-process + strategy validation. Used at every early-exit point."""
         merged = self._merge(all_values)
+
+        # Привязываем словарные value_id(s) (Ozon) или no-op для других стратегий
+        merged = [self._strategy.resolve_value_ids(v, context) for v in merged]
 
         # Strategy post-processing (e.g. casing normalisation for known enums)
         merged = self._strategy.post_process_values(merged, targets, context)

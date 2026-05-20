@@ -31,7 +31,7 @@ VISUAL_SEMANTIC_TYPES = {
 class _VisionExtractedAttr(BaseModel):
     model_config = {"populate_by_name": True}
     attribute_id: int = Field(..., validation_alias=AliasChoices("attribute_id", "id"))
-    value: str | int | float | bool = Field(..., validation_alias=AliasChoices("value", "attribute_value", "extracted_value"))
+    value: str | int | float | bool | list[str | int | float | bool] = Field(..., validation_alias=AliasChoices("value", "attribute_value", "extracted_value"))
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     evidence: Optional[str] = Field(None, description="что на фото подтверждает")
 
@@ -85,8 +85,9 @@ class VisionSource(AttributeSource):
 
         # Step 2: extraction from vision text
         targets_block = "\n".join([
-            f"- id={t.id}, name={t.name!r}, type={t.type}" +
-            (f", allowed={t.allowed_values}" if t.allowed_values else "")
+            f"- id={t.id}, name={t.name!r}, type={t.type}"
+            + (f", allowed={t.allowed_values}" if t.allowed_values else "")
+            + (", is_collection=true" if t.is_collection else "")
             for t in targets
         ])
 
@@ -95,7 +96,8 @@ class VisionSource(AttributeSource):
             "Only include attributes that are CLEARLY visible. If unsure, skip. "
             "When an attribute has 'allowed' values listed, you MUST choose your answer from that list "
             "(use the closest matching option). Do not invent values outside the allowed list. "
-            "Evidence should quote the relevant phrase from the vision description."
+            "Evidence should quote the relevant phrase from the vision description. "
+            "If the target has is_collection=true, return a JSON array of values; otherwise a single scalar."
         )
         user_text = (
             f"Vision description (from product photos):\n{vision_text}\n\n"
@@ -122,6 +124,8 @@ class VisionSource(AttributeSource):
                 evidence=a.evidence,
                 semantic_type=target_by_id[a.attribute_id].semantic_type
                               if a.attribute_id in target_by_id else None,
+                is_collection=target_by_id[a.attribute_id].is_collection
+                              if a.attribute_id in target_by_id else False,
             )
             for a in parsed.extracted
         ]

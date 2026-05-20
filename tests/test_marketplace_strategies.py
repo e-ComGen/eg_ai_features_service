@@ -2,8 +2,9 @@
 
 All tests are pure unit tests — no LLM calls, no external I/O.
 """
+import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.enrichment.base import (
     AttributeValue,
@@ -312,3 +313,315 @@ async def test_orchestrator_uses_strategy_validate_value():
     result = await orch.enrich(ctx, [_make_target(1)])
     # All values should be dropped by validation
     assert result == []
+
+
+# ---------------------------------------------------------------------------
+# 15. OzonStrategy — normalize_target_with_context использует словарь v2
+# ---------------------------------------------------------------------------
+
+# Тестовый словарь в формате v2 (compound keys)
+_OZON_TEST_DICT_V2 = {
+    "schema_version": 2,
+    "source": "ozon_seller_api",
+    "generated_at": "2026-05-20",
+    "categories": {
+        "100:200": {
+            "description_category_id": 100,
+            "type_id": 200,
+            "name": "Тестовая категория",
+            "path": ["Тест"],
+            "characteristics": [
+                {"id": 9048, "name": "Бренд", "type": "String",
+                 "is_required": True, "is_collection": False, "description": "Бренд товара"},
+                {"id": 4180, "name": "Цвет товара", "type": "Option",
+                 "is_required": False, "is_collection": False, "description": "Цвет"},
+                {"id": 7777, "name": "Объём, мл", "type": "Integer",
+                 "is_required": False, "is_collection": False, "description": "Объём"},
+            ],
+        }
+    },
+}
+
+
+def _reset_ozon_loader_cache() -> None:
+    from app.services.enrichment.strategies.dictionaries.ozon_loader import load_ozon_dictionary
+    load_ozon_dictionary.cache_clear()
+
+
+def test_ozon_normalize_target_with_context_enriches_metadata(tmp_path):
+    """normalize_target_with_context подставляет name и type из словаря v2."""
+    (tmp_path / "ozon_dictionary.json").write_text(
+        json.dumps(_OZON_TEST_DICT_V2), encoding="utf-8"
+    )
+    with patch(
+        "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+        tmp_path,
+    ):
+        _reset_ozon_loader_cache()
+        strategy = OzonStrategy()
+        # ExtractionContext без ozon_type_id — fallback на category_id
+        ctx = ExtractionContext(product_id=1, product_name="Тест", category_id=100)
+        # target с id=4180 (Цвет товара, type=Option → enum)
+        target = TargetAttribute(id=4180, name="Старое название", type="text")
+        result = strategy.normalize_target_with_context(target, ctx)
+
+    assert result.id == 4180
+    assert result.name == "Цвет товара"
+    assert result.type == "enum"  # Option → enum через _OZON_TYPE_MAP
+    assert result.description == "Цвет"
+
+
+def test_ozon_normalize_target_with_context_unknown_id_passthrough(tmp_path):
+    """normalize_target_with_context не меняет target если id отсутствует в словаре."""
+    (tmp_path / "ozon_dictionary.json").write_text(
+        json.dumps(_OZON_TEST_DICT_V2), encoding="utf-8"
+    )
+    with patch(
+        "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+        tmp_path,
+    ):
+        _reset_ozon_loader_cache()
+        strategy = OzonStrategy()
+        ctx = ExtractionContext(product_id=1, product_name="Тест", category_id=100)
+        target = TargetAttribute(id=99999, name="Неизвестный атрибут", type="text")
+        result = strategy.normalize_target_with_context(target, ctx)
+
+    # Без изменений — id нет в словаре
+    assert result.id == 99999
+    assert result.name == "Неизвестный атрибут"
+    assert result.type == "text"
+
+
+# ---------------------------------------------------------------------------
+# 16. OzonStrategy — filter_by_dictionary оставляет только словарные атрибуты
+# ---------------------------------------------------------------------------
+
+
+def test_ozon_filter_by_dictionary_keeps_only_known_attributes(tmp_path):
+    """filter_by_dictionary оставляет targets чьи id есть в словаре категории."""
+    (tmp_path / "ozon_dictionary.json").write_text(
+        json.dumps(_OZON_TEST_DICT_V2), encoding="utf-8"
+    )
+    with patch(
+        "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+        tmp_path,
+    ):
+        _reset_ozon_loader_cache()
+        strategy = OzonStrategy()
+        ctx = ExtractionContext(product_id=1, product_name="Тест", category_id=100)
+        targets = [
+            TargetAttribute(id=9048, name="Бренд", type="text"),    # есть в словаре
+            TargetAttribute(id=4180, name="Цвет", type="text"),     # есть в словаре
+            TargetAttribute(id=55555, name="Чужой атрибут", type="text"),  # нет
+        ]
+        result = strategy.filter_by_dictionary(targets, ctx)
+
+    kept_ids = [t.id for t in result]
+    assert 9048 in kept_ids
+    assert 4180 in kept_ids
+    assert 55555 not in kept_ids
+
+
+def test_ozon_filter_by_dictionary_graceful_on_missing_category(tmp_path):
+    """filter_by_dictionary возвращает все targets если категория не найдена в словаре."""
+    (tmp_path / "ozon_dictionary.json").write_text(
+        json.dumps(_OZON_TEST_DICT_V2), encoding="utf-8"
+    )
+    with patch(
+        "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+        tmp_path,
+    ):
+        _reset_ozon_loader_cache()
+        strategy = OzonStrategy()
+        # category_id=999 нет в словаре
+        ctx = ExtractionContext(product_id=1, product_name="Тест", category_id=999)
+        targets = [
+            TargetAttribute(id=1, name="А", type="text"),
+            TargetAttribute(id=2, name="Б", type="text"),
+        ]
+        result = strategy.filter_by_dictionary(targets, ctx)
+
+    # Graceful degradation: возвращаем все
+    assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# Task A: is_collection propagation
+# ---------------------------------------------------------------------------
+
+_OZON_TEST_DICT_WITH_COLLECTION = {
+    "schema_version": 2,
+    "source": "ozon_seller_api",
+    "generated_at": "2026-05-20",
+    "categories": {
+        "100:200": {
+            "description_category_id": 100,
+            "type_id": 200,
+            "name": "Тест",
+            "path": ["Тест"],
+            "characteristics": [
+                {"id": 1001, "name": "Материал", "type": "String",
+                 "is_required": False, "is_collection": True, "description": "Список материалов"},
+                {"id": 1002, "name": "Бренд", "type": "String",
+                 "is_required": True, "is_collection": False, "description": "Бренд"},
+                {"id": 1003, "name": "Цвет", "type": "Option",
+                 "is_required": False, "is_collection": False,
+                 "description": "Цвет",
+                 "values": [
+                     {"id": 501, "value": "Красный"},
+                     {"id": 502, "value": "Синий"},
+                     {"id": 503, "value": "Зелёный"},
+                 ]},
+                {"id": 1004, "name": "Теги", "type": "String",
+                 "is_required": False, "is_collection": True,
+                 "description": "Теги",
+                 "values": [
+                     {"id": 601, "value": "Хит"},
+                     {"id": 602, "value": "Новинка"},
+                 ]},
+            ],
+        }
+    },
+}
+
+
+def test_is_collection_propagates_to_target(tmp_path):
+    """normalize_target_with_context переносит is_collection=True из словаря."""
+    (tmp_path / "ozon_dictionary.json").write_text(
+        json.dumps(_OZON_TEST_DICT_WITH_COLLECTION), encoding="utf-8"
+    )
+    with patch(
+        "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+        tmp_path,
+    ):
+        _reset_ozon_loader_cache()
+        strategy = OzonStrategy()
+        ctx = ExtractionContext(product_id=1, product_name="Тест", category_id=100, ozon_type_id=200)
+        target_collection = TargetAttribute(id=1001, name="Материал", type="text")
+        target_scalar = TargetAttribute(id=1002, name="Бренд", type="text")
+        result_collection = strategy.normalize_target_with_context(target_collection, ctx)
+        result_scalar = strategy.normalize_target_with_context(target_scalar, ctx)
+
+    assert result_collection.is_collection is True
+    assert result_scalar.is_collection is False
+
+
+def test_attribute_value_accepts_scalar():
+    """AttributeValue принимает скалярное value без ошибок."""
+    av = AttributeValue(attribute_id=1, value="красный", confidence=0.9, source=Source.DESCRIPTION)
+    assert av.value == "красный"
+    assert av.is_collection is False
+
+
+def test_attribute_value_accepts_list():
+    """AttributeValue принимает list value без ошибок."""
+    av = AttributeValue(
+        attribute_id=1, value=["хлопок", "полиэстер"], confidence=0.9,
+        source=Source.DESCRIPTION, is_collection=True,
+    )
+    assert av.value == ["хлопок", "полиэстер"]
+    assert av.is_collection is True
+
+
+def test_attribute_value_accepts_mixed_list():
+    """AttributeValue принимает list смешанных скалярных типов."""
+    av = AttributeValue(
+        attribute_id=2, value=["A", 1, True], confidence=0.8,
+        source=Source.LLM_KNOWLEDGE, is_collection=True,
+    )
+    assert len(av.value) == 3
+
+
+# ---------------------------------------------------------------------------
+# Task B: resolve_value_id helper and resolve_value_ids method
+# ---------------------------------------------------------------------------
+
+def test_resolve_value_id_finds_matching_id(tmp_path):
+    """resolve_value_id возвращает id для known value (case-insensitive)."""
+    (tmp_path / "ozon_dictionary.json").write_text(
+        json.dumps(_OZON_TEST_DICT_WITH_COLLECTION), encoding="utf-8"
+    )
+    with patch(
+        "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+        tmp_path,
+    ):
+        _reset_ozon_loader_cache()
+        from app.services.enrichment.strategies.dictionaries.ozon_loader import resolve_value_id
+        # Прямое совпадение
+        assert resolve_value_id(100, 200, 1003, "Красный") == 501
+        # Case-insensitive
+        assert resolve_value_id(100, 200, 1003, "синий") == 502
+        # Нет совпадения
+        assert resolve_value_id(100, 200, 1003, "Фиолетовый") is None
+        # Характеристика без values
+        assert resolve_value_id(100, 200, 1002, "Apple") is None
+        # Неизвестная характеристика
+        assert resolve_value_id(100, 200, 9999, "X") is None
+
+
+def test_resolve_value_ids_scalar(tmp_path):
+    """resolve_value_ids привязывает value_id для одиночного значения."""
+    (tmp_path / "ozon_dictionary.json").write_text(
+        json.dumps(_OZON_TEST_DICT_WITH_COLLECTION), encoding="utf-8"
+    )
+    with patch(
+        "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+        tmp_path,
+    ):
+        _reset_ozon_loader_cache()
+        strategy = OzonStrategy()
+        ctx = ExtractionContext(
+            product_id=1, product_name="Тест", category_id=100, ozon_type_id=200
+        )
+        av = AttributeValue(
+            attribute_id=1003, value="Синий", confidence=0.9,
+            source=Source.DESCRIPTION, is_collection=False,
+        )
+        result = strategy.resolve_value_ids(av, ctx)
+
+    assert result.value_id == 502
+    assert result.value_ids is None
+
+
+def test_resolve_value_ids_collection(tmp_path):
+    """resolve_value_ids привязывает value_ids для массива значений."""
+    (tmp_path / "ozon_dictionary.json").write_text(
+        json.dumps(_OZON_TEST_DICT_WITH_COLLECTION), encoding="utf-8"
+    )
+    with patch(
+        "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+        tmp_path,
+    ):
+        _reset_ozon_loader_cache()
+        strategy = OzonStrategy()
+        ctx = ExtractionContext(
+            product_id=1, product_name="Тест", category_id=100, ozon_type_id=200
+        )
+        av = AttributeValue(
+            attribute_id=1004, value=["Хит", "Новинка", "Несуществующий"],
+            confidence=0.9, source=Source.DESCRIPTION, is_collection=True,
+        )
+        result = strategy.resolve_value_ids(av, ctx)
+
+    assert result.value_ids == [601, 602]  # "Несуществующий" пропускается
+    assert result.value_id is None
+
+
+def test_resolve_value_ids_no_type_id_passthrough():
+    """resolve_value_ids — no-op если ozon_type_id не задан в контексте."""
+    strategy = OzonStrategy()
+    ctx = ExtractionContext(product_id=1, product_name="X", category_id=100)  # без ozon_type_id
+    av = AttributeValue(attribute_id=1003, value="Синий", confidence=0.9, source=Source.DESCRIPTION)
+    result = strategy.resolve_value_ids(av, ctx)
+    assert result.value_id is None
+    assert result.value_ids is None
+
+
+def test_default_strategy_resolve_value_ids_passthrough():
+    """DefaultStrategy.resolve_value_ids — no-op."""
+    from app.services.enrichment.strategies.default_strategy import DefaultStrategy
+    strategy = DefaultStrategy()
+    ctx = ExtractionContext(product_id=1, product_name="X", category_id=1)
+    av = AttributeValue(attribute_id=1, value="test", confidence=0.8, source=Source.DESCRIPTION)
+    result = strategy.resolve_value_ids(av, ctx)
+    assert result is av  # возвращает тот же объект без изменений

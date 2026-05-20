@@ -19,7 +19,7 @@ from app.services.enrichment.judges.knowledge_judge import KnowledgeJudge
 
 class _KnowledgeAttr(BaseModel):
     attribute_id: int = Field(..., validation_alias=AliasChoices("attribute_id", "id"))
-    value: str | int | float | bool = Field(..., validation_alias=AliasChoices("value", "attribute_value", "extracted_value"))
+    value: str | int | float | bool | list[str | int | float | bool] = Field(..., validation_alias=AliasChoices("value", "attribute_value", "extracted_value"))
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     reasoning: Optional[str] = Field(None, max_length=200, description="откуда LLM знает")
 
@@ -62,8 +62,9 @@ class LlmKnowledgeSource(AttributeSource):
             return []
 
         targets_block = "\n".join([
-            f"- id={t.id}, name={t.name!r}, type={t.type}" +
-            (f", allowed={t.allowed_values}" if t.allowed_values else "")
+            f"- id={t.id}, name={t.name!r}, type={t.type}"
+            + (f", allowed={t.allowed_values}" if t.allowed_values else "")
+            + (", is_collection=true" if t.is_collection else "")
             for t in targets
         ])
 
@@ -76,7 +77,8 @@ class LlmKnowledgeSource(AttributeSource):
             "0.92-0.94 = highly likely but minor variation possible; "
             "below 0.92 = uncertain, DO NOT include. "
             "Set confidence=0.95 for facts you know with certainty from official specs or brand history. "
-            "Brief reasoning helps audit (e.g., 'official Samsung spec', 'Adidas classic model')."
+            "Brief reasoning helps audit (e.g., 'official Samsung spec', 'Adidas classic model'). "
+            "If the target has is_collection=true, return a JSON array of values; otherwise a single scalar."
         )
         user_text = (
             f"Product: {context.product_name}\n"
@@ -106,6 +108,8 @@ class LlmKnowledgeSource(AttributeSource):
                 evidence=a.reasoning,
                 semantic_type=target_by_id[a.attribute_id].semantic_type
                               if a.attribute_id in target_by_id else None,
+                is_collection=target_by_id[a.attribute_id].is_collection
+                              if a.attribute_id in target_by_id else False,
             )
             for a in parsed.known_attributes
         ]

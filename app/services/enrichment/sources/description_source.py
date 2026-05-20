@@ -21,7 +21,7 @@ class _ExtractedAttr(BaseModel):
     """Schema для LLM structured output."""
     model_config = {"populate_by_name": True}
     attribute_id: int = Field(..., validation_alias=AliasChoices("attribute_id", "id"))
-    value: str | int | float | bool = Field(..., validation_alias=AliasChoices("value", "attribute_value", "extracted_value"))
+    value: str | int | float | bool | list[str | int | float | bool] = Field(..., validation_alias=AliasChoices("value", "attribute_value", "extracted_value"))
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
     evidence: Optional[str] = None  # цитата из description
 
@@ -55,8 +55,9 @@ class DescriptionSource(AttributeSource):
 
         # Build prompt
         targets_block = "\n".join([
-            f"- id={t.id}, name={t.name!r}, type={t.type}" +
-            (f", allowed={t.allowed_values}" if t.allowed_values else "")
+            f"- id={t.id}, name={t.name!r}, type={t.type}"
+            + (f", allowed={t.allowed_values}" if t.allowed_values else "")
+            + (", is_collection=true" if t.is_collection else "")
             for t in targets
         ])
 
@@ -65,7 +66,8 @@ class DescriptionSource(AttributeSource):
             "For each target attribute, find its value in the description if mentioned. "
             "Provide confidence (0-1) based on how clearly the value is stated. "
             "If attribute is not mentioned, do NOT include it in the response. "
-            "Provide a short evidence quote (max 100 chars) from the description."
+            "Provide a short evidence quote (max 100 chars) from the description. "
+            "If the target has is_collection=true, return a JSON array of values; otherwise a single scalar."
         )
         user_text = (
             f"Product name: {context.product_name}\n"
@@ -96,6 +98,8 @@ class DescriptionSource(AttributeSource):
                 evidence=a.evidence,
                 semantic_type=target_by_id[a.attribute_id].semantic_type
                               if a.attribute_id in target_by_id else None,
+                is_collection=target_by_id[a.attribute_id].is_collection
+                              if a.attribute_id in target_by_id else False,
             )
             for a in parsed.extracted
         ]
