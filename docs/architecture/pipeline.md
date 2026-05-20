@@ -16,7 +16,10 @@
 
 ```mermaid
 flowchart TD
-    Start([На входе: товар + список характеристик которые нужно заполнить]) --> S0
+    Start([На входе: товар + список характеристик которые нужно заполнить]) --> SMP
+    
+    SMP["**Шаги 0b + 0c: MarketplaceStrategy**<br/>(для Ozon/WB; для остальных no-op)<br/>0b filter_by_dictionary — выкидывает<br/>характеристики которых нет в справочнике маркетплейса<br/>0c normalize_target_with_context —<br/>обогащает name/type/allowed_values/is_collection<br/>из официального словаря Ozon/WB<br/><br/>Подробнее: marketplace-strategy.md"]
+    SMP --> S0
     
     S0["**Этап 0: Парсер описания**<br/>(существующий ai_pipeline)<br/>1-4 обращения к ИИ<br/>→ характеристики которые нашлись в описании<br/>+ уверенность по каждой"]
     S0 --> CovA{Все нужные<br/>характеристики<br/>заполнены?}
@@ -61,8 +64,10 @@ flowchart TD
     S4_DONE --> FINAL
     
     FINAL["**Объединение результатов**<br/>Для каждой характеристики выбираем<br/>вариант с наибольшей уверенностью.<br/>При равной уверенности приоритет:<br/>Описание > Фото > Веб > Знания модели"]
-    FINAL --> Out([На выходе: заполненные характеристики + история откуда что взялось])
+    FINAL --> RV["**resolve_value_ids** (для Ozon/WB)<br/>Строковые значения → value_id<br/>из словаря или runtime API.<br/>Для is_collection — список value_ids"]
+    RV --> Out([На выходе: характеристики с value + value_id + источник])
     
+    style SMP fill:#cde,stroke:#369,color:#000
     style S0 fill:#cde,stroke:#369,color:#000
     style S1 fill:#fec,stroke:#c93,color:#000
     style S2 fill:#cfc,stroke:#393,color:#000
@@ -73,6 +78,7 @@ flowchart TD
     style JUDGE2 fill:#eef,stroke:#669,color:#000
     style JUDGE3 fill:#eef,stroke:#669,color:#000
     style JUDGE4 fill:#eef,stroke:#669,color:#000
+    style RV fill:#cde,stroke:#369,color:#000
 ```
 
 ---

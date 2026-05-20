@@ -34,11 +34,14 @@ class TargetAttribute(BaseModel):
     name: str                            # "Материал"
     type: Literal["text", "numeric", "enum"]
     allowed_values: list[str] | None     # для enum — допустимые значения
+    is_collection: bool = False          # принимает массив значений (например, «Совместимые модели»)
     semantic_type: str | None            # подсказка для распределителя:
                                           # "color" → лучше через фото
                                           # "weight" → лучше через веб
                                           # "brand" → лучше через знания ИИ
 ```
+
+Для маркетплейсов с собственной схемой характеристик (Ozon, Wildberries) часть полей TargetAttribute заполняется не из CS-Cart, а из словаря маркетплейса (см. [marketplace-strategy.md](marketplace-strategy.md)) — например, name/type/is_collection/allowed_values берутся из официального справочника Ozon.
 
 JSON пример полного запроса:
 
@@ -90,7 +93,11 @@ class Source(StrEnum):
 class AttributeValue(BaseModel):
     """Одно значение характеристики которое нашёл какой-то источник."""
     attribute_id: int
-    value: str | int | float | bool      # само значение
+    value: str | int | float | bool | list[str | int | float | bool]
+                                          # обычное значение ИЛИ массив (если is_collection)
+    is_collection: bool = False           # копируется из TargetAttribute, помогает downstream сериализации
+    value_id: int | None = None           # resolved value_id для Ozon dict-backed enum (см. marketplace-strategy.md)
+    value_ids: list[int] | None = None    # для коллекций — список value_ids
     confidence: float                     # 0.0 - 1.0, уверенность ИИ
     source: Source                        # откуда пришло
     evidence: str | None                  # обоснование: цитата / URL / описание
