@@ -282,6 +282,10 @@ class TestResolveValueIdsAsync:
     def setup_method(self):
         _reset_loader_cache()
         _reset_lookup_cache()
+        # Disable matcher so resolve_value_id does exact-match-only in these tests
+        import app.services.enrichment.strategies.dictionaries.ozon_loader as _loader_mod
+        _loader_mod._matcher_attempted = True
+        _loader_mod._matcher_instance = None
 
     def _make_attribute_value(self, attr_id: int, value, is_collection=False):
         from app.services.enrichment.base import AttributeValue, Source
@@ -373,6 +377,10 @@ class TestResolveValueIdsAsync:
         with patch(
             "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
             tmp_path,
+        ), patch(
+            # Disable matcher so only static dict lookup matters here
+            "app.services.enrichment.strategies.dictionaries.ozon_loader._get_matcher",
+            return_value=None,
         ):
             _reset_loader_cache()
             from app.services.enrichment.strategies.ozon_strategy import OzonStrategy

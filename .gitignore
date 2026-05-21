@@ -67,3 +67,9 @@ app/services/enrichment/strategies/dictionaries/data/*.values_partial
 
 # Runtime logs
 logs/
+
+# LLM disk cache (содержит реальные ответы LLM, может быть приватным)
+.llm_cache.sqlite
+
+# Eval artifacts (большие JSON отчёты, генерятся при прогоне)
+scripts/eval_results/

@@ -16,7 +16,7 @@ from app.services.providers.factory import get_main_manager
 class _WorthVerdict(BaseModel):
     worth_it: bool
     confidence: float = Field(ge=0.0, le=1.0)
-    reason: str = Field(max_length=200)
+    reason: str = Field(max_length=500)
 
 
 class CostPredictor:

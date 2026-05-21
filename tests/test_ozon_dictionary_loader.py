@@ -395,3 +395,118 @@ class TestSchemaV2CompoundKeys:
             )
             name = get_ozon_category_name(300000002)
         assert name == "Ноутбуки"
+
+
+# ---------------------------------------------------------------------------
+# Tests: resolve_value_id — fuzzy + semantic matcher fallback
+# ---------------------------------------------------------------------------
+
+# Dictionary with colour values for matcher tests
+_DICT_WITH_COLORS = {
+    "schema_version": 2,
+    "source": "ozon_seller_api",
+    "categories": {
+        "500:100": {
+            "description_category_id": 500,
+            "type_id": 100,
+            "name": "Тест",
+            "path": ["Тест"],
+            "characteristics": [
+                {
+                    "id": 4180,
+                    "name": "Цвет",
+                    "type": "Option",
+                    "is_required": False,
+                    "is_collection": False,
+                    "description": "Цвет товара",
+                    "values": [
+                        {"id": 1001, "value": "черный"},
+                        {"id": 1002, "value": "белый"},
+                        {"id": 1003, "value": "красный"},
+                        {"id": 1004, "value": "синий"},
+                    ],
+                }
+            ],
+        }
+    },
+}
+
+
+def _sentence_transformers_available() -> bool:
+    """Check if sentence_transformers is installed without actually importing it."""
+    import importlib.util
+    return importlib.util.find_spec("sentence_transformers") is not None
+
+
+_st_skip = pytest.mark.skipif(
+    not _sentence_transformers_available(),
+    reason="sentence_transformers not installed",
+)
+
+
+@pytest.mark.slow
+class TestResolveValueIdMatcherFallback:
+    """Tests resolve_value_id fuzzy+semantic fallback via MatcherService.
+
+    Uses a mock MatcherService so no model is loaded — only the wiring between
+    resolve_value_id and the matcher is exercised.  Skipped if
+    sentence_transformers is not installed.  Marked slow for real-model runs.
+    """
+
+    def setup_method(self):
+        if not _sentence_transformers_available():
+            pytest.skip("sentence_transformers not installed")
+        _reset_cache()
+        import app.services.enrichment.strategies.dictionaries.ozon_loader as mod
+        mod._matcher_instance = None
+        mod._matcher_attempted = False
+
+    @staticmethod
+    def _make_mock_matcher(return_value: str):
+        """Return a MatcherService stub whose find_best_match always returns return_value."""
+        from unittest.mock import MagicMock
+        m = MagicMock()
+        m.find_best_match.return_value = return_value
+        return m
+
+    def test_fuzzy_match_yo_vs_ye(self, tmp_path):
+        """'Чёрный' (ё) resolves to id 1001 when matcher returns 'черный' (е)."""
+        import json as _json
+        import app.services.enrichment.strategies.dictionaries.ozon_loader as mod
+        (tmp_path / "ozon_dictionary.json").write_text(
+            _json.dumps(_DICT_WITH_COLORS), encoding="utf-8"
+        )
+        mock_matcher = self._make_mock_matcher("черный")
+        with patch(
+            "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+            tmp_path,
+        ):
+            _reset_cache()
+            mod._matcher_instance = mock_matcher
+            mod._matcher_attempted = True
+            from app.services.enrichment.strategies.dictionaries.ozon_loader import resolve_value_id
+            result = resolve_value_id(500, 100, 4180, "Чёрный")
+        assert result == 1001, f"Expected 1001 (черный), got {result}"
+        mock_matcher.find_best_match.assert_called_once_with(
+            "Чёрный", ["черный", "белый", "красный", "синий"]
+        )
+
+    def test_semantic_match_paraphrase(self, tmp_path):
+        """'чёрного цвета' resolves to id 1001 when matcher returns 'черный'."""
+        import json as _json
+        import app.services.enrichment.strategies.dictionaries.ozon_loader as mod
+        (tmp_path / "ozon_dictionary.json").write_text(
+            _json.dumps(_DICT_WITH_COLORS), encoding="utf-8"
+        )
+        mock_matcher = self._make_mock_matcher("черный")
+        with patch(
+            "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+            tmp_path,
+        ):
+            _reset_cache()
+            mod._matcher_instance = mock_matcher
+            mod._matcher_attempted = True
+            from app.services.enrichment.strategies.dictionaries.ozon_loader import resolve_value_id
+            result = resolve_value_id(500, 100, 4180, "чёрного цвета")
+        assert result == 1001, f"Expected 1001 (черный), got {result}"
+        mock_matcher.find_best_match.assert_called_once()

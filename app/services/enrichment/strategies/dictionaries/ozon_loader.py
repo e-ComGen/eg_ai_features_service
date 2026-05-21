@@ -24,12 +24,34 @@ Schema v2 (current):
 """
 import gzip
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 from functools import lru_cache
 
 
 DATA_DIR = Path(__file__).parent / "data"
+
+logger = logging.getLogger(__name__)
+
+# Module-level singleton for MatcherService (lazy, None until first successful load)
+_matcher_instance = None
+_matcher_attempted = False
+
+
+def _get_matcher():
+    """Return singleton MatcherService, loading on first call. Returns None on failure."""
+    global _matcher_instance, _matcher_attempted
+    if _matcher_attempted:
+        return _matcher_instance
+    _matcher_attempted = True
+    try:
+        from app.services.matcher import MatcherService
+        _matcher_instance = MatcherService(cache_manager=None)
+    except Exception as exc:
+        logger.warning("MatcherService unavailable (fuzzy/semantic fallback disabled): %s", exc)
+        _matcher_instance = None
+    return _matcher_instance
 
 
 @lru_cache(maxsize=1)
@@ -116,8 +138,9 @@ def resolve_value_id(
 ) -> Optional[int]:
     """Найти словарный id для строкового значения характеристики.
 
-    Ищет по (cat_id, type_id, attribute_id), затем сравнивает value
-    case-insensitive. Возвращает None если список values отсутствует или совпадения нет.
+    1. Exact case-insensitive match (fast path).
+    2. Fuzzy + semantic match via MatcherService (fallback on miss).
+    Возвращает None если список values отсутствует или совпадения нет.
     """
     chars = get_ozon_characteristics_for_type(cat_id, type_id)
     char = next((c for c in chars if c.get("id") == attribute_id), None)
@@ -126,10 +149,49 @@ def resolve_value_id(
     values_list = char.get("values")
     if not values_list:
         return None
+
     value_lower = value.lower()
+    # Primary: exact case-insensitive match
     for entry in values_list:
         if str(entry.get("value", "")).lower() == value_lower:
             return entry.get("id")
+
+    # Normalize: ё→е, strip spaces/punct, lower
+    def _norm(s: str) -> str:
+        s = s.lower().replace("ё", "е").replace("-", " ")
+        s = " ".join(s.split())  # collapse whitespace
+        return s.strip(" .,;:!?\"'()[]")
+
+    value_norm = _norm(value)
+    for entry in values_list:
+        if _norm(str(entry.get("value", ""))) == value_norm:
+            return entry.get("id")
+
+    # Rapidfuzz fallback (без sentence_transformers — лёгкая зависимость)
+    try:
+        from rapidfuzz import fuzz, process
+        options = [(str(e.get("value", "")), e.get("id")) for e in values_list]
+        best = process.extractOne(
+            value, [o[0] for o in options], scorer=fuzz.WRatio
+        )
+        if best and best[1] >= 90:  # 0..100 score
+            return options[best[2]][1]
+    except Exception as exc:
+        logger.warning("resolve_value_id rapidfuzz fallback failed: %s", exc)
+
+    # Semantic match via MatcherService (если sentence_transformers доступен)
+    try:
+        matcher = _get_matcher()
+        if matcher is None:
+            return None
+        options = [str(e.get("value", "")) for e in values_list]
+        matched = matcher.find_best_match(str(value), options)
+        if matched is not None:
+            for entry in values_list:
+                if str(entry.get("value", "")) == matched:
+                    return entry.get("id")
+    except Exception as exc:
+        logger.warning("resolve_value_id matcher fallback failed: %s", exc)
     return None
 
 

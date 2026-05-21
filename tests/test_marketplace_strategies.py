@@ -537,13 +537,17 @@ def test_attribute_value_accepts_mixed_list():
 # ---------------------------------------------------------------------------
 
 def test_resolve_value_id_finds_matching_id(tmp_path):
-    """resolve_value_id возвращает id для known value (case-insensitive)."""
+    """resolve_value_id возвращает id для known value (case-insensitive); matcher отключён."""
     (tmp_path / "ozon_dictionary.json").write_text(
         json.dumps(_OZON_TEST_DICT_WITH_COLLECTION), encoding="utf-8"
     )
     with patch(
         "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
         tmp_path,
+    ), patch(
+        # Disable matcher so this test covers only exact/case-insensitive path
+        "app.services.enrichment.strategies.dictionaries.ozon_loader._get_matcher",
+        return_value=None,
     ):
         _reset_ozon_loader_cache()
         from app.services.enrichment.strategies.dictionaries.ozon_loader import resolve_value_id
@@ -551,7 +555,7 @@ def test_resolve_value_id_finds_matching_id(tmp_path):
         assert resolve_value_id(100, 200, 1003, "Красный") == 501
         # Case-insensitive
         assert resolve_value_id(100, 200, 1003, "синий") == 502
-        # Нет совпадения
+        # Нет совпадения (matcher disabled — exact miss)
         assert resolve_value_id(100, 200, 1003, "Фиолетовый") is None
         # Характеристика без values
         assert resolve_value_id(100, 200, 1002, "Apple") is None
@@ -584,13 +588,16 @@ def test_resolve_value_ids_scalar(tmp_path):
 
 
 def test_resolve_value_ids_collection(tmp_path):
-    """resolve_value_ids привязывает value_ids для массива значений."""
+    """resolve_value_ids привязывает value_ids для массива значений; matcher отключён."""
     (tmp_path / "ozon_dictionary.json").write_text(
         json.dumps(_OZON_TEST_DICT_WITH_COLLECTION), encoding="utf-8"
     )
     with patch(
         "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
         tmp_path,
+    ), patch(
+        "app.services.enrichment.strategies.dictionaries.ozon_loader._get_matcher",
+        return_value=None,
     ):
         _reset_ozon_loader_cache()
         strategy = OzonStrategy()

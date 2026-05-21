@@ -34,6 +34,10 @@ def pytest_configure(config):
         "markers",
         "integration: tests that hit the live worker service on port 8001",
     )
+    config.addinivalue_line(
+        "markers",
+        "slow: tests that load heavyweight models (sentence-transformers etc.)",
+    )
 
 
 @pytest.fixture(scope="session")

@@ -20,6 +20,7 @@ from typing import Optional, Tuple, Type, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from .base import LlmProvider
+from .llm_cache import get_cache, make_cache_key
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,30 @@ class StructuredLlmManager:
             (parsed_object, total_tokens) — mirrors OpenAIManager.structured_request().
             Returns (None, 0) on any error.
         """
+        # ---------------------------------------------------------------------------
+        # Cache check (only when LLM_CACHE_ENABLED=1)
+        # ---------------------------------------------------------------------------
+        cache = get_cache()
+        cache_key: Optional[str] = None
+        if cache is not None:
+            cache_key = make_cache_key(system_prompt, user_text, response_model)
+            cached_json = cache.get(cache_key)
+            if cached_json is not None:
+                try:
+                    data = json.loads(cached_json)
+                    parsed = response_model.model_validate(data)
+                    logger.info(
+                        "StructuredLlmManager: cache hit for %s (key=%.8s…)",
+                        response_model.__name__,
+                        cache_key,
+                    )
+                    return parsed, 0  # 0 tokens — no LLM call
+                except (json.JSONDecodeError, ValidationError) as exc:
+                    logger.warning(
+                        "StructuredLlmManager: cache entry invalid, proceeding with real call: %s", exc
+                    )
+                    # Fall through to real LLM call
+
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
@@ -82,6 +107,12 @@ class StructuredLlmManager:
         try:
             data = json.loads(llm_resp.content)
             parsed = response_model.model_validate(data)
+            # Store successful result in cache
+            if cache is not None and cache_key is not None:
+                try:
+                    cache.set(cache_key, parsed.model_dump_json())
+                except Exception as exc:
+                    logger.warning("StructuredLlmManager: cache write failed: %s", exc)
             return parsed, total_tokens
         except (json.JSONDecodeError, ValidationError) as exc:
             logger.warning(
