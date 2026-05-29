@@ -109,10 +109,11 @@ async def test_ozon_dictionary_filter_removes_unknown_targets_before_sources(tmp
 
         await orch.enrich(ctx, targets)
 
-        # source должен был получить только 2 известных target-а (без id=99999)
+        # source должен был получить только 2 известных target-а (без id=99999) — проверяем первый вызов
         assert desc_src.extract.called
-        call_targets = desc_src.extract.call_args[0][1]  # второй позиционный аргумент
-        called_ids = {t.id for t in call_targets}
+        # call_args_list[0] — первый вызов в основном pipeline (до finishing pass)
+        first_call_targets = desc_src.extract.call_args_list[0][0][1]
+        called_ids = {t.id for t in first_call_targets}
         assert 99999 not in called_ids, "Неизвестный target не должен попасть в sources"
         assert 9048 in called_ids
         assert 4180 in called_ids
@@ -135,7 +136,7 @@ async def test_ozon_normalize_enriches_target_type_before_sources(tmp_path):
 
         captured_targets: list[TargetAttribute] = []
 
-        async def _capture_extract(ctx, targets):
+        async def _capture_extract(ctx, targets, already_filled=None):
             captured_targets.extend(targets)
             return []
 

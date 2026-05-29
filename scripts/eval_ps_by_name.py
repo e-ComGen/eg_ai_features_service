@@ -35,6 +35,10 @@ from app.services.enrichment.strategies.dictionaries.ozon_loader import get_ozon
 from app.services.enrichment.base import ExtractionContext, TargetAttribute
 from app.services.enrichment.pipeline import PipelineOrchestrator
 from app.services.enrichment.strategies.factory import get_strategy
+from app.services.enrichment.sources.competitor_rag_source import CompetitorRagSource
+from app.services.enrichment.sources.icecat_source import IceCatSource
+from app.services.enrichment.sources.pdf_datasheet_source import PdfDatasheetSource
+from app.services.enrichment.sources.ozon_card_source import OzonCardSource
 
 DESCRIPTION_CATEGORY_ID = 17028612
 TYPE_ID = 91910
@@ -90,11 +94,27 @@ async def main():
     targets = build_targets(chars)
 
     strategy = get_strategy("ozon")
-    orchestrator = PipelineOrchestrator(strategy=strategy)
+    skip_rag = os.environ.get("SKIP_RAG", "0") == "1"
+    competitor_rag = None if skip_rag else CompetitorRagSource()
+    if skip_rag:
+        print("[Eval] SKIP_RAG=1 -> CompetitorRagSource disabled", flush=True)
+    icecat = IceCatSource()  # читает ICECAT_EMAIL, ICECAT_TOKEN из .env
+    pdf_datasheet = PdfDatasheetSource()  # Serper + Gemini 2.5 Flash PDF native
+    ozon_card = OzonCardSource(apify_token=os.environ.get("APIFY_TOKEN"))  # Apify ozon-scraper-pro
+    orchestrator = PipelineOrchestrator(
+        strategy=strategy,
+        competitor_rag_source=competitor_rag,
+        icecat_source=icecat,
+        pdf_datasheet_source=pdf_datasheet,
+        ozon_card_source=ozon_card,
+    )
 
     results = []
     t_start = time.time()
-    for i, name in enumerate(PRODUCTS, 1):
+    eval_limit = int(os.environ.get("EVAL_LIMIT", str(len(PRODUCTS))))
+    products_to_run = PRODUCTS[:eval_limit]
+    print(f"[Eval] Running {len(products_to_run)} of {len(PRODUCTS)} products (EVAL_LIMIT={eval_limit})", flush=True)
+    for i, name in enumerate(products_to_run, 1):
         # Бренд можно извлечь грубой эвристикой (второе слово)
         brand_guess = name.replace("Блок питания ", "").split()[0]
         print(f"  [{i:2d}/{len(PRODUCTS)}] {name[:70]}", flush=True)
@@ -167,6 +187,48 @@ async def main():
     for c in never[:15]:
         req = " [REQ]" if c.get("is_required") else ""
         print(f"  - {c['name']}{req}", flush=True)
+
+    # IceCat-specific stats
+    from app.services.enrichment.sources.icecat_source import closed_brands as icecat_closed, open_brands as icecat_open
+    icecat_keys = [k for k in source_counts if "icecat" in k.lower()]
+    icecat_total = sum(source_counts[k] for k in icecat_keys)
+    products_with_icecat = [
+        r for r in results
+        if any("icecat" in (f["source"] or "").lower() for f in r["filled"])
+    ]
+    print(f"\nIceCat stats:", flush=True)
+    print(f"  Total IceCat fills: {icecat_total}  avg/product: {icecat_total/n:.2f}", flush=True)
+    print(f"  Products with >=1 IceCat fill: {len(products_with_icecat)}/{n}", flush=True)
+    print(f"  Brands hit (200): {dict(icecat_open)}", flush=True)
+    print(f"  Brands blocked (403 Full IceCat only): {dict(icecat_closed)}", flush=True)
+    if products_with_icecat:
+        print(f"\nSample 3 products where IceCat fired:", flush=True)
+        for r in products_with_icecat[:3]:
+            icecat_fills = [f for f in r["filled"] if "icecat" in (f["source"] or "").lower()]
+            print(f"  Product: {r['name'][:70]}", flush=True)
+            for f in icecat_fills[:5]:
+                print(f"    {f['name']}: {f['value']}  (conf={f['confidence']:.2f}, {f['evidence'][:60]})", flush=True)
+
+    # RAG-specific stats
+    rag_source_key = "Source.COMPETITOR_RAG"
+    # normalize key — may be 'competitor_rag' or 'Source.COMPETITOR_RAG'
+    rag_keys = [k for k in source_counts if "competitor_rag" in k.lower()]
+    rag_total = sum(source_counts[k] for k in rag_keys)
+    products_with_rag = [
+        r for r in results
+        if any("competitor_rag" in (f["source"] or "").lower() for f in r["filled"])
+    ]
+    avg_rag_per_product = rag_total / n
+    print(f"\nRAG stats:", flush=True)
+    print(f"  Total RAG fills: {rag_total}  avg/product: {avg_rag_per_product:.2f}", flush=True)
+    print(f"  Products with >=1 RAG fill: {len(products_with_rag)}/{n}", flush=True)
+    if products_with_rag:
+        print(f"\nSample 3 products where RAG fired:", flush=True)
+        for r in products_with_rag[:3]:
+            rag_fills = [f for f in r["filled"] if "competitor_rag" in (f["source"] or "").lower()]
+            print(f"  Product: {r['name'][:70]}", flush=True)
+            for f in rag_fills[:5]:
+                print(f"    {f['name']}: {f['value']}  (conf={f['confidence']:.2f}, {f['evidence'][:60]})", flush=True)
 
     out_path = PROJECT_ROOT / "scripts" / "eval_results" / f"ps_by_name_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     out_path.write_text(json.dumps({

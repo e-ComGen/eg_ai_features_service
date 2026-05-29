@@ -15,6 +15,7 @@ from app.services.enrichment.base import (
     LlmJudge,
 )
 from app.services.enrichment.pipeline import PipelineOrchestrator
+from app.services.enrichment.strategies.base import MarketplaceStrategy, ValidationResult
 
 
 # ---------------------------------------------------------------------------
@@ -392,3 +393,411 @@ async def test_di_allows_injecting_mocks():
     desc_src.extract.assert_called_once()
     classifier.classify.assert_called_once()
     assert isinstance(result, list)
+
+
+# ---------------------------------------------------------------------------
+# Force-websearch bypass tests
+# ---------------------------------------------------------------------------
+
+def _make_strategy_with_force_list(force_ids: set[int]) -> MarketplaceStrategy:
+    """Build a minimal MarketplaceStrategy stub that returns `force_ids` from force_websearch_targets."""
+    class _StubStrategy(MarketplaceStrategy):
+        @property
+        def name(self) -> str:
+            return "stub"
+
+        def force_websearch_targets(self, targets) -> set[int]:
+            return force_ids
+
+    return _StubStrategy()
+
+
+@pytest.mark.asyncio
+async def test_force_websearch_runs_even_when_cost_predictor_returns_false():
+    """WebSearch IS called for force-listed attrs even when CostPredictor says False."""
+    force_id = 6049  # Кол-во разъемов Molex — in force list
+    targets = [_make_target(force_id, "Кол-во разъемов Molex")]
+    routing = {force_id: [Source.WEB_SEARCH]}
+    web_values = [_make_value(force_id, Source.WEB_SEARCH, confidence=0.92)]
+
+    web_src = _mock_source(Source.WEB_SEARCH, web_values)
+    cost_pred = _mock_cost_predictor(worth=False)  # predictor says NO
+    strategy = _make_strategy_with_force_list({force_id})
+
+    orch = PipelineOrchestrator(
+        description_source=_mock_source(Source.DESCRIPTION, []),
+        knowledge_source=_mock_source(Source.LLM_KNOWLEDGE, []),
+        vision_source=_mock_source(Source.VISION, []),
+        websearch_source=web_src,
+        classifier=_mock_classifier(routing),
+        cost_predictor=cost_pred,
+        strategy=strategy,
+    )
+
+    ctx = _make_ctx()
+    result = await orch.enrich(ctx, targets)
+
+    # WebSearch should have run despite cost_predictor=False
+    web_src.extract.assert_called_once()
+    assert len(result) == 1
+    assert result[0].source == Source.WEB_SEARCH
+    assert result[0].attribute_id == force_id
+
+
+@pytest.mark.asyncio
+async def test_force_websearch_cost_predictor_not_called_for_force_only_targets():
+    """When ALL websearch candidates are force-listed, CostPredictor is never called."""
+    force_id = 6049
+    targets = [_make_target(force_id)]
+    routing = {force_id: [Source.WEB_SEARCH]}
+
+    cost_pred = _mock_cost_predictor(worth=False)
+    strategy = _make_strategy_with_force_list({force_id})
+
+    orch = PipelineOrchestrator(
+        description_source=_mock_source(Source.DESCRIPTION, []),
+        knowledge_source=_mock_source(Source.LLM_KNOWLEDGE, []),
+        vision_source=_mock_source(Source.VISION, []),
+        websearch_source=_mock_source(Source.WEB_SEARCH, []),
+        classifier=_mock_classifier(routing),
+        cost_predictor=cost_pred,
+        strategy=strategy,
+    )
+
+    ctx = _make_ctx()
+    await orch.enrich(ctx, targets)
+
+    # CostPredictor should NOT be called when all candidates are force-listed
+    cost_pred.is_web_search_worth.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_force_and_optional_websearch_targets_handled_in_one_call():
+    """Force-listed and CostPredictor-approved targets are combined into one WebSearch call."""
+    force_id = 6049
+    optional_id = 999
+    targets = [_make_target(force_id), _make_target(optional_id)]
+    routing = {
+        force_id: [Source.WEB_SEARCH],
+        optional_id: [Source.WEB_SEARCH],
+    }
+    web_values = [
+        _make_value(force_id, Source.WEB_SEARCH, confidence=0.90),
+        _make_value(optional_id, Source.WEB_SEARCH, confidence=0.85),
+    ]
+    web_src = _mock_source(Source.WEB_SEARCH, web_values)
+    cost_pred = _mock_cost_predictor(worth=True)  # approves optional
+    strategy = _make_strategy_with_force_list({force_id})
+
+    orch = PipelineOrchestrator(
+        description_source=_mock_source(Source.DESCRIPTION, []),
+        knowledge_source=_mock_source(Source.LLM_KNOWLEDGE, []),
+        vision_source=_mock_source(Source.VISION, []),
+        websearch_source=web_src,
+        classifier=_mock_classifier(routing),
+        cost_predictor=cost_pred,
+        strategy=strategy,
+    )
+
+    ctx = _make_ctx()
+    result = await orch.enrich(ctx, targets)
+
+    # One combined WebSearch call for both targets
+    web_src.extract.assert_called_once()
+    call_targets = web_src.extract.call_args[0][1]  # second positional arg = targets
+    called_ids = {t.id for t in call_targets}
+    assert force_id in called_ids
+    assert optional_id in called_ids
+    assert len(result) == 2
+
+
+@pytest.mark.asyncio
+async def test_non_force_attr_still_blocked_by_cost_predictor():
+    """Attributes NOT in force list are still blocked when CostPredictor returns False."""
+    force_id = 6049
+    optional_id = 999  # not in force list
+    targets = [_make_target(optional_id)]
+    routing = {optional_id: [Source.WEB_SEARCH]}
+
+    web_src = _mock_source(Source.WEB_SEARCH, [_make_value(optional_id, Source.WEB_SEARCH)])
+    cost_pred = _mock_cost_predictor(worth=False)
+    strategy = _make_strategy_with_force_list({force_id})  # force list only has 6049
+
+    orch = PipelineOrchestrator(
+        description_source=_mock_source(Source.DESCRIPTION, []),
+        knowledge_source=_mock_source(Source.LLM_KNOWLEDGE, []),
+        vision_source=_mock_source(Source.VISION, []),
+        websearch_source=web_src,
+        classifier=_mock_classifier(routing),
+        cost_predictor=cost_pred,
+        strategy=strategy,
+    )
+
+    ctx = _make_ctx()
+    result = await orch.enrich(ctx, targets)
+
+    # WebSearch blocked for non-force attr when cost_predictor=False
+    web_src.extract.assert_not_called()
+    assert result == []
+
+
+def _make_target_typed(
+    id: int,
+    name: str,
+    type: str = "text",
+    allowed_values: list | None = None,
+) -> TargetAttribute:
+    """Helper для создания TargetAttribute с произвольным type и allowed_values."""
+    return TargetAttribute(id=id, name=name, type=type, allowed_values=allowed_values)
+
+
+@pytest.mark.asyncio
+async def test_ozon_strategy_force_websearch_targets_dimensions():
+    """OzonStrategy.force_websearch_targets() включает dimension-атрибуты (kind=dimensions)."""
+    from app.services.enrichment.strategies.ozon_strategy import OzonStrategy
+    strategy = OzonStrategy()
+    targets = [
+        _make_target_typed(1, "Длина, см", type="numeric"),    # dimensions
+        _make_target_typed(2, "Высота, см", type="numeric"),   # dimensions
+        _make_target_typed(3, "Ширина, см", type="numeric"),   # dimensions
+        _make_target_typed(4, "Бренд", type="text"),           # text — не force
+    ]
+    force_ids = strategy.force_websearch_targets(targets)
+    assert 1 in force_ids, "Длина (dimensions) должна быть в force list"
+    assert 2 in force_ids, "Высота (dimensions) должна быть в force list"
+    assert 3 in force_ids, "Ширина (dimensions) должна быть в force list"
+    assert 4 not in force_ids, "Бренд (text без словаря) не должен быть в force list"
+
+
+@pytest.mark.asyncio
+async def test_ozon_strategy_force_websearch_targets_numeric():
+    """OzonStrategy.force_websearch_targets() включает numeric-атрибуты (kind=numeric)."""
+    from app.services.enrichment.strategies.ozon_strategy import OzonStrategy
+    strategy = OzonStrategy()
+    targets = [
+        _make_target_typed(10, "Мощность, Вт", type="numeric"),         # numeric
+        _make_target_typed(11, "Кол-во разъемов SATA", type="Integer"), # numeric (Integer тип)
+        _make_target_typed(12, "Описание", type="text"),                 # text — не force
+    ]
+    force_ids = strategy.force_websearch_targets(targets)
+    assert 10 in force_ids, "Мощность Вт (numeric) должна быть в force list"
+    assert 11 in force_ids, "Кол-во разъемов Integer (numeric) должна быть в force list"
+    assert 12 not in force_ids, "Описание (text) не должно быть в force list"
+
+
+@pytest.mark.asyncio
+async def test_ozon_strategy_force_websearch_targets_large_enum():
+    """OzonStrategy.force_websearch_targets() включает enum с >100 значениями."""
+    from app.services.enrichment.strategies.ozon_strategy import OzonStrategy
+    strategy = OzonStrategy()
+    large_enum_values = [f"Значение{i}" for i in range(150)]
+    small_enum_values = ["Красный", "Синий", "Зелёный"]
+    targets = [
+        _make_target_typed(20, "Бренд", type="text", allowed_values=large_enum_values),  # enum >100
+        _make_target_typed(21, "Цвет", type="text", allowed_values=small_enum_values),    # enum ≤100
+        _make_target_typed(22, "Страна", type="text", allowed_values=large_enum_values),  # enum >100
+    ]
+    force_ids = strategy.force_websearch_targets(targets)
+    assert 20 in force_ids, "Бренд с >100 значениями (large enum) должен быть в force list"
+    assert 21 not in force_ids, "Цвет с 3 значениями (small enum) не должен быть в force list"
+    assert 22 in force_ids, "Страна с >100 значениями (large enum) должна быть в force list"
+
+
+@pytest.mark.asyncio
+async def test_ozon_strategy_force_websearch_targets_empty_for_text():
+    """OzonStrategy.force_websearch_targets() возвращает пустое множество для text-атрибутов."""
+    from app.services.enrichment.strategies.ozon_strategy import OzonStrategy
+    strategy = OzonStrategy()
+    targets = [
+        _make_target_typed(30, "Название модели", type="text"),
+        _make_target_typed(31, "Описание товара", type="text"),
+    ]
+    force_ids = strategy.force_websearch_targets(targets)
+    assert force_ids == set(), "Чистые text-атрибуты не должны быть в force list"
+
+
+@pytest.mark.asyncio
+async def test_default_strategy_force_websearch_targets_empty():
+    """DefaultStrategy.force_websearch_targets() всегда возвращает пустое множество."""
+    from app.services.enrichment.strategies.default_strategy import DefaultStrategy
+    strategy = DefaultStrategy()
+    targets = [
+        _make_target_typed(1, "Длина, см", type="numeric"),
+        _make_target_typed(2, "Бренд", type="text", allowed_values=[f"b{i}" for i in range(200)]),
+    ]
+    assert strategy.force_websearch_targets(targets) == set()
+
+
+@pytest.mark.asyncio
+async def test_wb_strategy_force_websearch_targets_empty():
+    """WildberriesStrategy.force_websearch_targets() наследует пустой default."""
+    from app.services.enrichment.strategies.wildberries_strategy import WildberriesStrategy
+    strategy = WildberriesStrategy()
+    targets = [
+        _make_target_typed(1, "Длина, см", type="numeric"),
+    ]
+    assert strategy.force_websearch_targets(targets) == set()
+
+
+@pytest.mark.asyncio
+async def test_ozon_no_hardcoded_force_constant():
+    """OZON_FORCE_WEBSEARCH_ATTRS больше не существует в модуле ozon_strategy."""
+    import importlib
+    import app.services.enrichment.strategies.ozon_strategy as mod
+    assert not hasattr(mod, "OZON_FORCE_WEBSEARCH_ATTRS"), (
+        "OZON_FORCE_WEBSEARCH_ATTRS должен быть удалён — логика теперь в force_websearch_targets()"
+    )
+
+
+# ---------------------------------------------------------------------------
+# IceCat-first + RAG-skip тесты (новый порядок: Description → IceCat → RAG fallback)
+# ---------------------------------------------------------------------------
+
+def _mock_icecat_source(fill_count: int = 0) -> MagicMock:
+    """Mock IceCatSource возвращающий fill_count уверенных атрибутов."""
+    from app.services.enrichment.base import LlmJudge
+    values = [_make_value(100 + i, Source.ICECAT, confidence=0.97) for i in range(fill_count)]
+    s = MagicMock(spec=AttributeSource)
+    s.source_type = Source.ICECAT
+    s.is_applicable = MagicMock(return_value=True)
+    s.extract = AsyncMock(return_value=values)
+    judge = MagicMock(spec=LlmJudge)
+    judge.source = Source.ICECAT
+    judge.validate = AsyncMock(return_value=True)
+    s.get_judge = MagicMock(return_value=judge)
+    return s
+
+
+def _mock_rag_source(fill_count: int = 0) -> MagicMock:
+    """Mock CompetitorRagSource возвращающий fill_count атрибутов."""
+    from app.services.enrichment.base import LlmJudge
+    values = [_make_value(200 + i, Source.COMPETITOR_RAG, confidence=0.90) for i in range(fill_count)]
+    s = MagicMock(spec=AttributeSource)
+    s.source_type = Source.COMPETITOR_RAG
+    s.is_applicable = MagicMock(return_value=True)
+    s.extract = AsyncMock(return_value=values)
+    judge = MagicMock(spec=LlmJudge)
+    judge.source = Source.COMPETITOR_RAG
+    judge.validate = AsyncMock(return_value=True)
+    s.get_judge = MagicMock(return_value=judge)
+    return s
+
+
+@pytest.mark.asyncio
+async def test_icecat_runs_before_rag():
+    """IceCat запускается ДО CompetitorRAG — новый порядок: Description → IceCat → RAG."""
+    call_order = []
+
+    icecat_src = _mock_icecat_source(fill_count=0)  # IceCat ничего не нашёл
+    rag_src = _mock_rag_source(fill_count=0)
+
+    # Перехватываем вызовы чтобы проверить порядок
+    original_icecat_extract = icecat_src.extract
+    original_rag_extract = rag_src.extract
+
+    async def icecat_extract_spy(*args, **kwargs):
+        call_order.append("icecat")
+        return await original_icecat_extract(*args, **kwargs)
+
+    async def rag_extract_spy(*args, **kwargs):
+        call_order.append("rag")
+        return await original_rag_extract(*args, **kwargs)
+
+    icecat_src.extract = icecat_extract_spy
+    rag_src.extract = rag_extract_spy
+
+    targets = [_make_target(1)]
+    orch = PipelineOrchestrator(
+        description_source=_mock_source(Source.DESCRIPTION, []),
+        knowledge_source=_mock_source(Source.LLM_KNOWLEDGE, []),
+        vision_source=_mock_source(Source.VISION, []),
+        websearch_source=_mock_source(Source.WEB_SEARCH, []),
+        icecat_source=icecat_src,
+        competitor_rag_source=rag_src,
+        classifier=_mock_classifier({}),
+        cost_predictor=_mock_cost_predictor(False),
+    )
+
+    await orch.enrich(_make_ctx(), targets)
+
+    # IceCat должен быть вызван раньше RAG
+    assert call_order.index("icecat") < call_order.index("rag"), (
+        f"IceCat должен идти до RAG, но порядок: {call_order}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rag_skipped_when_icecat_fills_5_or_more():
+    """CompetitorRAG пропускается если IceCat заполнил ≥ 5 атрибутов."""
+    # IceCat возвращает 5 уверенных атрибутов
+    icecat_src = _mock_icecat_source(fill_count=5)
+    rag_src = _mock_rag_source(fill_count=2)
+
+    # Запрашиваем 10 атрибутов чтобы не сработал early-exit по remaining=0
+    targets = [_make_target(i) for i in range(1, 11)]
+
+    orch = PipelineOrchestrator(
+        description_source=_mock_source(Source.DESCRIPTION, []),
+        knowledge_source=_mock_source(Source.LLM_KNOWLEDGE, []),
+        vision_source=_mock_source(Source.VISION, []),
+        websearch_source=_mock_source(Source.WEB_SEARCH, []),
+        icecat_source=icecat_src,
+        competitor_rag_source=rag_src,
+        classifier=_mock_classifier({}),
+        cost_predictor=_mock_cost_predictor(False),
+    )
+
+    await orch.enrich(_make_ctx(), targets)
+
+    # RAG НЕ должен быть вызван — IceCat закрыл ≥ 5 атрибутов
+    rag_src.extract.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rag_runs_when_icecat_fills_less_than_5():
+    """CompetitorRAG запускается если IceCat заполнил < 5 атрибутов (фолбэк)."""
+    # IceCat возвращает только 3 атрибута (< 5 — порог пропуска RAG)
+    icecat_src = _mock_icecat_source(fill_count=3)
+    rag_src = _mock_rag_source(fill_count=0)
+
+    targets = [_make_target(i) for i in range(1, 11)]
+
+    orch = PipelineOrchestrator(
+        description_source=_mock_source(Source.DESCRIPTION, []),
+        knowledge_source=_mock_source(Source.LLM_KNOWLEDGE, []),
+        vision_source=_mock_source(Source.VISION, []),
+        websearch_source=_mock_source(Source.WEB_SEARCH, []),
+        icecat_source=icecat_src,
+        competitor_rag_source=rag_src,
+        classifier=_mock_classifier({}),
+        cost_predictor=_mock_cost_predictor(False),
+    )
+
+    await orch.enrich(_make_ctx(), targets)
+
+    # RAG должен быть вызван — IceCat дал только 3 атрибута (фолбэк)
+    rag_src.extract.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_rag_runs_when_no_icecat_source():
+    """Если IceCatSource не передан — RAG работает как обычно (icecat_filled_count=0)."""
+    pytest.importorskip("qdrant_client", reason="Пропускаем если Qdrant недоступен (RAG тест)")
+    rag_src = _mock_rag_source(fill_count=1)
+    targets = [_make_target(1)]
+
+    orch = PipelineOrchestrator(
+        description_source=_mock_source(Source.DESCRIPTION, []),
+        knowledge_source=_mock_source(Source.LLM_KNOWLEDGE, []),
+        vision_source=_mock_source(Source.VISION, []),
+        websearch_source=_mock_source(Source.WEB_SEARCH, []),
+        icecat_source=None,       # нет IceCat
+        competitor_rag_source=rag_src,
+        classifier=_mock_classifier({}),
+        cost_predictor=_mock_cost_predictor(False),
+    )
+
+    await orch.enrich(_make_ctx(), targets)
+
+    # RAG должен быть вызван — IceCat отсутствует, icecat_filled_count=0 < 5
+    rag_src.extract.assert_called_once()
