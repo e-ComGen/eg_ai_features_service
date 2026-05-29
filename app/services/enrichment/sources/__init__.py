@@ -3,10 +3,18 @@ from .description_source import DescriptionSource
 from .llm_knowledge_source import LlmKnowledgeSource
 from .vision_source import VisionSource
 from .web_search_source import WebSearchSource
+from .competitor_rag_source import CompetitorRagSource
+from .icecat_source import IceCatSource
+from .pdf_datasheet_source import PdfDatasheetSource
+from .ozon_card_source import OzonCardSource
 
 __all__ = [
     "DescriptionSource",
     "LlmKnowledgeSource",
     "VisionSource",
     "WebSearchSource",
+    "CompetitorRagSource",
+    "IceCatSource",
+    "PdfDatasheetSource",
+    "OzonCardSource",
 ]
