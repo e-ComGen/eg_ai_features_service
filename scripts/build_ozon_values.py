@@ -1,3 +1,6 @@
+# DEPRECATED — bug: values copied across categories (fetched once per attr_id, not per
+# (cat_id, type_id, attr_id)).  Use build_ozon_values_v2.py instead.
+
 """Enrich ozon_dictionary.json with allowed_values for dictionary-backed attributes.
 
 Strategy:

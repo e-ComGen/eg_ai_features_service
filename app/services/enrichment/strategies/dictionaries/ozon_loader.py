@@ -130,6 +130,127 @@ def get_ozon_category_name(description_category_id: int) -> Optional[str]:
     return entries[0]["name"] if entries else None
 
 
+# Homoglyph map: Latin letters that look identical to Cyrillic ones.
+# E.g. Latin 'A' vs Cyrillic 'А' are different Unicode codepoints but identical glyphs.
+# LLMs and PDFs frequently mix these.
+_LATIN_TO_CYRILLIC_HOMOGLYPHS = str.maketrans({
+    "A": "А", "B": "В", "C": "С", "E": "Е", "H": "Н", "K": "К", "M": "М",
+    "O": "О", "P": "Р", "T": "Т", "X": "Х", "Y": "У",
+    "a": "а", "c": "с", "e": "е", "o": "о", "p": "р", "x": "х", "y": "у",
+})
+
+# Common technical term aliases: Latin technical token → Cyrillic equivalent.
+# Applied BEFORE normalization to align with Ozon dictionary canonical wording.
+_TECH_ALIASES = [
+    # PSU modularity
+    ("fully-modular", "полностью модульный"),
+    ("fully modular", "полностью модульный"),
+    ("semi-modular", "полумодульный"),
+    ("semi modular", "полумодульный"),
+    ("non-modular", "немодульный"),
+    ("non modular", "немодульный"),
+    ("modular", "модульный"),
+    # Connector types
+    (" pin ", " пин "),
+    (" pin", " пин"),
+    # Units (raw strings — \b is word boundary, not backspace)
+    (r"\bv\b", "в"),   # Volts (e.g. "240 V" → "240 в")
+    (r"\bw\b", "вт"),  # Watts
+    (r"\bcm\b", "см"),
+    (r"\bmm\b", "мм"),
+    # Protection
+    ("ocp", "защита от перегрузки по току"),
+    ("ovp", "защита от перенапряжения"),
+    ("uvp", "защита от пониженного напряжения"),
+    ("scp", "защита от короткого замыкания"),
+    ("opp", "защита от перегрузки по мощности"),
+    ("otp", "защита от перегрева"),
+]
+
+
+def _unwrap_array_repr(value: str) -> list[str]:
+    """If value looks like a list repr e.g. "['a', 'b']", return ['a', 'b'].
+    Otherwise return [value]. Handles both Python list str() and JSON.
+    """
+    s = value.strip()
+    if not (s.startswith("[") and s.endswith("]")):
+        return [value]
+    inner = s[1:-1]
+    parts = []
+    for p in inner.split(","):
+        p = p.strip().strip("'\"")
+        if p:
+            parts.append(p)
+    return parts if parts else [value]
+
+
+def _strip_parens(value: str) -> str:
+    """Strip trailing parenthetical: 'OCP (защита от перегрузки)' → 'OCP'."""
+    import re
+    return re.sub(r"\s*\([^)]*\)\s*$", "", value).strip()
+
+
+def _normalize_token(s: str) -> str:
+    """Strong normalization. Order matters:
+    1. lower
+    2. tech aliases (Latin patterns → Cyrillic, e.g. fully-modular → полностью модульный)
+    3. Latin homoglyph → Cyrillic (catches stray Latin lookalikes after aliases)
+    4. ё → е
+    5. Collapse spaces/dashes, strip punct.
+    """
+    import re
+    s = s.lower()
+    for src, dst in _TECH_ALIASES:
+        s = re.sub(src, dst, s)
+    s = s.translate(_LATIN_TO_CYRILLIC_HOMOGLYPHS)
+    s = s.replace("ё", "е")
+    s = s.replace("-", " ").replace("+", " + ")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip(" .,;:!?\"'()[]")
+
+
+def _try_match_one_value(value: str, values_list: list) -> Optional[int]:
+    """Try multiple match strategies for a single value string against dict values_list."""
+    # Strategy 1: exact case-insensitive
+    value_lower = value.lower()
+    for entry in values_list:
+        if str(entry.get("value", "")).lower() == value_lower:
+            return entry.get("id")
+
+    # Strategy 2: strong normalization on both sides
+    value_norm = _normalize_token(value)
+    for entry in values_list:
+        if _normalize_token(str(entry.get("value", ""))) == value_norm:
+            return entry.get("id")
+
+    # Strategy 3: strip parentheses, retry exact + normalized
+    value_stripped = _strip_parens(value)
+    if value_stripped != value:
+        vs_norm = _normalize_token(value_stripped)
+        for entry in values_list:
+            entry_val = str(entry.get("value", ""))
+            if entry_val.lower() == value_stripped.lower():
+                return entry.get("id")
+            if _normalize_token(entry_val) == vs_norm:
+                return entry.get("id")
+            # Also try stripping parens from dict side
+            entry_stripped = _strip_parens(entry_val)
+            if _normalize_token(entry_stripped) == vs_norm:
+                return entry.get("id")
+
+    # Strategy 4: rapidfuzz on normalized tokens
+    try:
+        from rapidfuzz import fuzz, process
+        options = [(str(e.get("value", "")), e.get("id")) for e in values_list]
+        norm_options = [_normalize_token(o[0]) for o in options]
+        best = process.extractOne(value_norm, norm_options, scorer=fuzz.WRatio)
+        if best and best[1] >= 85:  # lowered from 90 (more recall)
+            return options[best[2]][1]
+    except Exception as exc:
+        logger.warning("resolve_value_id rapidfuzz fallback failed: %s", exc)
+    return None
+
+
 def resolve_value_id(
     cat_id: int,
     type_id: int,
@@ -138,9 +259,13 @@ def resolve_value_id(
 ) -> Optional[int]:
     """Найти словарный id для строкового значения характеристики.
 
-    1. Exact case-insensitive match (fast path).
-    2. Fuzzy + semantic match via MatcherService (fallback on miss).
-    Возвращает None если список values отсутствует или совпадения нет.
+    Стратегии (по убыванию строгости):
+      1. Exact case-insensitive match.
+      2. Strong normalization: Latin homoglyphs → Cyrillic, tech aliases, ё→е.
+      3. Strip trailing parentheses content.
+      4. Rapidfuzz WRatio ≥ 85.
+      5. Если value — list repr ([...]), try each item then aggregate.
+      6. Semantic match via MatcherService (fallback).
     """
     chars = get_ozon_characteristics_for_type(cat_id, type_id)
     char = next((c for c in chars if c.get("id") == attribute_id), None)
@@ -150,34 +275,18 @@ def resolve_value_id(
     if not values_list:
         return None
 
-    value_lower = value.lower()
-    # Primary: exact case-insensitive match
-    for entry in values_list:
-        if str(entry.get("value", "")).lower() == value_lower:
-            return entry.get("id")
+    # Try direct match strategies
+    vid = _try_match_one_value(value, values_list)
+    if vid is not None:
+        return vid
 
-    # Normalize: ё→е, strip spaces/punct, lower
-    def _norm(s: str) -> str:
-        s = s.lower().replace("ё", "е").replace("-", " ")
-        s = " ".join(s.split())  # collapse whitespace
-        return s.strip(" .,;:!?\"'()[]")
-
-    value_norm = _norm(value)
-    for entry in values_list:
-        if _norm(str(entry.get("value", ""))) == value_norm:
-            return entry.get("id")
-
-    # Rapidfuzz fallback (без sentence_transformers — лёгкая зависимость)
-    try:
-        from rapidfuzz import fuzz, process
-        options = [(str(e.get("value", "")), e.get("id")) for e in values_list]
-        best = process.extractOne(
-            value, [o[0] for o in options], scorer=fuzz.WRatio
-        )
-        if best and best[1] >= 90:  # 0..100 score
-            return options[best[2]][1]
-    except Exception as exc:
-        logger.warning("resolve_value_id rapidfuzz fallback failed: %s", exc)
+    # Try list unwrapping: if value is "['a', 'b']", try matching first/best item
+    items = _unwrap_array_repr(value)
+    if len(items) > 1 or (len(items) == 1 and items[0] != value):
+        for item in items:
+            vid = _try_match_one_value(item, values_list)
+            if vid is not None:
+                return vid
 
     # Semantic match via MatcherService (если sentence_transformers доступен)
     try:
