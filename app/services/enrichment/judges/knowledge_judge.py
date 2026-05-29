@@ -13,7 +13,7 @@ from app.services.providers.factory import get_main_manager
 
 class _KnowledgeVerdict(BaseModel):
     valid: bool
-    reason: str = Field(max_length=200)
+    reason: str = Field(max_length=500)
 
 
 class KnowledgeJudge(LlmJudge):

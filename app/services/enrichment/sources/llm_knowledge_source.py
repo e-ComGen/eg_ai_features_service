@@ -13,8 +13,14 @@ from app.services.enrichment.base import (
     Source, LlmJudge,
 )
 from app.services.providers.structured_adapter import StructuredLlmManager
-from app.services.providers.factory import get_main_manager
+from app.services.providers.factory import get_main_manager, get_openai_strict_manager
 from app.services.enrichment.judges.knowledge_judge import KnowledgeJudge
+from app.services.enrichment.prompt_router import (
+    format_target_line, build_meta_guidance,
+    build_already_filled_block, filter_already_filled_targets,
+)
+from app.services.enrichment.strategies.base import MarketplaceStrategy
+from app.services.enrichment.strategies.default_strategy import DefaultStrategy
 
 
 class _KnowledgeAttr(BaseModel):
@@ -37,9 +43,14 @@ class LlmKnowledgeSource(AttributeSource):
     Для no-name товаров возвращает [] чтобы не тратить токены на галлюцинации.
     """
 
-    def __init__(self, llm_manager: Optional[StructuredLlmManager] = None):
+    def __init__(
+        self,
+        llm_manager: Optional[StructuredLlmManager] = None,
+        strategy: Optional[MarketplaceStrategy] = None,
+    ):
         self._llm = llm_manager or get_main_manager()
         self._judge = KnowledgeJudge()
+        self._strategy: MarketplaceStrategy = strategy or DefaultStrategy()
 
     @property
     def source_type(self) -> Source:
@@ -57,16 +68,23 @@ class LlmKnowledgeSource(AttributeSource):
         # Для MVP: возвращаем True для всех товаров с осмысленным name, judge отфильтрует галлюцинации
         return True
 
-    async def extract(self, context: ExtractionContext, targets: list[TargetAttribute]) -> list[AttributeValue]:
+    async def extract(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: list[AttributeValue] | None = None,
+    ) -> list[AttributeValue]:
         if not targets or not context.product_name:
             return []
 
-        targets_block = "\n".join([
-            f"- id={t.id}, name={t.name!r}, type={t.type}"
-            + (f", allowed={t.allowed_values}" if t.allowed_values else "")
-            + (", is_collection=true" if t.is_collection else "")
-            for t in targets
-        ])
+        # Убираем уже заполненные attrs из targets чтобы не тратить токены
+        effective_targets = filter_already_filled_targets(targets, already_filled or [])
+        if not effective_targets:
+            return []
+
+        # Build prompt с type-aware подсказками
+        targets_block = "\n".join([format_target_line(t) for t in effective_targets])
+        already_preamble, already_rule = build_already_filled_block(already_filled or [])
 
         system_prompt = (
             "You are a product knowledge expert. Given a product name (and optional brand), "
@@ -79,19 +97,29 @@ class LlmKnowledgeSource(AttributeSource):
             "Set confidence=0.95 for facts you know with certainty from official specs or brand history. "
             "Brief reasoning helps audit (e.g., 'official Samsung spec', 'Adidas classic model'). "
             "If the target has is_collection=true, return a JSON array of values; otherwise a single scalar."
+            + build_meta_guidance()
+            + already_rule
         )
         user_text = (
             f"Product: {context.product_name}\n"
             f"Brand: {context.brand or 'unknown'}\n"
             f"Category: {' / '.join(context.category_path) or 'n/a'}\n\n"
-            f"Target attributes:\n{targets_block}\n\n"
+            + already_preamble
+            + f"Target attributes:\n{targets_block}\n\n"
             f"Return only attributes you confidently know. Field name: 'known_attributes'."
         )
 
-        parsed, tokens = await self._llm.structured_request(
+        response_model = self._strategy.build_response_model(_KnowledgeResponse, targets)
+        # Маршрутизация: enum-heavy модели → OpenAI strict mode для token-level enforcement
+        llm = self._llm
+        if getattr(response_model, "__has_enum_constraints__", False):
+            strict = get_openai_strict_manager()
+            if strict is not None:
+                llm = strict
+        parsed, tokens = await llm.structured_request(
             system_prompt=system_prompt,
             user_text=user_text,
-            response_model=_KnowledgeResponse,
+            response_model=response_model,
         )
         if parsed is None:
             return []

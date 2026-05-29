@@ -1,0 +1,462 @@
+"""CompetitorRagSource — RAG-источник характеристик из реальных карточек Ozon.
+
+Использует локальный Qdrant-индекс (file-based) для поиска top-K похожих товаров
+по 384-dim эмбеддингу названия через sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2.
+Каждый сосед уже прошёл модерацию Ozon.
+
+Алгоритм (с LLM-фильтрацией):
+  1. Vector search: top-10 кандидатов по cosine similarity.
+  2. LLM relevance filter: DeepSeek проверяет, все ли кандидаты того же типа товара.
+  3. Consensus voting только на отфильтрованных кандидатах (≥2 кандидатов требуется).
+  4. Confidence: 0.7 + 0.05 * agree_count (capped at 0.95) — выше из-за LLM-фильтрации.
+
+При сбое LLM-фильтра (timeout/error) — graceful degradation: старый consensus на raw top-5.
+
+Spec: docs/architecture/pipeline.md (CompetitorRagSource — cheap pre-LLM stage).
+"""
+from __future__ import annotations
+
+# Windows DLL fix: pyarrow/pandas должны загружаться ДО torch/sentence_transformers,
+# иначе происходит access violation при загрузке pyarrow DLL после torch.
+try:
+    import pyarrow  # noqa: F401
+    import pandas   # noqa: F401
+except ImportError:
+    pass
+
+import logging
+import math
+import os
+from collections import Counter
+from typing import Optional, TYPE_CHECKING
+
+from pydantic import BaseModel
+
+from app.services.enrichment.base import (
+    AttributeSource,
+    AttributeValue,
+    ExtractionContext,
+    LlmJudge,
+    Source,
+    TargetAttribute,
+)
+from app.services.enrichment.judges.competitor_rag_judge import CompetitorRagJudge
+
+if TYPE_CHECKING:
+    pass
+
+logger = logging.getLogger(__name__)
+
+# Путь к локальному Qdrant-индексу по умолчанию
+_DEFAULT_INDEX_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "..",
+    "strategies",
+    "dictionaries",
+    "data",
+    "ozon_rag.qdrant",
+)
+
+# Имя коллекции в Qdrant
+_COLLECTION_NAME = "ozon_products"
+
+# Top-K соседей для поиска — увеличен до 10 для LLM-фильтрации
+_TOP_K = 10
+
+# Fallback top-K при сбое LLM-фильтра
+_FALLBACK_TOP_K = 5
+
+# Минимальное количество отфильтрованных кандидатов для consensus.
+# Снижено с 2 → 1: с category filter в retrieval шум резко падает,
+# можно принимать одиночные голоса от категорийно-точных кандидатов.
+_MIN_FILTERED_CANDIDATES = 1
+
+# Модель эмбеддингов — ДОЛЖНА совпадать с build_ozon_rag_index.py.
+# paraphrase-multilingual-MiniLM-L12-v2: 384-dim, быстрая, хорошо работает с русским.
+_EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+_EMBED_DIM = 384  # Размерность выходного вектора модели
+
+# Системный промпт для LLM-фильтрации релевантности
+_RELEVANCE_FILTER_SYSTEM = (
+    "Ты определяешь является ли каждый из кандидатов тем же типом товара что запрос. "
+    "Возвращай только индексы кандидатов которые точно того же типа."
+)
+
+
+class _RelevanceFilter(BaseModel):
+    """Ответ LLM-фильтра: индексы релевантных кандидатов."""
+    relevant_indices: list[int]
+
+
+def _get_embedding(text: str) -> list[float]:
+    """Вычислить 384-dim L2-нормированный эмбеддинг текста через sentence-transformers.
+
+    Lazy-load: модель загружается только при первом вызове и кэшируется в _model_cache.
+    Нормализация: normalize_embeddings=True, чтобы cosine search работал корректно.
+    """
+    from sentence_transformers import SentenceTransformer  # type: ignore
+    global _model_cache
+    if _model_cache is None:
+        logger.info("[CompetitorRag] Loading embed model %s (dim=%d)", _EMBED_MODEL_NAME, _EMBED_DIM)
+        _model_cache = SentenceTransformer(_EMBED_MODEL_NAME)
+    vec = _model_cache.encode(text, normalize_embeddings=True)
+    return vec.tolist()
+
+
+# Кэш загруженной модели (singleton per process)
+_model_cache = None
+
+
+def _build_relevance_user_text(query_name: str, candidates: list[dict]) -> str:
+    """Собрать user-текст для LLM-фильтра: запрос + список кандидатов.
+
+    Для каждого кандидата показываем imt_name + категорию из поля categories (если есть).
+    """
+    lines = [f"Запрос: {query_name}", "", "Кандидаты:"]
+    for i, c in enumerate(candidates):
+        imt_name = c.get("imt_name") or c.get("name") or "(без имени)"
+        # Категорийный путь из поля categories (список строк или dict)
+        cats_raw = c.get("categories")
+        cat_path = ""
+        if isinstance(cats_raw, list) and cats_raw:
+            # Список строк вида ["Электроника", "Цепи"]
+            cat_path = " > ".join(str(x) for x in cats_raw)
+        elif isinstance(cats_raw, dict):
+            # Может быть {id: name} или подобное — берём значения
+            cat_path = " > ".join(str(v) for v in cats_raw.values())
+        if cat_path:
+            lines.append(f"  [{i}] {imt_name} (категория: {cat_path})")
+        else:
+            lines.append(f"  [{i}] {imt_name}")
+    return "\n".join(lines)
+
+
+class CompetitorRagSource(AttributeSource):
+    """Извлекает характеристики по consensus из top-K похожих карточек Ozon.
+
+    Алгоритм с LLM-фильтрацией:
+      1. Vector search: top-10 кандидатов.
+      2. LLM relevance filter (DeepSeek): отсеиваем нерелевантные товары.
+      3. Consensus voting на отфильтрованном подмножестве (≥2 кандидатов).
+
+    При сбое LLM-фильтра — graceful degradation на raw top-5 с прежним min_consensus=2.
+    Cache: LLM_CACHE_ENABLED=1 гарантирует бесплатные повторные запуски.
+    """
+
+    def __init__(
+        self,
+        index_path: Optional[str] = None,
+        collection_name: str = _COLLECTION_NAME,
+        top_k: int = _TOP_K,
+        min_consensus: int = _MIN_FILTERED_CANDIDATES,
+        embed_model_name: str = _EMBED_MODEL_NAME,
+        llm_manager=None,
+        qdrant_url: Optional[str] = None,
+    ):
+        # QDRANT_URL env → HTTP server mode (preferred for 2M+ points).
+        # Falls back to embedded local mode using index_path.
+        self._qdrant_url = qdrant_url or os.environ.get("QDRANT_URL")
+        self._index_path = os.path.abspath(index_path or _DEFAULT_INDEX_PATH)
+        self._collection_name = collection_name
+        self._top_k = top_k
+        self._min_consensus = min_consensus
+        self._embed_model_name = embed_model_name
+        self._client = None   # lazy-init при первом использовании
+        self._judge = CompetitorRagJudge()
+        # LLM-менеджер для relevance filter — инициализируется лениво
+        self._llm_manager = llm_manager
+
+    def _get_client(self):
+        """Lazy-init Qdrant client. HTTP server mode if QDRANT_URL set, else local."""
+        if self._client is None:
+            from qdrant_client import QdrantClient  # type: ignore
+            if self._qdrant_url:
+                self._client = QdrantClient(url=self._qdrant_url, timeout=60)
+                logger.info("[CompetitorRagSource] using Qdrant server at %s", self._qdrant_url)
+            else:
+                self._client = QdrantClient(path=self._index_path)
+                logger.info("[CompetitorRagSource] using Qdrant local mode at %s", self._index_path)
+        return self._client
+
+    def _get_llm_manager(self):
+        """Lazy-инициализация LLM-менеджера (DeepSeek по умолчанию)."""
+        if self._llm_manager is None:
+            from app.services.providers.factory import get_main_manager
+            self._llm_manager = get_main_manager()
+        return self._llm_manager
+
+    @property
+    def source_type(self) -> Source:
+        return Source.COMPETITOR_RAG
+
+    def is_applicable(self, context: ExtractionContext, target: TargetAttribute) -> bool:
+        """Применим для любого товара с product_name (не требует description/images)."""
+        return bool(context.product_name and context.product_name.strip())
+
+    async def extract(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: Optional[list[AttributeValue]] = None,
+    ) -> list[AttributeValue]:
+        """Найти похожие Ozon-карточки, отфильтровать LLM и извлечь consensus характеристики.
+
+        Алгоритм:
+        1. Вычислить эмбеддинг product_name.
+        2. Найти top-10 ближайших в Qdrant.
+        3. LLM relevance filter: отсеять нерелевантные товары другого типа.
+        4. Если отфильтрованных < 2 → return [] (нет надёжного консенсуса).
+        5. Для каждого target.name собрать «голоса» из отфильтрованных кандидатов.
+        6. Консенсус ≥ ceil(len(filtered)/2) → emit AV(confidence=0.7+0.05*agree_count).
+        """
+        if not targets:
+            return []
+
+        # Определяем атрибуты которые уже заполнены
+        already_filled_ids: set[int] = set()
+        if already_filled:
+            already_filled_ids = {av.attribute_id for av in already_filled}
+
+        effective_targets = [t for t in targets if t.id not in already_filled_ids]
+        if not effective_targets:
+            return []
+
+        # Вычислить эмбеддинг
+        try:
+            query_vector = _get_embedding(context.product_name)
+        except Exception as e:
+            logger.warning("[CompetitorRag] embed failed: %s", e)
+            return []
+
+        # Категорийный фильтр для отсечения мусора (EVGA→замки EVVA, ASUS→мыши/ноутбуки).
+        # Используем самую глубокую категорию из category_path как text-match.
+        cat_filter_text: Optional[str] = None
+        if context.category_path:
+            for level in reversed(context.category_path):
+                if level and len(level) >= 4:
+                    cat_filter_text = level
+                    break
+
+        # Поиск в Qdrant (top-10)
+        try:
+            neighbors = self._search_neighbors(query_vector, cat_filter_text)
+        except Exception as e:
+            logger.warning("[CompetitorRag] qdrant search failed: %s", e)
+            return []
+
+        if not neighbors:
+            return []
+
+        # LLM relevance filter — отсеиваем нерелевантные товары другого типа
+        filtered_neighbors = await self._apply_relevance_filter(
+            context.product_name, neighbors
+        )
+
+        if filtered_neighbors is None:
+            # Graceful degradation: LLM-фильтр упал → старый consensus на raw top-5
+            logger.warning(
+                "[CompetitorRag] LLM relevance filter failed, falling back to raw top-5 consensus"
+            )
+            fallback = neighbors[:_FALLBACK_TOP_K]
+            return self._aggregate_consensus_legacy(fallback, effective_targets, min_consensus=2)
+
+        if len(filtered_neighbors) < _MIN_FILTERED_CANDIDATES:
+            # Нет надёжного консенсуса — лучше пропустить, чем добавить мусор
+            logger.info(
+                "[CompetitorRag] Only %d/%d candidates passed relevance filter for '%s' → skip",
+                len(filtered_neighbors), len(neighbors), context.product_name[:60],
+            )
+            return []
+
+        # Consensus voting на отфильтрованных кандидатах
+        return self._aggregate_consensus(filtered_neighbors, effective_targets)
+
+    async def _apply_relevance_filter(
+        self,
+        query_name: str,
+        candidates: list[dict],
+    ) -> Optional[list[dict]]:
+        """LLM-фильтр релевантности: оставить только кандидатов того же типа товара.
+
+        Использует DeepSeek (дешевый, ~$0.0001/вызов).
+        Кэшируется через LLM_CACHE_ENABLED=1 — бесплатен при повторных запусках.
+
+        Returns:
+            Отфильтрованный список кандидатов, или None при ошибке (fallback).
+        """
+        try:
+            manager = self._get_llm_manager()
+            user_text = _build_relevance_user_text(query_name, candidates)
+            result, _tokens = await manager.structured_request(
+                _RELEVANCE_FILTER_SYSTEM,
+                user_text,
+                _RelevanceFilter,
+            )
+            if result is None:
+                return None
+
+            # Фильтруем кандидатов по возвращённым индексам
+            valid_indices = [
+                i for i in result.relevant_indices
+                if 0 <= i < len(candidates)
+            ]
+            logger.info(
+                "[CompetitorRag] Relevance filter: %d/%d candidates kept for '%s' (indices=%s)",
+                len(valid_indices), len(candidates), query_name[:60], valid_indices,
+            )
+            return [candidates[i] for i in valid_indices]
+
+        except Exception as e:
+            logger.warning("[CompetitorRag] relevance filter exception: %s", e)
+            return None
+
+    def _search_neighbors(
+        self,
+        query_vector: list[float],
+        category_filter_text: Optional[str] = None,
+    ) -> list[dict]:
+        """Vector search в Qdrant с опциональным category text-фильтром.
+
+        Если задан category_filter_text — фильтруем кандидатов чьё поле
+        `categories` содержит эту строку (через text-payload-index). Это резко
+        снижает шум на запросах типа "EVGA SuperNOVA" (иначе ловит замки EVVA).
+        """
+        client = self._get_client()
+        query_filter = None
+        if category_filter_text:
+            from qdrant_client.models import Filter, FieldCondition, MatchText
+            query_filter = Filter(
+                must=[FieldCondition(
+                    key="categories",
+                    match=MatchText(text=category_filter_text),
+                )]
+            )
+        response = client.query_points(
+            collection_name=self._collection_name,
+            query=query_vector,
+            limit=self._top_k,
+            with_payload=True,
+            query_filter=query_filter,
+        )
+        neighbors = []
+        for hit in response.points:
+            if hit.payload:
+                neighbors.append(hit.payload)
+        return neighbors
+
+    def _aggregate_consensus(
+        self,
+        neighbors: list[dict],
+        targets: list[TargetAttribute],
+    ) -> list[AttributeValue]:
+        """Найти consensus значения характеристик среди LLM-отфильтрованных кандидатов.
+
+        Консенсус = ≥ ceil(len(filtered)/2) кандидатов с одинаковым значением.
+        Confidence = 0.7 + 0.05 * agree_count (capped at 0.95).
+        Повышенная уверенность относительно legacy-версии: кандидаты уже проверены LLM.
+        """
+        results: list[AttributeValue] = []
+        n = len(neighbors)
+        min_agree = math.ceil(n / 2)  # минимум половина отфильтрованных согласны
+
+        for target in targets:
+            # Собираем голоса: value → count
+            votes: Counter[str] = Counter()
+            for neighbor in neighbors:
+                characteristics = neighbor.get("characteristics", {})
+                if not isinstance(characteristics, dict):
+                    continue
+                value = self._find_attr_value(characteristics, target.name)
+                if value is not None:
+                    votes[str(value)] += 1
+
+            if not votes:
+                continue
+
+            best_value, best_count = votes.most_common(1)[0]
+            if best_count < min_agree:
+                continue  # консенсуса нет
+
+            # Уверенность выше, т.к. кандидаты отфильтрованы LLM
+            confidence = min(0.7 + 0.05 * best_count, 0.95)
+            evidence = f"seen in {best_count}/{n} similar Ozon cards (LLM-filtered)"
+
+            results.append(AttributeValue(
+                attribute_id=target.id,
+                value=best_value,
+                confidence=confidence,
+                source=Source.COMPETITOR_RAG,
+                evidence=evidence,
+                semantic_type=target.semantic_type,
+                is_collection=target.is_collection,
+            ))
+
+        return results
+
+    def _aggregate_consensus_legacy(
+        self,
+        neighbors: list[dict],
+        targets: list[TargetAttribute],
+        min_consensus: int = 2,
+    ) -> list[AttributeValue]:
+        """Старый consensus-алгоритм — используется как fallback при сбое LLM-фильтра.
+
+        Минимум min_consensus соседей с одинаковым значением.
+        Confidence: 0.6 + 0.4 * (best_count / len(neighbors)).
+        """
+        results: list[AttributeValue] = []
+
+        for target in targets:
+            votes: Counter[str] = Counter()
+            for neighbor in neighbors:
+                characteristics = neighbor.get("characteristics", {})
+                if not isinstance(characteristics, dict):
+                    continue
+                value = self._find_attr_value(characteristics, target.name)
+                if value is not None:
+                    votes[str(value)] += 1
+
+            if not votes:
+                continue
+
+            best_value, best_count = votes.most_common(1)[0]
+            if best_count < min_consensus:
+                continue
+
+            confidence = 0.6 + 0.4 * (best_count / len(neighbors))
+            evidence = f"seen in {best_count}/{len(neighbors)} similar Ozon cards"
+
+            results.append(AttributeValue(
+                attribute_id=target.id,
+                value=best_value,
+                confidence=confidence,
+                source=Source.COMPETITOR_RAG,
+                evidence=evidence,
+                semantic_type=target.semantic_type,
+                is_collection=target.is_collection,
+            ))
+
+        return results
+
+    def _find_attr_value(self, characteristics: dict, target_name: str) -> Optional[str]:
+        """Найти значение атрибута по имени цели в словаре characteristics.
+
+        Поиск нечёткий: нормализуем к нижнему регистру, убираем пробелы.
+        characteristics формат из датасета: {attr_name: [val1, val2, ...]} или {attr_name: val}.
+        """
+        target_lower = target_name.lower().strip()
+
+        for key, val in characteristics.items():
+            key_lower = key.lower().strip()
+            # Прямое совпадение или совпадение с нормализацией
+            if key_lower == target_lower or key_lower.replace(" ", "_") == target_lower.replace(" ", "_"):
+                # Извлечь первое значение из списка или скаляр
+                if isinstance(val, list) and val:
+                    return str(val[0])
+                elif val is not None:
+                    return str(val)
+
+        return None
+
+    def get_judge(self) -> LlmJudge:
+        return self._judge

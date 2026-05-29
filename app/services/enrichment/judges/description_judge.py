@@ -12,7 +12,7 @@ from typing import Optional
 
 class _JudgeVerdict(BaseModel):
     valid: bool
-    reason: str = Field(max_length=200)
+    reason: str = Field(max_length=500)
 
 
 class DescriptionJudge(LlmJudge):

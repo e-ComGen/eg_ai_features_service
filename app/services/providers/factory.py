@@ -17,6 +17,8 @@ from .deepseek_provider import DeepSeekProvider
 from .openrouter_provider import OpenRouterProvider
 from .serper_client import SerperClient
 from .structured_adapter import StructuredLlmManager
+from .openai_strict_provider import OpenAIStrictProvider
+from .gemini_pdf_provider import GeminiPdfProvider
 
 if TYPE_CHECKING:
     from ..llm_manager import OpenAIManager
@@ -184,6 +186,40 @@ def get_extraction_manager() -> "StructuredLlmManager | OpenAIManager":
     provider = _make_raw_provider(provider_name)
     provider = _wrap_with_fallback(provider, is_vision=False)
     return StructuredLlmManager(provider=provider, model=model)
+
+
+# ---------------------------------------------------------------------------
+# OpenAI strict json_schema — для enum-heavy structured extraction
+# ---------------------------------------------------------------------------
+
+def get_openai_strict_manager() -> "OpenAIStrictProvider | None":
+    """Вернуть OpenAIStrictProvider если OPENAI_API_KEY задан, иначе None.
+
+    Используется sources для маршрутизации вызовов с __has_enum_constraints__=True
+    через OpenAI gpt-4.1-mini strict mode вместо DeepSeek JSON mode.
+    """
+    if not config.OPENAI_API_KEY:
+        logger.debug("get_openai_strict_manager: OPENAI_API_KEY not set, returning None")
+        return None
+    return OpenAIStrictProvider(
+        api_key=config.OPENAI_API_KEY,
+        model=config.OPENAI_STRUCTURED_MODEL,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gemini PDF — native PDF input для PdfDatasheetSource
+# ---------------------------------------------------------------------------
+
+def get_gemini_pdf_provider() -> "GeminiPdfProvider | None":
+    """Return GeminiPdfProvider если OPEN_ROUTER_API_KEY задан, иначе None."""
+    if not config.OPENROUTER_API_KEY:
+        logger.debug("get_gemini_pdf_provider: OPEN_ROUTER_API_KEY not set, returning None")
+        return None
+    return GeminiPdfProvider(
+        api_key=config.OPENROUTER_API_KEY,
+        model=config.VISION_MODEL,
+    )
 
 
 # ---------------------------------------------------------------------------

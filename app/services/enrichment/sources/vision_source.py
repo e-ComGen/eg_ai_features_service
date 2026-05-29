@@ -19,6 +19,12 @@ from app.services.providers.structured_adapter import StructuredLlmManager
 from app.services.providers.factory import get_main_manager
 from app.services.enrichment.vision_producer import VisionProducer
 from app.services.enrichment.judges.vision_judge import VisionJudge
+from app.services.enrichment.prompt_router import (
+    format_target_line, build_meta_guidance,
+    build_already_filled_block, filter_already_filled_targets,
+)
+from app.services.enrichment.strategies.base import MarketplaceStrategy
+from app.services.enrichment.strategies.default_strategy import DefaultStrategy
 
 
 # Semantic types которые можно извлечь визуально.
@@ -45,10 +51,12 @@ class VisionSource(AttributeSource):
         self,
         vision_producer: Optional[VisionProducer] = None,
         extraction_manager: Optional[StructuredLlmManager] = None,
+        strategy: Optional[MarketplaceStrategy] = None,
     ):
         self._vision = vision_producer or VisionProducer()
         self._extractor = extraction_manager or get_main_manager()
         self._judge = VisionJudge()
+        self._strategy: MarketplaceStrategy = strategy or DefaultStrategy()
         # Cache vision text per (context.product_id) чтобы не делать vision call 2 раза для одного товара
         self._vision_cache: dict[int, Optional[str]] = {}
 
@@ -65,8 +73,18 @@ class VisionSource(AttributeSource):
             return False
         return True
 
-    async def extract(self, context: ExtractionContext, targets: list[TargetAttribute]) -> list[AttributeValue]:
+    async def extract(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: list[AttributeValue] | None = None,
+    ) -> list[AttributeValue]:
         if not context.image_urls or not targets:
+            return []
+
+        # Убираем уже заполненные attrs из targets чтобы не тратить токены
+        effective_targets = filter_already_filled_targets(targets, already_filled or [])
+        if not effective_targets:
             return []
 
         # Step 1: vision call (cached per product_id)
@@ -83,32 +101,30 @@ class VisionSource(AttributeSource):
         if not vision_text:
             return []
 
-        # Step 2: extraction from vision text
-        targets_block = "\n".join([
-            f"- id={t.id}, name={t.name!r}, type={t.type}"
-            + (f", allowed={t.allowed_values}" if t.allowed_values else "")
-            + (", is_collection=true" if t.is_collection else "")
-            for t in targets
-        ])
+        # Step 2: extraction from vision text с type-aware подсказками
+        targets_block = "\n".join([format_target_line(t) for t in effective_targets])
+        already_preamble, already_rule = build_already_filled_block(already_filled or [])
 
         system_prompt = (
             "You extract visual attributes from a description of what's visible on product photos. "
             "Only include attributes that are CLEARLY visible. If unsure, skip. "
-            "When an attribute has 'allowed' values listed, you MUST choose your answer from that list "
-            "(use the closest matching option). Do not invent values outside the allowed list. "
             "Evidence should quote the relevant phrase from the vision description. "
             "If the target has is_collection=true, return a JSON array of values; otherwise a single scalar."
+            + build_meta_guidance()
+            + already_rule
         )
         user_text = (
             f"Vision description (from product photos):\n{vision_text}\n\n"
-            f"Target attributes (visual):\n{targets_block}\n\n"
+            + already_preamble
+            + f"Target attributes (visual):\n{targets_block}\n\n"
             f"Return JSON with 'extracted' list of {{attribute_id, value, confidence, evidence}}."
         )
 
+        response_model = self._strategy.build_response_model(_VisionExtractionResponse, targets)
         parsed, tokens = await self._extractor.structured_request(
             system_prompt=system_prompt,
             user_text=user_text,
-            response_model=_VisionExtractionResponse,
+            response_model=response_model,
         )
         if parsed is None:
             return []

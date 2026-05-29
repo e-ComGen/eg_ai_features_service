@@ -17,9 +17,15 @@ from app.services.enrichment.base import (
     Source, LlmJudge,
 )
 from app.services.providers.structured_adapter import StructuredLlmManager
-from app.services.providers.factory import get_main_manager
+from app.services.providers.factory import get_main_manager, get_openai_strict_manager
 from app.services.enrichment.websearch_producer import WebSearchProducer
 from app.services.enrichment.judges.websearch_judge import WebSearchJudge
+from app.services.enrichment.prompt_router import (
+    format_target_line, build_meta_guidance,
+    build_already_filled_block, filter_already_filled_targets,
+)
+from app.services.enrichment.strategies.base import MarketplaceStrategy
+from app.services.enrichment.strategies.default_strategy import DefaultStrategy
 
 
 class _WebExtractedAttr(BaseModel):
@@ -40,10 +46,12 @@ class WebSearchSource(AttributeSource):
         self,
         websearch_producer: Optional[WebSearchProducer] = None,
         extraction_manager: Optional[StructuredLlmManager] = None,
+        strategy: Optional[MarketplaceStrategy] = None,
     ):
         self._search = websearch_producer or WebSearchProducer()
         self._extractor = extraction_manager or get_main_manager()
         self._judge = WebSearchJudge()
+        self._strategy: MarketplaceStrategy = strategy or DefaultStrategy()
         # Cache summary per product_id чтобы не повторять search
         self._summary_cache: dict[int, Optional[str]] = {}
 
@@ -56,8 +64,18 @@ class WebSearchSource(AttributeSource):
         Реальное решение запускать ли — за CostPredictor (отдельный stage)."""
         return bool(context.product_name) and len(context.product_name) >= 5
 
-    async def extract(self, context: ExtractionContext, targets: list[TargetAttribute]) -> list[AttributeValue]:
+    async def extract(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: list[AttributeValue] | None = None,
+    ) -> list[AttributeValue]:
         if not targets or not context.product_name:
+            return []
+
+        # Убираем уже заполненные attrs из targets чтобы не тратить токены
+        effective_targets = filter_already_filled_targets(targets, already_filled or [])
+        if not effective_targets:
             return []
 
         # Step 1+2: search + summary (cached per product)
@@ -76,32 +94,38 @@ class WebSearchSource(AttributeSource):
         if not summary:
             return []
 
-        # Step 3: extraction from summary
-        targets_block = "\n".join([
-            f"- id={t.id}, name={t.name!r}, type={t.type}"
-            + (f", allowed={t.allowed_values}" if t.allowed_values else "")
-            + (", is_collection=true" if t.is_collection else "")
-            for t in targets
-        ])
+        # Step 3: extraction from summary с type-aware подсказками
+        targets_block = "\n".join([format_target_line(t) for t in effective_targets])
+        already_preamble, already_rule = build_already_filled_block(already_filled or [])
 
         system_prompt = (
             "You extract product characteristics from a summary of web search results. "
             "Prefer values from authoritative sources (manufacturer site, well-known retailers). "
             "Include source URL if mentioned in the summary. Evidence should be a brief quote. "
             "If the target has is_collection=true, return a JSON array of values; otherwise a single scalar."
+            + build_meta_guidance()
+            + already_rule
         )
         user_text = (
             f"Product: {context.product_name}\n"
             f"Brand: {context.brand or 'unknown'}\n\n"
             f"Web search summary:\n{summary}\n\n"
-            f"Target attributes:\n{targets_block}\n\n"
+            + already_preamble
+            + f"Target attributes:\n{targets_block}\n\n"
             f"Return JSON with 'extracted' list of {{attribute_id, value, confidence, source_url, evidence}}."
         )
 
-        parsed, tokens = await self._extractor.structured_request(
+        response_model = self._strategy.build_response_model(_WebExtractionResponse, targets)
+        # Маршрутизация: enum-heavy модели → OpenAI strict mode для token-level enforcement
+        extractor = self._extractor
+        if getattr(response_model, "__has_enum_constraints__", False):
+            strict = get_openai_strict_manager()
+            if strict is not None:
+                extractor = strict
+        parsed, tokens = await extractor.structured_request(
             system_prompt=system_prompt,
             user_text=user_text,
-            response_model=_WebExtractionResponse,
+            response_model=response_model,
         )
         if parsed is None:
             return []

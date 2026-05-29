@@ -13,8 +13,14 @@ from app.services.enrichment.base import (
     Source, LlmJudge,
 )
 from app.services.providers.structured_adapter import StructuredLlmManager
-from app.services.providers.factory import get_main_manager
+from app.services.providers.factory import get_main_manager, get_openai_strict_manager
 from app.services.enrichment.judges.description_judge import DescriptionJudge
+from app.services.enrichment.prompt_router import (
+    format_target_line, build_meta_guidance,
+    build_already_filled_block, filter_already_filled_targets,
+)
+from app.services.enrichment.strategies.base import MarketplaceStrategy
+from app.services.enrichment.strategies.default_strategy import DefaultStrategy
 
 
 class _ExtractedAttr(BaseModel):
@@ -37,9 +43,14 @@ class DescriptionSource(AttributeSource):
     Если description пустой/слишком короткий — возвращает [] (is_applicable=False).
     """
 
-    def __init__(self, llm_manager: Optional[StructuredLlmManager] = None):
+    def __init__(
+        self,
+        llm_manager: Optional[StructuredLlmManager] = None,
+        strategy: Optional[MarketplaceStrategy] = None,
+    ):
         self._llm = llm_manager or get_main_manager()
         self._judge = DescriptionJudge()
+        self._strategy: MarketplaceStrategy = strategy or DefaultStrategy()
 
     @property
     def source_type(self) -> Source:
@@ -49,17 +60,23 @@ class DescriptionSource(AttributeSource):
         """DescriptionSource применим если есть осмысленное описание."""
         return bool(context.product_description) and len(context.product_description.strip()) >= 10
 
-    async def extract(self, context: ExtractionContext, targets: list[TargetAttribute]) -> list[AttributeValue]:
+    async def extract(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: list[AttributeValue] | None = None,
+    ) -> list[AttributeValue]:
         if not context.product_description or len(targets) == 0:
             return []
 
-        # Build prompt
-        targets_block = "\n".join([
-            f"- id={t.id}, name={t.name!r}, type={t.type}"
-            + (f", allowed={t.allowed_values}" if t.allowed_values else "")
-            + (", is_collection=true" if t.is_collection else "")
-            for t in targets
-        ])
+        # Убираем уже заполненные attrs из targets чтобы не тратить токены
+        effective_targets = filter_already_filled_targets(targets, already_filled or [])
+        if not effective_targets:
+            return []
+
+        # Build prompt с type-aware подсказками
+        targets_block = "\n".join([format_target_line(t) for t in effective_targets])
+        already_preamble, already_rule = build_already_filled_block(already_filled or [])
 
         system_prompt = (
             "You extract product characteristics from product description text. "
@@ -68,19 +85,29 @@ class DescriptionSource(AttributeSource):
             "If attribute is not mentioned, do NOT include it in the response. "
             "Provide a short evidence quote (max 100 chars) from the description. "
             "If the target has is_collection=true, return a JSON array of values; otherwise a single scalar."
+            + build_meta_guidance()
+            + already_rule
         )
         user_text = (
             f"Product name: {context.product_name}\n"
             f"Category: {' / '.join(context.category_path) or context.category_id}\n\n"
             f"Description:\n{context.product_description}\n\n"
-            f"Target attributes:\n{targets_block}\n\n"
+            + already_preamble
+            + f"Target attributes:\n{targets_block}\n\n"
             f"Return JSON with field 'extracted' = list of {{attribute_id, value, confidence, evidence}}."
         )
 
-        parsed, tokens = await self._llm.structured_request(
+        response_model = self._strategy.build_response_model(_ExtractionResponse, targets)
+        # Маршрутизация: enum-heavy модели → OpenAI strict mode для token-level enforcement
+        llm = self._llm
+        if getattr(response_model, "__has_enum_constraints__", False):
+            strict = get_openai_strict_manager()
+            if strict is not None:
+                llm = strict
+        parsed, tokens = await llm.structured_request(
             system_prompt=system_prompt,
             user_text=user_text,
-            response_model=_ExtractionResponse,
+            response_model=response_model,
         )
         if parsed is None:
             return []
