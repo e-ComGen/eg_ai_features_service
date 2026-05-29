@@ -4,7 +4,7 @@ Pipeline core не знает про WB/Ozon. Все различия (слов�
 форматы значений) — в strategy. По умолчанию DefaultStrategy (no-op).
 """
 from abc import ABC, abstractmethod
-from typing import Optional, Any
+from typing import Optional, Any, Type
 from pydantic import BaseModel
 
 from app.services.enrichment.base import (
@@ -94,3 +94,22 @@ class MarketplaceStrategy(ABC):
     ) -> AttributeValue:
         """Привязать словарные value_id(s). Default: no-op (pass-through)."""
         return attribute_value
+
+    def force_websearch_targets(
+        self,
+        targets: list[TargetAttribute],
+    ) -> set[int]:
+        """Return attribute IDs to force-route through WebSearch regardless of CostPredictor.
+
+        Default: empty (no force). Strategies override with universal logic
+        (e.g. kind=dimensions, kind=numeric, large enum dictionaries).
+        """
+        return set()
+
+    def build_response_model(
+        self,
+        base_model: Type[BaseModel],
+        targets: list[TargetAttribute],
+    ) -> Type[BaseModel]:
+        """Default: return base_model unchanged. Strategies override to enforce constraints."""
+        return base_model

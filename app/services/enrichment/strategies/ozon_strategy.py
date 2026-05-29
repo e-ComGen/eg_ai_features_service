@@ -4,7 +4,7 @@
 для авторитетной схемы характеристик: normalize_target подмешивает метаданные
 из словаря, validate_value проверяет банлист и (будущее) enum-значения.
 """
-from typing import Any, Optional
+from typing import Any, Optional, Type
 from .base import MarketplaceStrategy, ValidationResult
 from app.services.enrichment.base import (
     AttributeValue, TargetAttribute, ExtractionContext,
@@ -19,6 +19,8 @@ from app.services.enrichment.strategies.dictionaries.ozon_loader import (
 from app.services.enrichment.strategies.dictionaries.ozon_runtime_lookup import (
     search_value as _runtime_search_value,
 )
+from pydantic import BaseModel, model_validator
+from app.services.enrichment.prompt_router import classify_target
 
 
 # Атрибуты которые Ozon требует от продавца напрямую или генерит сам
@@ -61,6 +63,85 @@ class OzonStrategy(MarketplaceStrategy):
     @property
     def name(self) -> str:
         return "ozon"
+
+    def force_websearch_targets(self, targets: list[TargetAttribute]) -> set[int]:
+        """Force WebSearch для kinds где сайты производителей/ритейлеров точнее LLM-знаний.
+
+        Универсальные правила (работают для всех 9227 категорий Ozon):
+        - dimensions: физические габариты — LxWxH ищутся на странице товара
+        - numeric: числовые спецификации (кол-во разъёмов, мощность, вес и т.п.)
+        - enum с большим словарём (>100 значений): бренд, страна, цвет — длинный хвост,
+          LLM делает ошибки написания; web-поиск точнее находит официальные значения
+        """
+        # Kinds для которых web-поиск обычно точнее LLM-знаний
+        force_kinds = {"dimensions", "numeric"}
+        ids: set[int] = set()
+        for t in targets:
+            k = classify_target(t)
+            if k in force_kinds:
+                ids.add(t.id)
+            # Enum со словарём > 100 значений (бренд, страна, город, цвет):
+            # LLM часто ошибается в написании на длинном хвосте — web точнее
+            elif k == "enum" and t.allowed_values and len(t.allowed_values) > 100:
+                ids.add(t.id)
+        return ids
+
+    def build_response_model(
+        self,
+        base_model: Type[BaseModel],
+        targets: list[TargetAttribute],
+    ) -> Type[BaseModel]:
+        """Строим constrained response model с model_validator для enum-targets.
+
+        Для каждого enum-target с непустым allowed_values добавляем проверку:
+        если извлечённый value не входит в allowed list (case-sensitive) — ValueError,
+        structured_adapter повторит запрос.
+        """
+        # Собираем словарь {attribute_id: frozenset(allowed_values)} для enum-targets
+        enum_constraints: dict[int, frozenset[str]] = {
+            t.id: frozenset(str(v) for v in t.allowed_values)
+            for t in targets
+            if classify_target(t) == "enum" and t.allowed_values
+        }
+        if not enum_constraints:
+            return base_model
+
+        _constraints = enum_constraints  # замыкание в validator
+
+        class _ConstrainedModel(base_model):  # type: ignore[valid-type]
+            @model_validator(mode="after")
+            def _enforce_allowed_values(self):
+                # Извлекаем список _ExtractedAttr из поля (поддерживаем разные имена полей)
+                items = (
+                    getattr(self, "extracted", None)
+                    or getattr(self, "known_attributes", None)
+                    or []
+                )
+                for item in items:
+                    attr_id = getattr(item, "attribute_id", None)
+                    if attr_id not in _constraints:
+                        continue
+                    allowed = _constraints[attr_id]
+                    raw_value = getattr(item, "value", None)
+                    # Проверяем скаляр или список (is_collection)
+                    if isinstance(raw_value, list):
+                        bad = [str(v) for v in raw_value if str(v) not in allowed]
+                        if bad:
+                            raise ValueError(
+                                f"attr_id={attr_id}: values {bad} not in allowed list {sorted(allowed)}"
+                            )
+                    else:
+                        if raw_value is not None and str(raw_value) not in allowed:
+                            raise ValueError(
+                                f"attr_id={attr_id}: value {raw_value!r} not in allowed list {sorted(allowed)}"
+                            )
+                return self
+
+        _ConstrainedModel.__name__ = f"Constrained_{base_model.__name__}"
+        _ConstrainedModel.__qualname__ = _ConstrainedModel.__name__
+        # Флаг: sources увидят этот маркер и направят вызов в OpenAI strict provider
+        _ConstrainedModel.__has_enum_constraints__ = True  # type: ignore[attr-defined]
+        return _ConstrainedModel
 
     def _get_char_index(
         self,
@@ -113,6 +194,7 @@ class OzonStrategy(MarketplaceStrategy):
             semantic_type=target.semantic_type,
             description=target.description or char_meta.get("description"),
             is_collection=bool(char_meta.get("is_collection", False)),
+            is_required=bool(char_meta.get("is_required", target.is_required)),
         )
 
     def filter_unsupported_attributes(

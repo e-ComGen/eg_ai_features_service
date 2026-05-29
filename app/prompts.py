@@ -63,3 +63,19 @@ INSTRUCTIONS:
 2. Allow for synonyms (e.g. 'Wireless' -> 'Bluetooth').
 3. If no option fits, return NULL.
 """
+
+# --- 6. MODEL NAME (Название модели) ---
+# Универсальный промпт: убрать бренд-префикс, оставить идентификатор модели.
+# Работает для любых категорий (БП, обувь, телефоны, бытовая техника).
+MODEL_NAME_PROMPT = """
+Task: Extract the model identifier for '{feature_name}' from the product name.
+Product Name: '{product_name}'
+
+INSTRUCTIONS:
+1. Remove the category prefix (e.g. "Блок питания", "Кроссовки", "Смартфон").
+2. Remove the brand name (first recognizable brand word after the category prefix).
+3. Return ONLY the model identifier string that remains (e.g. "MWE Gold 750 V2 Full Modular").
+4. Do NOT include wattage/capacity/size if it is already encoded in the model name; keep it if it is part of the official model string.
+5. If no distinct model identifier exists (e.g. generic no-name), return NULL.
+6. Applies across all product categories — use common sense to identify the model substring.
+"""

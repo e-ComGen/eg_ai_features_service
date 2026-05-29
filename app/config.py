@@ -49,6 +49,14 @@ ENABLE_OPENAI_FALLBACK: bool = os.getenv("ENABLE_OPENAI_FALLBACK", "true").lower
 OPENAI_FALLBACK_MODEL: str = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-4o-mini")
 OPENAI_FALLBACK_MODEL_VISION: str = os.getenv("OPENAI_FALLBACK_MODEL_VISION", "gpt-4o")
 
+# ---------------------------------------------------------------------------
+# OpenAI strict json_schema — для enum-heavy structured extraction
+# ---------------------------------------------------------------------------
+# gpt-4.1-mini поддерживает token-level enum enforcement через llguidance.
+# Используется ТОЛЬКО когда response_model.__has_enum_constraints__ == True.
+# $0.40 input / $1.60 output per 1M tokens — дороже DeepSeek, но без retries.
+OPENAI_STRUCTURED_MODEL: str = os.getenv("OPENAI_STRUCTURED_MODEL", "gpt-4.1-mini")
+
 # Vague / placeholder feature names that must NEVER trigger an LLM call.
 # These are operator-defined placeholders (e.g. "NewFeature" from CS-Cart's
 # default schema templates) — extracting any value for them would be a

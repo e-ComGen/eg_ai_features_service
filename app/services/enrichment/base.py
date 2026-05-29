@@ -49,24 +49,36 @@ class Source(StrEnum):
     LLM_KNOWLEDGE = "llm_knowledge"    # из обучающей памяти LLM
     VISION = "vision"                   # с фото товара
     WEB_SEARCH = "web_search"           # из веб-поиска
+    COMPETITOR_RAG = "competitor_rag"   # consensus из top-K похожих Ozon-карточек (без LLM)
+    ICECAT = "icecat"                   # верифицированные спеки от бренда через IceCat Open API
+    PDF_DATASHEET = "pdf_datasheet"     # спеки извлечены из официального datasheet PDF производителя
+    OZON_CARD = "ozon_card"             # копия характеристик из live-карточки Ozon (через Apify ozon-scraper-pro)
 
 
 # Source priority при tie-break (если confidence равна).
 # Более привязанные к конкретному товару источники имеют выше приоритет.
 SOURCE_PRIORITY: dict[Source, int] = {
-    Source.DESCRIPTION: 4,    # самый надёжный — описание конкретного товара
-    Source.VISION: 3,         # тоже про этот товар, но визуально
-    Source.WEB_SEARCH: 2,     # про товар, но внешний источник
-    Source.LLM_KNOWLEDGE: 1,  # общие знания
+    Source.DESCRIPTION: 4,         # самый надёжный — описание конкретного товара
+    Source.PDF_DATASHEET: 4,       # официальный datasheet производителя — авторитетен как описание
+    Source.OZON_CARD: 4,           # копия с pre-modered Ozon-карточки точно такого же товара
+    Source.VISION: 3,              # тоже про этот товар, но визуально
+    Source.ICECAT: 3,              # brand-verified спеки от производителя
+    Source.WEB_SEARCH: 2,          # про товар, но внешний источник
+    Source.COMPETITOR_RAG: 2,      # реальные Ozon-карточки с модерацией
+    Source.LLM_KNOWLEDGE: 1,       # общие знания
 }
 
 
 # Per-source confidence thresholds: выше — судью не зовём, доверяем.
 SOURCE_CONFIDENCE_THRESHOLDS: dict[Source, float] = {
     Source.DESCRIPTION: 0.95,
+    Source.PDF_DATASHEET: 0.90,    # официальный PDF datasheet — высокий порог без judge
+    Source.OZON_CARD: 0.90,        # копия с pre-modered Ozon-карточки — высокий порог без LLM-judge
+    Source.ICECAT: 0.90,           # brand-verified: высокий порог без judge
     Source.LLM_KNOWLEDGE: 0.92,
     Source.WEB_SEARCH: 0.88,
     Source.VISION: 0.85,
+    Source.COMPETITOR_RAG: 0.80,   # consensus из реальных Ozon-листингов — высокая точность
 }
 
 
@@ -113,6 +125,7 @@ class TargetAttribute(BaseModel):
     semantic_type: Optional[str] = Field(None, description="color | weight | material_visual | brand | etc — подсказка для classifier")
     description: Optional[str] = None
     is_collection: bool = Field(False, description="Характеристика принимает массив значений")
+    is_required: bool = Field(False, description="Обязательная характеристика маркетплейса")
 
 
 class ExtractionContext(BaseModel):
@@ -183,9 +196,12 @@ class AttributeSource(ABC):
         self,
         context: ExtractionContext,
         targets: list[TargetAttribute],
+        already_filled: Optional[list["AttributeValue"]] = None,
     ) -> list[AttributeValue]:
         """Извлечь значения для applicable targets.
 
+        already_filled — список AttributeValue с confidence ≥ 0.85 от предыдущих sources.
+        Источник должен исключить их из targets и добавить в prompt как «уже известные».
         Может вернуть пустой список (источник ничего не нашёл).
         Все возвращённые AttributeValue должны иметь source=self.source_type.
         """
