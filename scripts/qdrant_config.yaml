@@ -1,0 +1,17 @@
+log_level: INFO
+
+storage:
+  storage_path: /tmp/qdrant_storage
+  snapshots_path: /tmp/qdrant_snapshots
+  on_disk_payload: true
+  optimizers:
+    indexing_threshold_kb: 0  # disable HNSW indexing during bulk upsert; rebuild later
+    default_segment_number: 4
+
+service:
+  host: 0.0.0.0
+  http_port: 6334
+  grpc_port: 6335
+
+cluster:
+  enabled: false
