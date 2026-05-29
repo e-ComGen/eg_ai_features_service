@@ -73,3 +73,27 @@ logs/
 
 # Eval artifacts (большие JSON отчёты, генерятся при прогоне)
 scripts/eval_results/
+
+# Local Claude Code settings (must not go to repo)
+.claude/
+
+# Debug artifacts (HTML dumps, nuxt state snapshots)
+_dump_*.html
+_nuxt_state*.json
+
+# RunPod runtime resume state files
+scripts/.runpod_*_state.json
+
+# Test fixtures (CSV/XLSX samples for scripts)
+scripts/test_*.xlsx
+scripts/test_*.csv
+scripts/test_*_enriched.xlsx
+scripts/test_psu_*.csv
+scripts/test_psu_*.xlsx
+scripts/test_excel_importer_sample*
+
+# RAG snapshots & shards (huge — 4–6GB, build on deploy)
+app/services/enrichment/strategies/dictionaries/data/ozon_rag.snapshot
+app/services/enrichment/strategies/dictionaries/data/ozon_rag.qdrant/
+app/services/enrichment/strategies/dictionaries/data/from_pod/
+scripts/qdrant.tar.gz
