@@ -84,9 +84,17 @@ _FEATURES_STATE_RE = re.compile(
 _CONF_EXACT = 0.93
 _CONF_BRAND_LINE = 0.85
 
-# Similarity thresholds
-_EXACT_THRESHOLD = 85.0
-_BRAND_LINE_THRESHOLD = 70.0
+# Similarity thresholds (понижены для (V2/V3/Plus/Bronze) вариаций — title часто
+# содержит "Блок питания + brand + model + V3 80 Plus Gold (MPE-XXX-...)", т.е.
+# много шума вокруг query "brand + model").
+_EXACT_THRESHOLD = 78.0
+_BRAND_LINE_THRESHOLD = 60.0
+
+# Retry: HTML < этого размера или 0 tiles → retry (Ozon **рандомно** отдаёт
+# обрезанную SPA-страницу 10KB без SSR data; та же query 2-3 попытки спустя
+# возвращает полные 480+KB SSR). Эмпирически 3 попыток достаточно.
+_MIN_VALID_HTML_LEN = 50_000
+_MAX_RETRIES = 3
 
 # Skip-guard
 _SKIP_FILL_RATIO = 0.80
@@ -112,6 +120,35 @@ _GENERIC_PREFIXES = (
     "блок питания", "блок", "питания",
     "power supply", "power", "supply", "unit",
 )
+
+
+def _compress_search_query(product_name: str, brand: Optional[str], max_tokens: int = 5) -> str:
+    """Сжимает product_name для Ozon search.
+
+    Ozon отдаёт пустую SPA-страницу для слишком специфичных запросов
+    ("Блок питания Cooler Master MWE Gold 750 V2 Full Modular 750W ATX"
+    → 10KB пустота). Нормальный SSR приходит для запросов
+    «brand + model line» (5-6 терминов).
+
+    Логика:
+      1. Strip leading generic prefix («Блок питания», «Power supply»).
+      2. Взять первые max_tokens токенов.
+      3. Если brand задан и его нет в результате — prepend.
+    """
+    result = product_name.strip()
+    low = result.lower()
+    for prefix in _GENERIC_PREFIXES:
+        if low.startswith(prefix):
+            result = result[len(prefix):].strip()
+            low = result.lower()
+            break
+    tokens = result.split()[:max_tokens]
+    compact = " ".join(tokens).strip()
+    if brand and brand.strip():
+        b = brand.strip()
+        if b.lower() not in compact.lower():
+            compact = f"{b} {compact}".strip()
+    return compact or product_name.strip()
 
 
 def _normalize_model(product_name: str, brand: Optional[str]) -> str:
@@ -252,19 +289,49 @@ class OzonCardSource(AttributeSource):
         self,
         client: httpx.AsyncClient,
         target_url: str,
+        min_len: int = _MIN_VALID_HTML_LEN,
     ) -> Optional[str]:
-        """POST к Scrappey, возвращает HTML response от target_url.
+        """POST к Scrappey с retry, возвращает HTML response от target_url.
 
-        Возвращает None если:
-        - Scrappey HTTP 4xx (квота / bad key)
-        - upstream HTTP не 200
-        - DataDome challenge в content
-        - network/timeout
+        Ozon иногда отдаёт обрезанную SPA-страницу (10KB без SSR data),
+        особенно при долгих запросах. Retry 1 раз если content слишком короткий.
+
+        Возвращает None если все попытки fail.
         """
-        payload = {
-            "cmd": "request.get",
-            "url": target_url,
-        }
+        for attempt in range(_MAX_RETRIES + 1):
+            content = await self._scrappey_fetch_once(client, target_url)
+            if content is None:
+                # Hard fail (network, HTTP4xx, DataDome) — retry имеет смысл
+                if attempt < _MAX_RETRIES:
+                    logger.info(
+                        "[OzonCard] retry #%d (hard fail) %s",
+                        attempt + 1, target_url[:80],
+                    )
+                    continue
+                return None
+            if len(content) < min_len:
+                # Soft fail — короткий HTML, бывает = пустая SPA. Retry.
+                if attempt < _MAX_RETRIES:
+                    logger.info(
+                        "[OzonCard] retry #%d (short %d chars) %s",
+                        attempt + 1, len(content), target_url[:80],
+                    )
+                    continue
+                logger.info(
+                    "[OzonCard] final HTML still too short (%d chars) for %s",
+                    len(content), target_url[:80],
+                )
+                return None
+            return content
+        return None
+
+    async def _scrappey_fetch_once(
+        self,
+        client: httpx.AsyncClient,
+        target_url: str,
+    ) -> Optional[str]:
+        """Один POST к Scrappey, без retry."""
+        payload = {"cmd": "request.get", "url": target_url}
         try:
             r = await client.post(
                 _SCRAPPEY_ENDPOINT,
@@ -327,7 +394,14 @@ class OzonCardSource(AttributeSource):
             follow_redirects=True,
         ) as client:
             # ---- SEARCH (HTML) ----
-            query = context.product_name.strip()
+            # Ozon SSR пустой для длинных/слишком специфичных запросов —
+            # сжимаем product_name до brand+model+ключевая_спека.
+            full_name = context.product_name.strip()
+            query = _compress_search_query(full_name, context.brand)
+            logger.info(
+                "[OzonCard] search query: '%s' (was: '%s')",
+                query, full_name[:80],
+            )
             search_url = f"{_OZON_SEARCH_URL}?text={query}"
             search_html = await self._scrappey_fetch(client, search_url)
             if search_html is None:

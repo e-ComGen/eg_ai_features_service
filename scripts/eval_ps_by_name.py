@@ -22,6 +22,18 @@ os.environ.setdefault("LLM_CACHE_DB", str(PROJECT_ROOT / ".llm_cache.sqlite"))
 from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".env")
 
+# Per-source logging (OzonCard etc.) — enabled via DEBUG_LOG=1
+if os.environ.get("DEBUG_LOG") == "1":
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+        force=True,
+    )
+    # Silence noisy httpx INFO
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # Мини-словарь patch
 _CACHE_FILE = PROJECT_ROOT / "scripts" / "eval_results" / "ozon_power_supply_cache.json"
 import app.services.enrichment.strategies.dictionaries.ozon_loader as _loader
