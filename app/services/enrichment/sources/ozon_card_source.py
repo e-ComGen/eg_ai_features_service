@@ -102,17 +102,33 @@ _SKIP_FILL_RATIO = 0.80
 # LRU
 _CACHE_MAX = 256
 
-# Brand-line whitelist (русские имена как в словаре Ozon)
-_BRAND_LINE_SAFE_ATTRS: frozenset[str] = frozenset({
-    "Бренд",
-    "Производитель",
-    "Страна-изготовитель",
-    "Цвет товара",
-    "Корректор коэффициента мощности (PFC)",
-    "Тип",
-    "Система охлаждения",
-    "Гарантия",
-    "Гарантийный срок",
+# Brand-line BLACKLIST (универсальный для всех категорий).
+#
+# В brand_line режиме (match score 60-78 — товар похож, но не точно тот же)
+# копируем ВСЁ что Ozon /features/ карточки соседнего товара отдаёт, **кроме**
+# явно model-specific атрибутов которые гарантированно отличаются между
+# моделями даже одной линейки бренда (Артикул конкретного товара, MPN,
+# серийник, ID-шник).
+#
+# Фильтрация по targets+Ozon dict работает естественно: если char_name
+# с tile не сматчился ни с одним target.name из загруженного Ozon dict для
+# текущей категории — этот char просто пропускается в _map_characteristics().
+# Поэтому whitelist в source избыточен — здесь только защита от перетирания
+# реальных полей шумом из чужой карточки.
+_BRAND_LINE_BLACKLIST: frozenset[str] = frozenset(name.lower() for name in {
+    "Артикул",
+    "Код производителя",
+    "MPN",
+    "Партномер",
+    "Серийный номер",
+    "EAN",
+    "GTIN",
+    "ASIN",
+    "Дата производства",
+    "Модель",
+    "Название модели",
+    "ID товара",
+    "ID карточки",
 })
 
 # Generic-префиксы которые срезаются при нормализации для cache key
@@ -396,20 +412,36 @@ class OzonCardSource(AttributeSource):
             # ---- SEARCH (HTML) ----
             # Ozon SSR пустой для длинных/слишком специфичных запросов —
             # сжимаем product_name до brand+model+ключевая_спека.
+            # Если 5-токенный compress + 3 retries дали SPA — пробуем
+            # ультра-короткий 3-токенный fallback (часто помогает на
+            # редких/старых моделях вроде «AeroCool Cylon 600W»).
             full_name = context.product_name.strip()
-            query = _compress_search_query(full_name, context.brand)
-            logger.info(
-                "[OzonCard] search query: '%s' (was: '%s')",
-                query, full_name[:80],
-            )
-            search_url = f"{_OZON_SEARCH_URL}?text={query}"
-            search_html = await self._scrappey_fetch(client, search_url)
-            if search_html is None:
-                return []
+            primary_query = _compress_search_query(full_name, context.brand, max_tokens=5)
+            fallback_query = _compress_search_query(full_name, context.brand, max_tokens=3)
 
-            tiles = self._parse_search_tiles_html(search_html)
-            if not tiles:
-                logger.info("[OzonCard] no search tiles для '%s'", query[:60])
+            queries_to_try: list[str] = [primary_query]
+            if fallback_query and fallback_query != primary_query:
+                queries_to_try.append(fallback_query)
+
+            search_html: Optional[str] = None
+            query: Optional[str] = None
+            tiles: list[dict] = []
+            for q in queries_to_try:
+                logger.info(
+                    "[OzonCard] search query: '%s' (was: '%s')",
+                    q, full_name[:80],
+                )
+                html = await self._scrappey_fetch(client, f"{_OZON_SEARCH_URL}?text={q}")
+                if html is None:
+                    continue
+                parsed = self._parse_search_tiles_html(html)
+                if parsed:
+                    search_html, query, tiles = html, q, parsed
+                    break
+                logger.info("[OzonCard] no tiles на query='%s' — пробую fallback", q[:60])
+
+            if not tiles or query is None:
+                logger.info("[OzonCard] no search tiles ни для primary ни для fallback")
                 return []
 
             top_tile, top_score = self._pick_best_match(query, tiles[:_MAX_SEARCH_TILES])
@@ -667,16 +699,12 @@ class OzonCardSource(AttributeSource):
             char_val = c["value"].strip()
             char_name_low = char_name.lower()
 
-            # brand_line: только safe-attrs
-            if mode == "brand_line":
-                if char_name not in _BRAND_LINE_SAFE_ATTRS:
-                    matched_safe = False
-                    for safe in _BRAND_LINE_SAFE_ATTRS:
-                        if safe.lower() == char_name_low:
-                            matched_safe = True
-                            break
-                    if not matched_safe:
-                        continue
+            # brand_line: блокируем только явно model-specific шум
+            # (Артикул/MPN/Серийник/EAN — гарантированно отличаются между
+            # моделями даже одного бренда). Всё остальное копируем — фильтр
+            # по targets+Ozon dict ниже отсечёт нерелевантные сами.
+            if mode == "brand_line" and char_name_low in _BRAND_LINE_BLACKLIST:
+                continue
 
             # 1) Exact lowercase match
             target_id = name_to_target_id.get(char_name_low)
