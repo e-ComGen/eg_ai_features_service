@@ -136,13 +136,17 @@ class PipelineOrchestrator:
             all_values += await self._run_finishing(context, targets, all_values)
             return self._finalize(all_values, targets, context)
 
-        # Stage 0.5: IceCatSource — brand-verified спеки без LLM (HTTP к IceCat Open API)
-        # Запускаем ПЕРВЫМ (до RAG и Classifier) — самый авторитетный источник спецификаций.
-        # При 403/404 (неизвестный бренд) возвращает [] — тогда RAG подхватывает как фолбэк.
-        icecat_filled_count = 0
-        if self._icecat is not None:
-            new_avs = await self._run_icecat_stage(context, remaining, already_filled=filled_so_far)
-            icecat_filled_count = len([v for v in new_avs if v.is_confident()])
+        # Stage 0.5: OzonCardSource — копия характеристик с похожего Ozon-товара.
+        # Запускаем ПЕРВЫМ (до IceCat, PDF, LLM) — на eval-аудите парсер достаёт
+        # 95.5% chars (21/22) из /features/ страницы и mapping на Ozon dict
+        # gives direct attr_id resolution. Конкурирующие sources при таком
+        # порядке дополняют OzonCard на attrs которые тот пропустил (outlier
+        # товары, OzonCard match=skip), а не наоборот — OzonCard «съел» 14
+        # потенциальных fills у других sources в предыдущей версии порядка.
+        if self._ozon_card is not None and remaining:
+            new_avs = await self._run_ozon_card_stage(
+                context, remaining, already_filled=filled_so_far,
+            )
             all_values += new_avs
             filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
             remaining = self._remaining_targets(targets, all_values)
@@ -150,15 +154,13 @@ class PipelineOrchestrator:
                 all_values += await self._run_finishing(context, targets, all_values)
                 return self._finalize(all_values, targets, context)
 
-        # Stage 0.55: OzonCardSource — копия характеристик из живой Ozon-карточки (Apify).
-        # Запускается ПОСЛЕ IceCat и ДО PDF: если IceCat закрыл атрибут (brand-verified),
-        # OzonCard не перезаписывает; если нет — OzonCard может дать «exact» совпадение
-        # (наивысший приоритет среди внешних источников) или brand-line частичное.
-        # Skip-guard внутри source: ≥80% filled → пропуск.
-        if self._ozon_card is not None and remaining:
-            new_avs = await self._run_ozon_card_stage(
-                context, remaining, already_filled=filled_so_far,
-            )
+        # Stage 0.55: IceCatSource — brand-verified спеки без LLM (IceCat Open API).
+        # Дополняет attrs которые OzonCard не закрыл (brand_line skip, outlier товары).
+        # При 403/404 (неизвестный бренд) возвращает [].
+        icecat_filled_count = 0
+        if self._icecat is not None:
+            new_avs = await self._run_icecat_stage(context, remaining, already_filled=filled_so_far)
+            icecat_filled_count = len([v for v in new_avs if v.is_confident()])
             all_values += new_avs
             filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
             remaining = self._remaining_targets(targets, all_values)

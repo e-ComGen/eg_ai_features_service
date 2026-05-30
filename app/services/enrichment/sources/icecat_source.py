@@ -317,10 +317,15 @@ class IceCatSource(AttributeSource):
 
         brand = context.brand.strip()
 
-        # Определяем уже заполненные
+        # Определяем уже заполненные — только high-confidence (is_confident()).
+        # Source threshold для IceCat = 0.90. Если ранее запущенный source
+        # положил attr с conf < 0.90 (например OzonCard brand_line 0.85),
+        # IceCat ВСЁ РАВНО пытается заполнить — потом AttributeMerger выберет
+        # winner по confidence. Раньше naive set membership блокировал IceCat
+        # даже на низкоуверенных prior fills, теряя его 0.92 точность.
         already_filled_ids: set[int] = set()
         if already_filled:
-            already_filled_ids = {av.attribute_id for av in already_filled}
+            already_filled_ids = {av.attribute_id for av in already_filled if av.is_confident()}
 
         effective_targets = [t for t in targets if t.id not in already_filled_ids]
         if not effective_targets:

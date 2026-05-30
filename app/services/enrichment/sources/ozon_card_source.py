@@ -80,7 +80,14 @@ _FEATURES_STATE_RE = re.compile(
     re.DOTALL,
 )
 
-# Confidence
+# Confidence.
+# brand_line conf=0.85 — ровно на pipeline `filter_already_filled_targets`
+# threshold 0.85, чтобы OzonCard fills попадали в filled_so_far и AttributeMerger
+# выбирал их как backup, если позже более уверенный источник не нашёл.
+# IceCat skip-guard теперь использует is_confident() (>=0.90 для IceCat),
+# а не naive set membership, поэтому OzonCard brand_line 0.85 НЕ блокирует
+# IceCat от заполнения этих же attrs с conf 0.92 — merger выберет IceCat.
+# exact conf=0.93 — точный match того же товара, не переписываем.
 _CONF_EXACT = 0.93
 _CONF_BRAND_LINE = 0.85
 
