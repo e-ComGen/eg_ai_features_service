@@ -34,17 +34,17 @@ from app.services.enrichment.strategies.base import MarketplaceStrategy
 from app.services.enrichment.strategies.default_strategy import DefaultStrategy
 
 
-# Semantic types которые можно извлечь визуально — УЗКИЙ whitelist.
-# В v10b расширили список (+brand/model/article/certification/etc) — Vision начал
-# давать 67 fills (vs 4), но они **неточные** (Vision видит фото чужой brand_line
-# модели от OzonCard, переносит её спеки на наш товар → coverage required упал
-# с 88.8% до 81.2%). Возвращаем к атрибутам которые НЕ model-specific
-# (цвет/материал/форма видны и для похожей модели той же линейки — там обычно
-# одинаковые).
+# Semantic types которые можно извлечь визуально — ОРИГИНАЛЬНЫЙ v8 whitelist.
+# История:
+#   v8 (8 типов): coverage required 88.8%, Vision 4 fills.
+#   v10b (18 типов): Vision дал 67 fills но они НЕТОЧНЫЕ (видит фото чужой
+#     brand_line модели от OzonCard) → coverage drop до 81.2%.
+#   v12 (7 типов + indicator/lighting): Vision 20 fills, coverage required 87.5%
+#     (-1.3 pp от v8). Vision просто перетирал более точные fills других sources.
+#   Возвращаем к v8: Vision только на color/material/shape/form_factor/...
 VISUAL_SEMANTIC_TYPES = {
-    "color", "material_visual", "shape",
-    "pattern", "texture",
-    "indicator", "lighting",
+    "color", "material_visual", "shape", "form_factor",
+    "visible_size", "visible_label", "pattern", "texture",
 }
 
 

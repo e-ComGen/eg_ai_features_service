@@ -214,10 +214,17 @@ def filter_already_filled_targets(
     targets: "list[TargetAttribute]",
     already_filled: "list[AttributeValue]",
 ) -> "list[TargetAttribute]":
-    """Убирает из targets те, что уже заполнены с confidence ≥ 0.85."""
+    """Убирает из targets те, что уже заполнены с **is_confident()** (≥source threshold).
+
+    Раньше использовали глобальный threshold 0.85 — это блокировало PDF (threshold
+    0.90) перезаписать attrs которые OzonCard заполнил brand_line conf=0.85, хотя
+    PDF был бы точнее. is_confident() для каждого source проверяет свой threshold:
+    OZON_CARD=0.90, ICECAT=0.90, PDF_DATASHEET=0.90, LLM_KNOWLEDGE=0.92 и т.д.
+    Это позволяет более точным sources перебивать менее уверенные.
+    """
     filled_ids = {
         av.attribute_id
         for av in already_filled
-        if av.confidence >= SKIP_FILLED_CONFIDENCE_THRESHOLD
+        if av.is_confident()
     }
     return [t for t in targets if t.id not in filled_ids]

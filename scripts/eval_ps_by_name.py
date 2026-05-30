@@ -129,44 +129,58 @@ async def main():
         ozon_card_source=ozon_card,
     )
 
-    results = []
     t_start = time.time()
     eval_limit = int(os.environ.get("EVAL_LIMIT", str(len(PRODUCTS))))
     products_to_run = PRODUCTS[:eval_limit]
-    print(f"[Eval] Running {len(products_to_run)} of {len(PRODUCTS)} products (EVAL_LIMIT={eval_limit})", flush=True)
-    for i, name in enumerate(products_to_run, 1):
-        # Бренд можно извлечь грубой эвристикой (второе слово)
-        brand_guess = name.replace("Блок питания ", "").split()[0]
-        print(f"  [{i:2d}/{len(PRODUCTS)}] {name[:70]}", flush=True)
-        ctx = ExtractionContext(
-            product_id=i,
-            product_name=name,
-            product_description="",
-            brand=brand_guess,
-            category_id=str(DESCRIPTION_CATEGORY_ID),
-            category_path=["Электроника", "Блоки питания ПК", "Блок питания компьютера"],
-            image_urls=[],
-            marketplace="ozon",
-            ozon_type_id=TYPE_ID,
-        )
-        try:
-            avs = await orchestrator.enrich(ctx, targets)
-        except Exception as e:
-            print(f"    ! pipeline error: {type(e).__name__}: {e}", flush=True)
-            avs = []
-        print(f"    -> {len(avs)} attrs filled", flush=True)
-        results.append({
-            "name": name,
-            "filled": [{
-                "attribute_id": av.attribute_id,
-                "name": char_by_id.get(av.attribute_id, {}).get("name"),
-                "value": av.value,
-                "value_id": av.value_id,
-                "source": str(av.source),
-                "confidence": av.confidence,
-                "evidence": (av.evidence or "")[:120],
-            } for av in avs],
-        })
+    # CONCURRENCY: обработка продуктов параллельно через semaphore.
+    # 8 параллельно — баланс между скоростью и rate limit'ами (Scrappey/Serper/LLM).
+    # 30+ минут → 3-5 минут на 20 продуктов.
+    concurrency = int(os.environ.get("EVAL_CONCURRENCY", "8"))
+    sem = asyncio.Semaphore(concurrency)
+    print(f"[Eval] Running {len(products_to_run)} of {len(PRODUCTS)} products (EVAL_LIMIT={eval_limit}, concurrency={concurrency})", flush=True)
+
+    async def _process_one(idx: int, prod_name: str) -> dict:
+        async with sem:
+            brand_guess = prod_name.replace("Блок питания ", "").split()[0]
+            print(f"  [{idx:2d}/{len(PRODUCTS)}] start: {prod_name[:70]}", flush=True)
+            ctx = ExtractionContext(
+                product_id=idx,
+                product_name=prod_name,
+                product_description="",
+                brand=brand_guess,
+                category_id=str(DESCRIPTION_CATEGORY_ID),
+                category_path=["Электроника", "Блоки питания ПК", "Блок питания компьютера"],
+                image_urls=[],
+                marketplace="ozon",
+                ozon_type_id=TYPE_ID,
+            )
+            try:
+                avs = await orchestrator.enrich(ctx, targets)
+            except Exception as e:
+                print(f"  [{idx:2d}/{len(PRODUCTS)}] ! pipeline error: {type(e).__name__}: {e}", flush=True)
+                avs = []
+            print(f"  [{idx:2d}/{len(PRODUCTS)}] -> {len(avs)} attrs filled ({prod_name[:50]})", flush=True)
+            return {
+                "name": prod_name,
+                "filled": [{
+                    "attribute_id": av.attribute_id,
+                    "name": char_by_id.get(av.attribute_id, {}).get("name"),
+                    "value": av.value,
+                    # value_id для скаляра, value_ids для коллекций (is_collection=True
+                    # для разъёмов GPU/MB, защит, и т.д.). Раньше писали только value_id,
+                    # что давало ложное «83.6%» вместо реальных 91.6% — метрика баг.
+                    "value_id": av.value_id,
+                    "value_ids": getattr(av, "value_ids", None),
+                    "source": str(av.source),
+                    "confidence": av.confidence,
+                    "evidence": (av.evidence or "")[:120],
+                } for av in avs],
+            }
+
+    # asyncio.gather preserves order — results[i] соответствует products_to_run[i]
+    results = await asyncio.gather(
+        *(_process_one(i, name) for i, name in enumerate(products_to_run, 1))
+    )
 
     t_elapsed = time.time() - t_start
 
@@ -183,7 +197,8 @@ async def main():
             source_counts[f["source"]] += 1
             if char_by_id.get(f["attribute_id"], {}).get("values"):
                 value_id_total += 1
-                if f["value_id"]:
+                # Считаем как resolved: scalar value_id OR collection value_ids (любой непустой)
+                if f.get("value_id") or f.get("value_ids"):
                     value_id_resolved += 1
 
     total_req = sum(1 for c in chars if c.get("is_required"))
