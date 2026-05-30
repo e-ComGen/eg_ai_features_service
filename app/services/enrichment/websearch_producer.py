@@ -102,6 +102,7 @@ class WebSearchProducer:
         product_name: str,
         brand: Optional[str] = None,
         ean: Optional[str] = None,
+        mpn: Optional[str] = None,
         timeout: int = 60,
     ) -> Optional[str]:
         """Search the web for product info and return a plain-text summary.
@@ -114,9 +115,9 @@ class WebSearchProducer:
             return None
 
         if self._use_serper:
-            return await self._produce_via_serper(product_name, brand, ean, timeout)
+            return await self._produce_via_serper(product_name, brand, ean, mpn, timeout)
         else:
-            return await self._produce_via_openai(product_name, brand, ean, timeout)
+            return await self._produce_via_openai(product_name, brand, ean, mpn, timeout)
 
     # ------------------------------------------------------------------
     # Serper path: Google search + LLM extraction
@@ -126,10 +127,15 @@ class WebSearchProducer:
         product_name: str,
         brand: Optional[str],
         ean: Optional[str],
+        mpn: Optional[str],
         timeout: int,
     ) -> Optional[str]:
-        # Build search query
-        parts = [product_name]
+        # Build search query — MPN first (highest signal: точный код производителя),
+        # then product_name + brand + ean (любые secondary identifiers).
+        parts: list[str] = []
+        if mpn:
+            parts.append(mpn)
+        parts.append(product_name)
         if brand:
             parts.append(brand)
         if ean:
@@ -169,6 +175,7 @@ class WebSearchProducer:
         user_text = (
             f"Товар: {product_name}"
             + (f"\nБренд: {brand}" if brand else "")
+            + (f"\nMPN: {mpn}" if mpn else "")
             + (f"\nEAN: {ean}" if ean else "")
             + f"\n\nНайденные фрагменты:\n{search_context}"
         )
@@ -244,13 +251,18 @@ class WebSearchProducer:
         product_name: str,
         brand: Optional[str],
         ean: Optional[str],
+        mpn: Optional[str],
         timeout: int,
     ) -> Optional[str]:
         brand_line = f"Brand: {brand}\n" if brand else ""
+        # Кладём MPN в product_name строку чтобы не ломать существующий template.
+        product_line = product_name
+        if mpn:
+            product_line = f"{product_name} (MPN: {mpn})"
         ean_line = f"EAN / barcode: {ean}\n" if ean else ""
 
         query = _WS_USER_TEMPLATE.format(
-            product_name=product_name,
+            product_name=product_line,
             brand_line=brand_line,
             ean_line=ean_line,
         )

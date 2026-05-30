@@ -115,6 +115,7 @@ async def test_extract_calls_search_then_extraction():
         product_name=ctx.product_name,
         brand=ctx.brand,
         ean=ctx.ean,
+        mpn=ctx.mpn,
     )
     mock_extractor.structured_request.assert_awaited_once()
     assert len(result) == 1

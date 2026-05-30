@@ -7,6 +7,8 @@ from .competitor_rag_source import CompetitorRagSource
 from .icecat_source import IceCatSource
 from .pdf_datasheet_source import PdfDatasheetSource
 from .ozon_card_source import OzonCardSource
+from .wb_card_source import WbCardSource
+from .ugc_source import UgcSource
 
 __all__ = [
     "DescriptionSource",
@@ -17,4 +19,6 @@ __all__ = [
     "IceCatSource",
     "PdfDatasheetSource",
     "OzonCardSource",
+    "WbCardSource",
+    "UgcSource",
 ]

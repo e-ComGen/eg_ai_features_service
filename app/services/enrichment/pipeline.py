@@ -26,6 +26,8 @@ from app.services.enrichment.sources import (
     IceCatSource,
     PdfDatasheetSource,
     OzonCardSource,
+    WbCardSource,
+    UgcSource,
 )
 from app.services.enrichment.intelligence import LlmClassifier, CostPredictor
 from app.services.enrichment.confidence_aware_judge import ConfidenceAwareJudgeWrapper
@@ -56,6 +58,8 @@ class PipelineOrchestrator:
         icecat_source: Optional[IceCatSource] = None,
         pdf_datasheet_source: Optional[PdfDatasheetSource] = None,
         ozon_card_source: Optional[OzonCardSource] = None,
+        wb_card_source: Optional[WbCardSource] = None,
+        ugc_source: Optional[UgcSource] = None,
         classifier: Optional[LlmClassifier] = None,
         cost_predictor: Optional[CostPredictor] = None,
         strategy: Optional[MarketplaceStrategy] = None,
@@ -78,9 +82,15 @@ class PipelineOrchestrator:
         # PdfDatasheetSource: datasheet PDF от производителя через Gemini native PDF.
         # None → PDF stage пропускается.
         self._pdf_datasheet: Optional[PdfDatasheetSource] = pdf_datasheet_source
-        # OzonCardSource: копия характеристик из живой Ozon-карточки через Apify.
+        # OzonCardSource: копия характеристик из живой Ozon-карточки через Scrappey.
         # None → Ozon card stage пропускается.
         self._ozon_card: Optional[OzonCardSource] = ozon_card_source
+        # WbCardSource: копия характеристик из WB basket-API (бесплатно, без anti-bot).
+        # None → WB card stage пропускается.
+        self._wb_card: Optional[WbCardSource] = wb_card_source
+        # UgcSource: отзывы и Q&A с Ozon/WB для compat/physical attrs.
+        # None → UGC stage пропускается.
+        self._ugc: Optional[UgcSource] = ugc_source
         self._judges: dict[Source, ConfidenceAwareJudgeWrapper] = {
             src: ConfidenceAwareJudgeWrapper(s.get_judge())
             for src, s in self._sources.items()
@@ -104,6 +114,16 @@ class PipelineOrchestrator:
         if self._ozon_card is not None:
             self._judges[Source.OZON_CARD] = ConfidenceAwareJudgeWrapper(
                 self._ozon_card.get_judge()
+            )
+        # Judge для WbCard (если source передан)
+        if self._wb_card is not None:
+            self._judges[Source.WB_CARD] = ConfidenceAwareJudgeWrapper(
+                self._wb_card.get_judge()
+            )
+        # Judge для UGC (если source передан)
+        if self._ugc is not None:
+            self._judges[Source.UGC] = ConfidenceAwareJudgeWrapper(
+                self._ugc.get_judge()
             )
         self._classifier = classifier or LlmClassifier()
         self._cost_predictor = cost_predictor or CostPredictor()
@@ -136,6 +156,21 @@ class PipelineOrchestrator:
             all_values += await self._run_finishing(context, targets, all_values)
             return self._finalize(all_values, targets, context)
 
+        # Stage 0.45: WbCardSource — копия характеристик с похожего WB-товара
+        # через бесплатный basket-API (БЕЗ Scrappey credits). Запускаем ПЕРВЫМ
+        # — нулевая стоимость, ~300ms latency. WB-чары мапятся на тот же
+        # Ozon-словарь (мы заполняем для Ozon, но WB — отличный источник).
+        if self._wb_card is not None and remaining:
+            new_avs = await self._run_wb_card_stage(
+                context, remaining, already_filled=filled_so_far,
+            )
+            all_values += new_avs
+            filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
+            remaining = self._remaining_targets(targets, all_values)
+            if not remaining:
+                all_values += await self._run_finishing(context, targets, all_values)
+                return self._finalize(all_values, targets, context)
+
         # Stage 0.5: OzonCardSource — копия характеристик с похожего Ozon-товара.
         # Запускаем ПЕРВЫМ (до IceCat, PDF, LLM) — на eval-аудите парсер достаёт
         # 95.5% chars (21/22) из /features/ страницы и mapping на Ozon dict
@@ -157,6 +192,9 @@ class PipelineOrchestrator:
         # Stage 0.55: IceCatSource — brand-verified спеки без LLM (IceCat Open API).
         # Дополняет attrs которые OzonCard не закрыл (brand_line skip, outlier товары).
         # При 403/404 (неизвестный бренд) возвращает [].
+        # Vision Stage 0.52 (mpn/ean enrich) был отключён в v10b — Vision видит фото
+        # чужой brand_line карточки от OzonCard, MPN с неё неточен. Vision запускается
+        # только Stage 3 (classifier-routed) для реально визуальных attrs.
         icecat_filled_count = 0
         if self._icecat is not None:
             new_avs = await self._run_icecat_stage(context, remaining, already_filled=filled_so_far)
@@ -296,6 +334,18 @@ class PipelineOrchestrator:
             Source.WEB_SEARCH, context, websearch_targets,
             already_filled=filled_so_far,
         )
+        filled_so_far = self._merge_high_conf(filled_so_far, all_values)
+
+        # Stage 4.5: UgcSource — отзывы и Q&A с Ozon/WB для compat/physical attrs
+        # (длина кабеля как у покупателя, шум, совместимость материнской платой).
+        # Запускается последним перед finishing — после всех structured sources.
+        if self._ugc is not None:
+            remaining_for_ugc = self._remaining_targets(targets, all_values)
+            if remaining_for_ugc:
+                new_avs = await self._run_ugc_stage(
+                    context, remaining_for_ugc, already_filled=filled_so_far,
+                )
+                all_values += new_avs
 
         # Stage 5: Finishing pass — focused re-extraction for empty required attributes
         all_values += await self._run_finishing(context, targets, all_values)
@@ -396,6 +446,70 @@ class PipelineOrchestrator:
             except Exception as e:
                 logger.warning(
                     "[Pipeline] pdf_datasheet judge failed for attr %s: %s",
+                    value.attribute_id, e,
+                )
+        return results
+
+    async def _run_wb_card_stage(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: Optional[list[AttributeValue]] = None,
+    ) -> list[AttributeValue]:
+        """Запустить WbCardSource + его судью. Ошибки не прерывают pipeline."""
+        if self._wb_card is None:
+            return []
+        judge_wrapper = self._judges.get(Source.WB_CARD)
+        try:
+            extracted = await self._wb_card.extract(
+                context, targets, already_filled=already_filled
+            )
+        except Exception as e:
+            logger.warning("[Pipeline] wb_card source failed: %s", e, exc_info=True)
+            return []
+        if judge_wrapper is None:
+            return extracted
+        results: list[AttributeValue] = []
+        for value in extracted:
+            try:
+                judged = await judge_wrapper.maybe_validate(value, context)
+                if judged is not None:
+                    results.append(judged)
+            except Exception as e:
+                logger.warning(
+                    "[Pipeline] wb_card judge failed for attr %s: %s",
+                    value.attribute_id, e,
+                )
+        return results
+
+    async def _run_ugc_stage(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: Optional[list[AttributeValue]] = None,
+    ) -> list[AttributeValue]:
+        """Запустить UgcSource + его судью. Ошибки не прерывают pipeline."""
+        if self._ugc is None:
+            return []
+        judge_wrapper = self._judges.get(Source.UGC)
+        try:
+            extracted = await self._ugc.extract(
+                context, targets, already_filled=already_filled
+            )
+        except Exception as e:
+            logger.warning("[Pipeline] ugc source failed: %s", e, exc_info=True)
+            return []
+        if judge_wrapper is None:
+            return extracted
+        results: list[AttributeValue] = []
+        for value in extracted:
+            try:
+                judged = await judge_wrapper.maybe_validate(value, context)
+                if judged is not None:
+                    results.append(judged)
+            except Exception as e:
+                logger.warning(
+                    "[Pipeline] ugc judge failed for attr %s: %s",
                     value.attribute_id, e,
                 )
         return results
@@ -533,9 +647,35 @@ class PipelineOrchestrator:
         return list(by_id.values())
 
     def _merge(self, all_values: list[AttributeValue]) -> list[AttributeValue]:
-        """Per attribute_id, pick highest confidence; tie-break by SOURCE_PRIORITY."""
-        by_id: dict[int, AttributeValue] = {}
+        """Per attribute_id, pick highest confidence; tie-break by SOURCE_PRIORITY.
+
+        Ensemble voting: если ≥2 разных source выдали одинаковое
+        normalized value на тот же attribute_id — bump confidence
+        +0.10 (cap 0.97). Cross-source agreement = сильный сигнал
+        достоверности (LLM сказал, web search подтвердил, etc).
+        """
+        # Step 1: count unique sources per (attribute_id, normalized_value)
+        sources_per_value: dict[tuple[int, str], set] = {}
         for v in all_values:
+            norm_value = str(v.value).strip().lower()
+            key = (v.attribute_id, norm_value)
+            sources_per_value.setdefault(key, set()).add(v.source)
+
+        # Step 2: apply consensus bonus
+        boosted: list[AttributeValue] = []
+        for v in all_values:
+            norm_value = str(v.value).strip().lower()
+            key = (v.attribute_id, norm_value)
+            n_sources = len(sources_per_value[key])
+            if n_sources >= 2 and v.confidence < 0.97:
+                new_conf = min(0.97, v.confidence + 0.10)
+                boosted.append(v.model_copy(update={"confidence": new_conf}))
+            else:
+                boosted.append(v)
+
+        # Step 3: highest-conf wins per attribute_id (original logic)
+        by_id: dict[int, AttributeValue] = {}
+        for v in boosted:
             existing = by_id.get(v.attribute_id)
             if existing is None:
                 by_id[v.attribute_id] = v

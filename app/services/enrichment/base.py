@@ -53,6 +53,8 @@ class Source(StrEnum):
     ICECAT = "icecat"                   # верифицированные спеки от бренда через IceCat Open API
     PDF_DATASHEET = "pdf_datasheet"     # спеки извлечены из официального datasheet PDF производителя
     OZON_CARD = "ozon_card"             # копия характеристик из live-карточки Ozon (через Apify ozon-scraper-pro)
+    WB_CARD = "wb_card"                 # копия характеристик из live-карточки Wildberries (открытое API, без Scrappey)
+    UGC = "ugc"                         # отзывы + Q&A с Ozon/WB (user-generated, реальные пользователи)
 
 
 # Source priority при tie-break (если confidence равна).
@@ -61,10 +63,12 @@ SOURCE_PRIORITY: dict[Source, int] = {
     Source.DESCRIPTION: 4,         # самый надёжный — описание конкретного товара
     Source.PDF_DATASHEET: 4,       # официальный datasheet производителя — авторитетен как описание
     Source.OZON_CARD: 4,           # копия с pre-modered Ozon-карточки точно такого же товара
+    Source.WB_CARD: 4,             # копия с pre-modered WB-карточки точно такого же товара
     Source.VISION: 3,              # тоже про этот товар, но визуально
     Source.ICECAT: 3,              # brand-verified спеки от производителя
     Source.WEB_SEARCH: 2,          # про товар, но внешний источник
     Source.COMPETITOR_RAG: 2,      # реальные Ozon-карточки с модерацией
+    Source.UGC: 2,                 # отзывы реальных покупателей — обычно про конкретный товар, но noisy
     Source.LLM_KNOWLEDGE: 1,       # общие знания
 }
 
@@ -74,11 +78,13 @@ SOURCE_CONFIDENCE_THRESHOLDS: dict[Source, float] = {
     Source.DESCRIPTION: 0.95,
     Source.PDF_DATASHEET: 0.90,    # официальный PDF datasheet — высокий порог без judge
     Source.OZON_CARD: 0.90,        # копия с pre-modered Ozon-карточки — высокий порог без LLM-judge
+    Source.WB_CARD: 0.90,          # копия с pre-modered WB-карточки — высокий порог без LLM-judge
     Source.ICECAT: 0.90,           # brand-verified: высокий порог без judge
     Source.LLM_KNOWLEDGE: 0.92,
     Source.WEB_SEARCH: 0.88,
     Source.VISION: 0.85,
     Source.COMPETITOR_RAG: 0.80,   # consensus из реальных Ozon-листингов — высокая точность
+    Source.UGC: 0.75,              # отзывы/Q&A — шумные, низкий порог, всегда через judge
 }
 
 
@@ -141,6 +147,8 @@ class ExtractionContext(BaseModel):
     category_path: list[str] = Field(default_factory=list)
     brand: Optional[str] = None
     ean: Optional[str] = None
+    mpn: Optional[str] = None              # Manufacturer Part Number (артикул производителя для IceCat / datasheet lookup)
+    article: Optional[str] = None          # Артикул производителя (отдельно от MPN — иногда это разные коды)
     source_urls: list[str] = Field(default_factory=list)
     image_urls: list[str] = Field(default_factory=list)
 

@@ -36,7 +36,8 @@ logger = logging.getLogger(__name__)
 
 _PDF_CONFIDENCE = 0.92
 _SKIP_FILL_RATIO = 0.80
-_MAX_PDF_BYTES = 8 * 1024 * 1024  # 8 MB hard cap
+_MAX_PDF_BYTES = 20 * 1024 * 1024  # 20 MB hard cap (Gemini PDF native поддерживает ~30MB inline).
+                                   # 8MB резал outliers (Seasonic 10.9MB → 20MB закрывает).
 _DOWNLOAD_TIMEOUT = 25
 _SERPER_TOP_K = 5
 _LRU_MAX = 256
@@ -161,7 +162,9 @@ class PdfDatasheetSource(AttributeSource):
         if not model:
             return []
 
-        cache_key = (brand.lower(), model.lower())
+        mpn = (context.mpn or "").strip()
+        # cache_key учитывает MPN: разные MPN → разные PDF результаты
+        cache_key = (brand.lower(), f"{mpn.lower()}|{model.lower()}" if mpn else model.lower())
         if cache_key in self._cache:
             cached = self._cache[cache_key]
             if not cached:
@@ -184,7 +187,7 @@ class PdfDatasheetSource(AttributeSource):
                 self._cache[cache_key] = None
                 return []
 
-        pdf_url = await self._find_pdf_url(brand, model)
+        pdf_url = await self._find_pdf_url(brand, model, mpn=mpn)
         if not pdf_url:
             self._cache[cache_key] = None
             return []
@@ -210,10 +213,17 @@ class PdfDatasheetSource(AttributeSource):
             return []
         return self._to_attribute_values(extracted, effective, pdf_url)
 
-    async def _find_pdf_url(self, brand: str, model: str) -> Optional[str]:
+    async def _find_pdf_url(self, brand: str, model: str, mpn: str = "") -> Optional[str]:
         if not self._serper:
             return None
         queries = []
+        # MPN-first queries: точный код производителя — highest signal-to-noise.
+        # Используем его если задан (например, обогащено Vision из фото).
+        if mpn:
+            if brand:
+                queries.append(f'"{brand} {mpn}" datasheet filetype:pdf')
+            queries.append(f'"{mpn}" datasheet filetype:pdf')
+            queries.append(f'site:gzhls.at "{mpn}"')
         if brand:
             queries.append(f'"{brand} {model}" specifications filetype:pdf')
         queries.append(f'site:gzhls.at "{model}"')

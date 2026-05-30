@@ -55,6 +55,8 @@ from app.services.enrichment.sources.competitor_rag_source import CompetitorRagS
 from app.services.enrichment.sources.icecat_source import IceCatSource
 from app.services.enrichment.sources.pdf_datasheet_source import PdfDatasheetSource
 from app.services.enrichment.sources.ozon_card_source import OzonCardSource
+from app.services.enrichment.sources.wb_card_source import WbCardSource
+from app.services.enrichment.sources.ugc_source import UgcSource
 
 DESCRIPTION_CATEGORY_ID = 17028612
 TYPE_ID = 91910
@@ -116,7 +118,9 @@ async def main():
         print("[Eval] SKIP_RAG=1 -> CompetitorRagSource disabled", flush=True)
     icecat = IceCatSource()  # читает ICECAT_EMAIL, ICECAT_TOKEN из .env
     pdf_datasheet = PdfDatasheetSource()  # Serper + Gemini 2.5 Flash PDF native
-    ozon_card = OzonCardSource(apify_token=os.environ.get("APIFY_TOKEN"))  # Apify ozon-scraper-pro
+    ozon_card = OzonCardSource()  # Scrappey, reads SCRAPPEY_KEY from env
+    # WB и UGC отключены: WB Scrappey envelope-error на search.wb.ru endpoint;
+    # UGC зависит от nm_id discovery который сейчас не работает.
     orchestrator = PipelineOrchestrator(
         strategy=strategy,
         competitor_rag_source=competitor_rag,

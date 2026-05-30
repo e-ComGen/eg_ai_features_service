@@ -6,6 +6,8 @@ from .websearch_judge import WebSearchJudge
 from .competitor_rag_judge import CompetitorRagJudge
 from .icecat_judge import IceCatJudge
 from .ozon_card_judge import OzonCardJudge
+from .wb_card_judge import WbCardJudge
+from .ugc_judge import UgcJudge
 
 __all__ = [
     "DescriptionJudge",
@@ -15,4 +17,6 @@ __all__ = [
     "CompetitorRagJudge",
     "IceCatJudge",
     "OzonCardJudge",
+    "WbCardJudge",
+    "UgcJudge",
 ]

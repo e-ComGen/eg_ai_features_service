@@ -29,9 +29,12 @@ class VisionJudge(LlmJudge):
         verdict, _ = await self._llm.structured_request(
             system_prompt=(
                 "You verify if a visual attribute was actually OBSERVED on product photos, "
-                "not inferred from product name or category. The evidence should describe what "
-                "is visually seen (color, shape, material appearance), not deduced. "
-                "Reject if the evidence is generic or sounds like assumption."
+                "not inferred from product name or category. "
+                "Evidence is valid if it describes (a) what is visually seen on the product "
+                "(color, shape, material appearance), OR (b) text/logos transcribed verbatim "
+                "from packaging, labels, or stickers visible in the photos. "
+                "Reject only if the evidence is generic, contradicts the photos, or sounds "
+                "like an assumption drawn purely from the product name/category."
             ),
             user_text=(
                 f"Product: {context.product_name}\n"

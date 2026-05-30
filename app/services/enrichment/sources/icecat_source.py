@@ -341,7 +341,7 @@ class IceCatSource(AttributeSource):
                 return []
             features = cached
         else:
-            features = await self._search_and_fetch(brand, context.product_name)
+            features = await self._search_and_fetch(brand, context.product_name, context=context)
             self._search_cache[search_key] = features if features != "403" else "403"
 
         if not features or features == "403":
@@ -354,10 +354,13 @@ class IceCatSource(AttributeSource):
         self,
         brand: str,
         product_name: str,
+        context: Optional[ExtractionContext] = None,
     ) -> list[tuple[str, str]] | None | str:
         """Перебрать кандидатов product code и вернуть первый успешный результат.
 
         Стратегия:
+          0. Если context.mpn задан (например, обогащён Vision из фото) — пробуем его
+             ПЕРВЫМ. Это бесплатный точный MPN, экономит Serper+LLM lookup.
           1. Генерируем кандидатов из product_name (многоуровневая эвристика).
           2. Для каждого кандидата: GET IceCat API.
              - 200 → возвращаем features.
@@ -371,6 +374,35 @@ class IceCatSource(AttributeSource):
           - "403" при 403 (бренд в Full tier) — прекращаем все попытки
           - None если ни один кандидат не дал 200
         """
+        # Step 0: если context принёс точный MPN (например, Vision прочитал с коробки) —
+        # пробуем его первым. Это free shortcut, минует и эвристики, и платный Serper+LLM lookup.
+        context_mpn = (context.mpn.strip() if context and context.mpn else "")
+        if context_mpn:
+            logger.info(
+                "[IceCat] using context.mpn='%s' for brand='%s' (skip heuristics + LLM lookup)",
+                context_mpn, brand,
+            )
+            result = await self._fetch_features(brand, context_mpn)
+            if result == "403":
+                closed_brands[brand] += 1
+                logger.info(
+                    "[IceCat] 403 brand='%s' — Full IceCat only (не в Open tier)",
+                    brand,
+                )
+                return "403"
+            if isinstance(result, list):
+                open_brands[brand] += 1
+                logger.info(
+                    "[IceCat] 200 brand='%s' mpn='%s' → %d features (via context.mpn)",
+                    brand, context_mpn, len(result),
+                )
+                return result
+            # 404 на context.mpn — продолжаем эвристический поиск как fallback
+            logger.debug(
+                "[IceCat] 404 на context.mpn='%s', продолжаем эвристический поиск",
+                context_mpn,
+            )
+
         # Генерируем кандидатов по многоуровневой стратегии
         candidates = _build_code_candidates(product_name, brand)
         if not candidates:

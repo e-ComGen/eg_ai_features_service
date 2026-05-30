@@ -2,19 +2,26 @@
 
 2 LLM calls:
 1. VisionProducer (Gemini 2.5 Flash) → текстовое описание видимого на фото
-2. Extraction LLM (DeepSeek) → AttributeValue list из этого текста
+2. Extraction LLM (DeepSeek) → AttributeValue list + identifiers (MPN/EAN/article) из этого текста
 
 Применим для visual attributes (цвет, материал по виду, форма). Не применим
 для невидимых свойств (вес, состав, мощность).
 
+Identifier enrichment: если на фото виден MPN/EAN/article на коробке/наклейке —
+извлекаем и обогащаем ExtractionContext, чтобы downstream sources (IceCat / PDF /
+WebSearch) могли использовать точный код вместо угадывания через LLM.
+
 Spec: docs/architecture/pipeline.md, section "Stage 3 / VisionSource".
 """
+import logging
 from typing import Optional
 from pydantic import BaseModel, Field, AliasChoices
 from app.services.enrichment.base import (
     AttributeSource, AttributeValue, TargetAttribute, ExtractionContext,
     Source, LlmJudge,
 )
+
+logger = logging.getLogger(__name__)
 from app.services.providers.structured_adapter import StructuredLlmManager
 from app.services.providers.factory import get_main_manager
 from app.services.enrichment.vision_producer import VisionProducer
@@ -27,10 +34,17 @@ from app.services.enrichment.strategies.base import MarketplaceStrategy
 from app.services.enrichment.strategies.default_strategy import DefaultStrategy
 
 
-# Semantic types которые можно извлечь визуально.
+# Semantic types которые можно извлечь визуально — УЗКИЙ whitelist.
+# В v10b расширили список (+brand/model/article/certification/etc) — Vision начал
+# давать 67 fills (vs 4), но они **неточные** (Vision видит фото чужой brand_line
+# модели от OzonCard, переносит её спеки на наш товар → coverage required упал
+# с 88.8% до 81.2%). Возвращаем к атрибутам которые НЕ model-specific
+# (цвет/материал/форма видны и для похожей модели той же линейки — там обычно
+# одинаковые).
 VISUAL_SEMANTIC_TYPES = {
-    "color", "material_visual", "shape", "form_factor",
-    "visible_size", "visible_label", "pattern", "texture",
+    "color", "material_visual", "shape",
+    "pattern", "texture",
+    "indicator", "lighting",
 }
 
 
@@ -42,8 +56,24 @@ class _VisionExtractedAttr(BaseModel):
     evidence: Optional[str] = Field(None, description="что на фото подтверждает")
 
 
+class _VisionIdentifiers(BaseModel):
+    """Идентификаторы прочитанные с этикетки/коробки на фото.
+
+    Используются для обогащения ExtractionContext: даёт downstream sources
+    (IceCat, PDF datasheet, WebSearch) точный код вместо guess через LLM.
+    Все поля опциональны — заполняются только если ЯВНО видны на фото.
+    """
+    mpn: Optional[str] = Field(None, description="Manufacturer Part Number с наклейки/коробки")
+    ean: Optional[str] = Field(None, description="EAN/UPC barcode digits с упаковки")
+    article: Optional[str] = Field(None, description="Артикул производителя")
+
+
 class _VisionExtractionResponse(BaseModel):
     extracted: list[_VisionExtractedAttr]
+    identifiers: Optional[_VisionIdentifiers] = Field(
+        None,
+        description="Идентификаторы прочитанные с фото для обогащения context (MPN/EAN/article)"
+    )
 
 
 class VisionSource(AttributeSource):
@@ -65,12 +95,19 @@ class VisionSource(AttributeSource):
         return Source.VISION
 
     def is_applicable(self, context: ExtractionContext, target: TargetAttribute) -> bool:
-        """Применим если есть image_urls И целевой attribute визуально определяем."""
+        """Применим если есть image_urls И целевой attribute не numeric.
+
+        Semantic types это hint а не whitelist: пробуем все non-numeric attrs
+        когда есть фото, judge отфильтрует мусор. Это даёт vision доступ к
+        package labels (80 PLUS, бренд, страна, артикул, гарантия).
+        """
         if not context.image_urls:
             return False
-        # Filter by semantic_type если задан
-        if target.semantic_type and target.semantic_type not in VISUAL_SEMANTIC_TYPES:
+        # Numeric targets — vision plохо измеряет числа без референса.
+        if target.type == "numeric":
             return False
+        # Semantic type — hint: если задан и явно визуальный, ok; если задан
+        # но не визуальный, всё равно пробуем (judge решит).
         return True
 
     async def extract(
@@ -109,7 +146,13 @@ class VisionSource(AttributeSource):
             "You extract visual attributes from a description of what's visible on product photos. "
             "Only include attributes that are CLEARLY visible. If unsure, skip. "
             "Evidence should quote the relevant phrase from the vision description. "
-            "If the target has is_collection=true, return a JSON array of values; otherwise a single scalar."
+            "If the target has is_collection=true, return a JSON array of values; otherwise a single scalar.\n\n"
+            "IDENTIFIERS: if the vision description explicitly mentions a Manufacturer Part Number "
+            "(MPN, format like MPE-7501-AFAAG / R-PK650D-FA0B-EU / 90YE00A4-B0NA00), an EAN/UPC "
+            "barcode (12-13 digits), or an article number (артикул) read from a product label / "
+            "sticker / box, populate the top-level 'identifiers' object: "
+            "{mpn: '...', ean: '...', article: '...'}. Only include identifiers clearly transcribed "
+            "from the photo (mentioned in the vision description). Otherwise omit them or set to null."
             + build_meta_guidance()
             + already_rule
         )
@@ -117,7 +160,9 @@ class VisionSource(AttributeSource):
             f"Vision description (from product photos):\n{vision_text}\n\n"
             + already_preamble
             + f"Target attributes (visual):\n{targets_block}\n\n"
-            f"Return JSON with 'extracted' list of {{attribute_id, value, confidence, evidence}}."
+            "Return JSON with two fields: "
+            "'extracted' — list of {attribute_id, value, confidence, evidence}; "
+            "'identifiers' — optional object {mpn, ean, article} with codes read from photo (may be null)."
         )
 
         response_model = self._strategy.build_response_model(_VisionExtractionResponse, targets)
@@ -129,6 +174,26 @@ class VisionSource(AttributeSource):
         if parsed is None:
             return []
         context.llm_calls_so_far += 1
+
+        # Обогащаем ExtractionContext идентификаторами прочитанными с фото.
+        # Не перезаписываем уже заданные значения (вышестоящие sources имеют приоритет).
+        identifiers = getattr(parsed, "identifiers", None)
+        if identifiers is not None:
+            enriched: list[str] = []
+            mpn_val = (identifiers.mpn or "").strip() if identifiers.mpn else ""
+            if mpn_val and not context.mpn:
+                context.mpn = mpn_val
+                enriched.append(f"mpn={mpn_val}")
+            ean_val = (identifiers.ean or "").strip() if identifiers.ean else ""
+            if ean_val and not context.ean:
+                context.ean = ean_val
+                enriched.append(f"ean={ean_val}")
+            article_val = (identifiers.article or "").strip() if identifiers.article else ""
+            if article_val and not context.article:
+                context.article = article_val
+                enriched.append(f"article={article_val}")
+            if enriched:
+                logger.info("[Vision] context enrich: %s", ", ".join(enriched))
 
         target_by_id = {t.id: t for t in targets}
         return [

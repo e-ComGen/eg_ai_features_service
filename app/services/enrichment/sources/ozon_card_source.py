@@ -79,6 +79,14 @@ _FEATURES_STATE_RE = re.compile(
     r'<div\s+id="state-webCharacteristics-[^"]+"\s+data-state=\'([^\']+)\'',
     re.DOTALL,
 )
+# Product photos на /features/ странице — `<img src="https://ir.ozone.ru/s3/multimedia-X/wcY/...jpg">`.
+# wc1200 = высокое разрешение (1200px) — нужно для Vision LLM. Берём первые ~5 уникальных
+# (товар обычно имеет 5-15 фото — front/back/side/box/detail). Vision дополнит attrs
+# которые сложно достать из текста: цвет, RGB-подсветка, форм-фактор SFX vs ATX.
+_OZON_IMAGE_RE = re.compile(
+    r'<img[^>]+src="(https://ir(?:-\d+)?\.ozone\.ru/[^"]+\.(?:jpg|jpeg|png|webp))"',
+    re.IGNORECASE,
+)
 
 # Confidence.
 # brand_line conf=0.85 — ровно на pipeline `filter_already_filled_targets`
@@ -485,6 +493,23 @@ class OzonCardSource(AttributeSource):
                 logger.info("[OzonCard] no characteristics в /features/ for pid=%s", pid)
                 return []
 
+            # ---- IMAGES (для downstream VisionSource) ----
+            # Mutating context.image_urls — pipeline передаёт context по ссылке
+            # между stages, поэтому Stage 3 (VisionSource) увидит эти фотки
+            # на товарах где OzonCard нашёл tile. Vision дополнит «визуальные»
+            # attrs (цвет, RGB-подсветка, форм-фактор) которые сложно достать
+            # из текста характеристик.
+            new_image_urls = self._extract_image_urls(features_html)
+            if new_image_urls:
+                existing = set(context.image_urls or [])
+                added = [u for u in new_image_urls if u not in existing]
+                if added:
+                    context.image_urls = list(context.image_urls or []) + added
+                    logger.info(
+                        "[OzonCard] +%d image URLs для VisionSource (pid=%s)",
+                        len(added), pid,
+                    )
+
             # ---- MAP & EMIT ----
             return self._map_characteristics(
                 chars, targets, context, mode, title, top_score,
@@ -526,6 +551,29 @@ class OzonCardSource(AttributeSource):
             if not title or len(title) < 15:
                 continue
             out.append({"title": title[:200], "slug": info["slug"], "pid": pid})
+        return out
+
+    @staticmethod
+    def _extract_image_urls(html: str, limit: int = 5) -> list[str]:
+        """Извлекает URL'ы фоток товара из Ozon /features/ HTML.
+
+        Возвращает первые `limit` уникальных high-res URL'ов. Vision LLM
+        обычно достаточно 3-5 фоток (front/back/box) — больше = дороже без
+        прироста. Дедупим по basename файла (один товар имеет ту же фотку
+        в нескольких разрешениях wc50/wc300/wc1200).
+        """
+        seen_basenames: set[str] = set()
+        out: list[str] = []
+        for m in _OZON_IMAGE_RE.finditer(html):
+            url = m.group(1)
+            # Dedup по imagename (https://ir.ozone.ru/s3/multimedia-X/wc1200/{filename})
+            basename = url.rsplit("/", 1)[-1].split("?", 1)[0]
+            if basename in seen_basenames:
+                continue
+            seen_basenames.add(basename)
+            out.append(url)
+            if len(out) >= limit:
+                break
         return out
 
     @classmethod

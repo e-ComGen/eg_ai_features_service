@@ -78,12 +78,15 @@ class WebSearchSource(AttributeSource):
         if not effective_targets:
             return []
 
-        # Step 1+2: search + summary (cached per product)
+        # Step 1+2: search + summary (cached per product).
+        # MPN передаётся первым в search query — точный код производителя имеет
+        # наивысший signal-to-noise (Vision может обогатить context.mpn из фото).
         if context.product_id not in self._summary_cache:
             summary = await self._search.produce_summary(
                 product_name=context.product_name,
                 brand=context.brand,
                 ean=context.ean,
+                mpn=context.mpn,
             )
             self._summary_cache[context.product_id] = summary
             # WebSearchProducer делает 1 LLM call внутри + Serper search

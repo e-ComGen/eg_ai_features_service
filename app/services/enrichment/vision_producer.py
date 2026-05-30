@@ -19,7 +19,8 @@ from app.services.providers.base import LlmProvider
 logger = logging.getLogger(__name__)
 
 # Hard limit: cost / latency control.  Vision tokens are expensive.
-MAX_IMAGES = 4
+# 5 covers OzonCardSource which yields up to 5 image URLs per product.
+MAX_IMAGES = 5
 
 _VISION_SYSTEM_PROMPT = (
     "You are a meticulous product analyst. "
@@ -28,7 +29,19 @@ _VISION_SYSTEM_PROMPT = (
     "(only if a reference object is visible), any visible text / markings / logos, "
     "and the product's visible condition. "
     "Be concise and factual — no marketing language, no assumptions beyond what is "
-    "visually evident."
+    "visually evident.\n\n"
+    "For electronics/computer products: read box labels (80 PLUS certifications, model "
+    "numbers, manufacturer info, country of origin, warranty period, barcodes/EAN). "
+    "Count visible connectors on the product (modular cable bay). Identify form factor "
+    "by physical dimensions (ATX/SFX/TFX). Note RGB lighting effects. Transcribe ALL "
+    "visible text and logos verbatim — package text IS visual evidence.\n\n"
+    "IDENTIFIERS — CRITICAL: If you can see a product label, sticker, or box with: "
+    "MPN (manufacturer part number, format like MPE-7501-AFAAG / R-PK650D-FA0B-EU / "
+    "90YE00A4-B0NA00), EAN/UPC barcode digits (12-13 numeric digits under a barcode), "
+    "or article number (артикул) — explicitly mention each one labelled in your output, "
+    "e.g. 'MPN: MPE-7501-AFAAG', 'EAN: 4710562760552', 'Article: 90YE00A4-B0NA00'. "
+    "Only include identifiers that you can clearly read/transcribe directly from the photo — "
+    "do not guess. If no identifier is visible, do not invent one."
 )
 
 _VISION_USER_TEMPLATE = (
@@ -134,7 +147,7 @@ class VisionProducer:
                         messages=messages,
                         model=self._model,
                         temperature=0.1,
-                        max_tokens=512,
+                        max_tokens=1024,
                         timeout=timeout,
                     ),
                     timeout=timeout,
@@ -147,7 +160,7 @@ class VisionProducer:
                         model=self._model,
                         messages=messages,
                         temperature=0.1,
-                        max_tokens=512,
+                        max_tokens=1024,
                     ),
                     timeout=timeout,
                 )

@@ -132,7 +132,7 @@ async def test_extract_403_returns_empty_and_logs_brand():
     """Мокнутый 403 → graceful [] без исключений, бренд попадает в closed_brands."""
     source = IceCatSource(email="x", token="y")
     # Мокаем _search_and_fetch чтобы вернуть "403" и также обновить closed_brands
-    async def _mock_search_403(brand, product_name):
+    async def _mock_search_403(brand, product_name, context=None):
         closed_brands[brand] += 1
         return "403"
     source._search_and_fetch = _mock_search_403
