@@ -27,10 +27,13 @@ from pydantic import BaseModel, model_validator
 from app.services.enrichment.prompt_router import classify_target
 
 
-# Cross-fill rules: если src_attr заполнен, а dst_attr пуст — копируем значение.
-# Используется в post_process_values для zero-LLM дозаливки атрибутов-дубликатов.
-_OZON_CROSSFILL: tuple[tuple[int, int], ...] = (
-    (4381, 9024),  # Партномер → Код продавца
+# Cross-fill rules: пары (id_a, id_b) — одно и то же значение под двумя именами.
+# post_process_values копирует в ОБОИХ направлениях: если одна сторона заполнена,
+# а другая пуста — заполняем пустую. Не перетирает уже заполненное.
+_OZON_CROSSFILL_PAIRS: tuple[tuple[int, int], ...] = (
+    (4381, 9024),   # Партномер ↔ Код продавца (MPN)
+    (9048, 12141),  # Название модели (для объединения в одну карточку) ↔
+                    # Название модели для шаблона наименования
 )
 
 # Confidence для значений, проставленных детерминированно (CategoryDefaults / cross-fill).
@@ -124,6 +127,13 @@ class OzonStrategy(MarketplaceStrategy):
 
         _constraints = enum_constraints  # замыкание в validator
 
+        # Индекс для case-insensitive нормализации: {attr_id: {lower_stripped_canonical: canonical}}
+        # Позволяет найти точную каноническую строку из словаря по любому регистру/пробелу.
+        _canonical_index: dict[int, dict[str, str]] = {
+            attr_id: {v.strip().lower(): v for v in allowed}
+            for attr_id, allowed in _constraints.items()
+        }
+
         class _ConstrainedModel(base_model):  # type: ignore[valid-type]
             @model_validator(mode="after")
             def _enforce_allowed_values(self):
@@ -137,20 +147,33 @@ class OzonStrategy(MarketplaceStrategy):
                     attr_id = getattr(item, "attribute_id", None)
                     if attr_id not in _constraints:
                         continue
-                    allowed = _constraints[attr_id]
+                    canon_map = _canonical_index[attr_id]
                     raw_value = getattr(item, "value", None)
                     # Проверяем скаляр или список (is_collection)
                     if isinstance(raw_value, list):
-                        bad = [str(v) for v in raw_value if str(v) not in allowed]
+                        normalized: list[str] = []
+                        bad: list[str] = []
+                        for v in raw_value:
+                            key = str(v).strip().lower()
+                            if key in canon_map:
+                                normalized.append(canon_map[key])
+                            else:
+                                bad.append(str(v))
                         if bad:
                             raise ValueError(
-                                f"attr_id={attr_id}: values {bad} not in allowed list {sorted(allowed)}"
+                                f"attr_id={attr_id}: values {bad} not in allowed list"
                             )
+                        # Нормализуем к каноническим значениям из словаря
+                        item.value = normalized
                     else:
-                        if raw_value is not None and str(raw_value) not in allowed:
-                            raise ValueError(
-                                f"attr_id={attr_id}: value {raw_value!r} not in allowed list {sorted(allowed)}"
-                            )
+                        if raw_value is not None:
+                            key = str(raw_value).strip().lower()
+                            if key not in canon_map:
+                                raise ValueError(
+                                    f"attr_id={attr_id}: value {raw_value!r} not in allowed list"
+                                )
+                            # Нормализуем к канонической форме из словаря
+                            item.value = canon_map[key]
                 return self
 
         _ConstrainedModel.__name__ = f"Constrained_{base_model.__name__}"
@@ -349,25 +372,32 @@ class OzonStrategy(MarketplaceStrategy):
                     existing_ids.add(attr_id)
                 break
 
-        # (C) Cross-fill: src→dst если dst пуст
-        values_by_id: dict[int, AttributeValue] = {v.attribute_id: v for v in values}
-        for src_id, dst_id in _OZON_CROSSFILL:
-            if dst_id in existing_ids or dst_id not in target_ids:
-                continue
-            src_av = values_by_id.get(src_id)
-            if src_av is None or src_av.value is None:
-                continue
-            av = AttributeValue(
-                attribute_id=dst_id,
-                value=src_av.value,
-                confidence=_DEFAULT_CONFIDENCE,
-                source=Source.DESCRIPTION,
-                evidence=f"cross-fill from attr {src_id}",
-            )
-            # Резолвим value_id для cross-fill тоже (если дубликат-атрибут enum).
-            self.resolve_value_ids(av, context)
-            extras.append(av)
-            existing_ids.add(dst_id)
+        # (C) Cross-fill: для каждой пары (id_a, id_b) копируем в обе стороны.
+        # values_by_id включает и оригинальные values, и extras добавленные на шагах A/B,
+        # чтобы cross-fill видел атрибуты проставленные defaults.
+        values_by_id: dict[int, AttributeValue] = {
+            v.attribute_id: v for v in list(values) + extras
+        }
+        for id_a, id_b in _OZON_CROSSFILL_PAIRS:
+            for src_id, dst_id in ((id_a, id_b), (id_b, id_a)):
+                if dst_id in existing_ids or dst_id not in target_ids:
+                    continue
+                src_av = values_by_id.get(src_id)
+                if src_av is None or src_av.value is None:
+                    continue
+                av = AttributeValue(
+                    attribute_id=dst_id,
+                    value=src_av.value,
+                    confidence=src_av.confidence,
+                    source=src_av.source,
+                    evidence="cross-fill",
+                )
+                # Резолвим value_id для cross-fill тоже (если дубликат-атрибут enum).
+                self.resolve_value_ids(av, context)
+                extras.append(av)
+                existing_ids.add(dst_id)
+                # Обновляем индекс чтобы не заполнять dst ещё раз если пара встретится снова
+                values_by_id[dst_id] = av
 
         return list(values) + extras
 
