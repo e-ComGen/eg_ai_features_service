@@ -157,46 +157,6 @@ _BRAND_LINE_BLACKLIST: frozenset[str] = frozenset(name.lower() for name in {
     "ID карточки",
 })
 
-# Brand-line STRICT WHITELIST — главный фильтр для brand_line режима.
-#
-# Threshold 75-77 (brand_line) означает «близкая модель того же бренда, но
-# НЕ тот же товар». Spec attrs (Мощность, Длина/Ширина/Высота, Кол-во SATA/
-# Molex, Гарантия, Сертификат 80 PLUS, Подсветка, Разъёмы) — модель-
-# специфичны и копирование их с соседней модели = галлюцинация.
-#
-# Безопасны для копирования с brand-line карточки только brand-/линейка-
-# уровневые атрибуты: бренд, производитель, страна-изготовитель, цвет,
-# ТН ВЭД (классификация на уровне типа товара), назначение.
-#
-# Применяется case-insensitive substring match: char_name из Ozon-карточки
-# проходит если ЛЮБОЙ entry из whitelist встречается как substring в нём
-# (например «Цвет товара» → match «цвет товара», «Цвет товара (основной)»).
-#
-# Exact режим (≥78) не использует whitelist — копируется всё.
-_BRAND_LINE_STRICT_WHITELIST: frozenset[str] = frozenset(name.lower() for name in {
-    # Brand/manufacturer (как было)
-    "Бренд",
-    "Производитель",
-    "Страна-изготовитель",
-    # Color/appearance (как было)
-    "Цвет товара",
-    # Classification (как было)
-    "ТН ВЭД",
-    "Назначение",
-    # NEW Phase 2 #1: brand-line-safe spec attrs.
-    # Эти атрибуты одинаковы в продуктовой линейке бренда независимо от
-    # конкретной модели (Phase 1 #5 recovery: вернули 30+ valid OzonCard
-    # fills для Zalman/Deepcool/FSP — гарантия/PFC/охлаждение/80PLUS
-    # фактически brand-line-уровневые, а не модель-специфичные).
-    "Гарантия",                              # одинакова в брендовой линейке
-    "Гарантийный срок",                      # синоним «Гарантии»
-    "Подсветка",                             # enum-based на дизайне линейки
-    "Оплётка проводов",                      # одинакова в продуктовом классе
-    "Сертификат 80 PLUS",                    # часто одинаков (Bronze/Gold/Platinum)
-    "Корректор коэффициента мощности (PFC)", # 99% Активный для современных БП
-    "Система охлаждения",                    # 95% Активная (с вентилятором)
-    "Тип",                                   # «Блок питания компьютера» по умолчанию
-})
 
 # Generic-префиксы — универсальные слова, которые срезаются как fallback
 # (когда category_name не задан или не покрывает случай)
@@ -1278,21 +1238,14 @@ class OzonCardSource(AttributeSource):
             char_val = c["value"].strip()
             char_name_low = char_name.lower()
 
-            # brand_line: STRICT WHITELIST — копируем ТОЛЬКО brand-/линейка-
-            # уровневые атрибуты (бренд, цвет, страна, ТН ВЭД, назначение).
-            # Spec attrs (мощность, размеры, кол-во разъёмов, гарантия,
-            # сертификат 80 PLUS, подсветка) — модель-специфичны и брать
-            # их с соседней модели = галлюцинация. Whitelist match —
-            # case-insensitive substring (любой entry из whitelist должен
-            # встречаться как substring в char_name_low). BLACKLIST остаётся
-            # дополнительным фильтром (страховка от Артикул/MPN/EAN если они
-            # случайно проходят whitelist substring match).
+            # brand_line: пропускаем ТОЛЬКО numeric-атрибуты (мощность,
+            # размеры, объём и т.п. — модель-специфичны, брать с соседней
+            # модели = галлюцинация). enum/text/bool (бренд, цвет, материал,
+            # состав, сезон, гарантия, ...) — безопасны: они одинаковы в
+            # рамках бренд-линейки и merger/judge отфильтруют чужое.
+            # BLACKLIST (артикул/MPN/EAN) остаётся — страховка во всех режимах.
             if mode == "brand_line":
                 if char_name_low in _BRAND_LINE_BLACKLIST:
-                    continue
-                if not any(
-                    allowed in char_name_low for allowed in _BRAND_LINE_STRICT_WHITELIST
-                ):
                     continue
 
             # 1) Exact lowercase match
@@ -1317,6 +1270,13 @@ class OzonCardSource(AttributeSource):
             target = target_by_id.get(target_id)
             if target is None:
                 continue
+
+            # brand_line: skip numeric targets — они модель-специфичны
+            # (мощность/объём/размеры) и взятые с соседней модели = галлюцинация.
+            # enum/text/bool пропускаем без ограничений: merger/judge отфильтруют.
+            if mode == "brand_line" and target.type == "numeric":
+                continue
+
             used_ids.add(target_id)
 
             # value_id через ozon_loader

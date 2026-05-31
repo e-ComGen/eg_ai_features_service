@@ -97,28 +97,24 @@ def api_headers() -> dict[str, str]:
     }
 
 
-def fetch_values(
+def _fetch_values_page(
     client: httpx.Client,
     cat_id: int,
     type_id: int,
     attr_id: int,
+    last_value_id: int,
 ) -> tuple[list[dict], bool] | None:
-    """Fetch first page of allowed values for (cat_id, type_id, attr_id).
-
-    Returns:
-        (values_list, has_next) — may be ([], False) for dict-backed attr with 0 values
-        None                    — not dict-backed for this (cat, type) pair (404/400)
-    """
+    """Fetch ONE page of values.  Returns (vals, has_next) or None on error/not-dict-backed."""
     payload = {
         "description_category_id": cat_id,
         "type_id": type_id,
         "attribute_id": attr_id,
         "language": "DEFAULT",
-        "last_value_id": 0,
+        "last_value_id": last_value_id,
         "limit": VALUES_PAGE_LIMIT,
     }
 
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             r = client.post(
                 f"{BASE_URL}/v1/description-category/attribute/values",
@@ -141,17 +137,76 @@ def fetch_values(
             return None  # not dict-backed for this (cat, type)
 
         if r.status_code == 429:
-            if attempt == 0:
-                log.warning("  429 for (%d,%d,%d), sleep 5s...", cat_id, type_id, attr_id)
-                time.sleep(5)
-                continue
-            log.error("  429 after retry for (%d,%d,%d), skip", cat_id, type_id, attr_id)
-            return None
+            wait = 5 * (attempt + 1)
+            log.warning("  429 for (%d,%d,%d), sleep %ds...", cat_id, type_id, attr_id, wait)
+            time.sleep(wait)
+            continue
 
         log.warning("  HTTP %d for (%d,%d,%d): %s", r.status_code, cat_id, type_id, attr_id, r.text[:200])
         return None
 
     return None
+
+
+def fetch_values(
+    client: httpx.Client,
+    cat_id: int,
+    type_id: int,
+    attr_id: int,
+) -> tuple[list[dict], bool] | None:
+    """Fetch ALL pages of allowed values for (cat_id, type_id, attr_id).
+
+    Paginates via last_value_id until has_next=False.  Always returns the
+    complete list so values_truncated is never set for a fully-fetched attr.
+
+    Returns:
+        (values_list, False)  — complete list, has_next always False after full fetch
+        None                  — not dict-backed for this (cat, type) pair (404/400)
+    """
+    all_vals: list[dict] = []
+    last_value_id = 0
+    page = 0
+
+    while True:
+        page += 1
+        result = _fetch_values_page(client, cat_id, type_id, attr_id, last_value_id)
+
+        if result is None:
+            if page == 1:
+                return None  # not dict-backed (first page returned 400/404)
+            # Mid-pagination error: return what we have so far (truncated)
+            log.warning(
+                "  Mid-pagination error at page %d for (%d,%d,%d); returning %d values so far",
+                page, cat_id, type_id, attr_id, len(all_vals),
+            )
+            return all_vals, True  # mark truncated so caller knows it's incomplete
+
+        page_vals, has_next = result
+        all_vals.extend(page_vals)
+        log.debug(
+            "    page %d: +%d vals (total %d), has_next=%s, last_value_id=%d",
+            page, len(page_vals), len(all_vals), has_next,
+            page_vals[-1]["id"] if page_vals else last_value_id,
+        )
+
+        if not has_next:
+            break  # full list received
+
+        if not page_vals:
+            # Safety: has_next=True but empty page → avoid infinite loop
+            log.warning("  Empty page with has_next=True for (%d,%d,%d); stopping", cat_id, type_id, attr_id)
+            break
+
+        last_value_id = page_vals[-1]["id"]
+        time.sleep(RATE_LIMIT_SLEEP)  # polite inter-page delay
+
+    if page > 1:
+        log.info(
+            "    Paginated %d pages → %d total values for attr_id=%d",
+            page, len(all_vals), attr_id,
+        )
+
+    return all_vals, False  # False = complete, not truncated
 
 
 # ---------------------------------------------------------------------------

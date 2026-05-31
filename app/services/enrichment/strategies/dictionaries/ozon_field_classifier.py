@@ -6,7 +6,7 @@ Platform fields (return True) are those that:
   - have type == "URL"                         → document/image links
   - have a values dict                         → False (dict field = extractable)
   - otherwise: match a platform-instruction
-    pattern in the Ozon API's own description.
+    pattern in the Ozon API's own description OR a high-precision name pattern.
 
 Real char schema (ozon_seller_api, schema_version 2):
   {"id": int, "name": str, "type": str,
@@ -27,7 +27,7 @@ description. Ambiguous broad words (видео / оптом / маркетинг
 were removed on purpose — better to under-exclude (honest number stays a lower
 bound) than to over-exclude (overstate coverage / risk dropping real fields).
 
-High-precision signals only:
+High-precision signals only (description-based):
   https?://           — external URL in the seller instruction
   mp4 | mov           — video file formats (video cover / main video fields)
   json                — JSON-encoded rich-content block
@@ -36,6 +36,14 @@ High-precision signals only:
   соцсет              — "как в соцсетях" (hashtag field metaphor)
   rich-контент        — explicit rich-content label
   заводск.*упаковок   — factory-packaging count (logistics, not a spec)
+
+High-precision name-based signals (_PLATFORM_NAME_RE):
+  озон.видео          — «Озон.Видео: название» (video platform title field)
+  объединить в похожие — «Объединить в похожие товары» (grouping field;
+                          NOT «Объединить на одной карточке» which is required
+                          and already guarded by is_required → False)
+  уеи                 — «Количество товара в УЕИ» (unit-of-item logistics)
+  нескольких упаковк  — «Планирую доставлять товар в нескольких упаковках»
 """
 from __future__ import annotations
 import re
@@ -53,16 +61,30 @@ _PLATFORM_DESC_RE = re.compile(
     re.IGNORECASE,
 )
 
+# High-precision patterns matched against the field *name* (not description).
+# Each pattern is chosen to be unambiguous: it cannot appear in a real
+# extractable characteristic name. Guard: is_required → False is applied
+# BEFORE this regex, so «Объединить на одной карточке» (required) is safe.
+_PLATFORM_NAME_RE = re.compile(
+    r"(озон\.видео"
+    r"|объединить в похожие"
+    r"|\bуеи\b"
+    r"|нескольких упаковк"
+    r")",
+    re.IGNORECASE,
+)
+
 
 def is_platform_field(char: dict) -> bool:
     """Return True if *char* is a non-extractable platform/manual field.
 
     REPORTING ONLY — never use to filter pipeline targets (see module docstring).
 
-    Conservative criteria (no field-name matching):
+    Conservative criteria:
     - is_required               → NEVER platform (hard guard, required is real work)
     - type == "URL"             → platform (link-only entry, nothing to extract)
     - has values list           → has dictionary → LLM can resolve → False
+    - name matches _PLATFORM_NAME_RE → high-precision name signal
     - else description matches  → high-precision platform signal in Ozon's text
     """
     if char.get("is_required"):  # required is never a manual-only field
@@ -71,5 +93,8 @@ def is_platform_field(char: dict) -> bool:
         return True
     if char.get("values"):  # non-empty dictionary → extractable
         return False
+    name: str = char.get("name") or ""
+    if _PLATFORM_NAME_RE.search(name):
+        return True
     desc: str = char.get("description") or ""
     return bool(_PLATFORM_DESC_RE.search(desc))
