@@ -90,6 +90,13 @@ _OZON_IMAGE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Штраф за несовпадение типа товара в tile-заголовке.
+# Применяется к тайлам ТОЛЬКО когда нет model-токенов (артикулов) в query —
+# т.е. типично для одежды («Куртка The North Face Resolve») где тип = ключевой
+# дискриминатор. Для электроники с артикулом (WH-1000XM5, RTX 4060) штраф
+# НЕ срабатывает: артикул уже уникален, тип «Наушники» vs «Колонка» не нужен.
+_TYPE_MISMATCH_PENALTY = 30.0
+
 # Confidence.
 # brand_line conf=0.85 — ровно на pipeline `filter_already_filled_targets`
 # threshold 0.85, чтобы OzonCard fills попадали в filled_so_far и AttributeMerger
@@ -823,7 +830,7 @@ class OzonCardSource(AttributeSource):
                 "stage": "no_tiles",
             }
 
-        top_tile, top_score = self._pick_best_match(query, tiles[:_MAX_SEARCH_TILES])
+        top_tile, top_score = self._pick_best_match(query, tiles[:_MAX_SEARCH_TILES], category_leaf=cat_leaf)
         mode = self._classify_match(top_score) if top_tile is not None else "skip"
 
         if top_tile is None or mode == "skip":
@@ -1148,6 +1155,7 @@ class OzonCardSource(AttributeSource):
     def _pick_best_match(
         query: str,
         tiles: list[dict],
+        category_leaf: Optional[str] = None,
     ) -> tuple[Optional[dict], float]:
         """Top-1 по rapidfuzz (partial_ratio + token_sort_ratio averaged).
 
@@ -1155,6 +1163,11 @@ class OzonCardSource(AttributeSource):
         чтобы точные совпадения модели (EC685.M, WH-1000XM5 и т.п.)
         не тонули из-за описательных слов в tile-title.
         Соседние модели (M90 vs M902S, 4624 vs 4621) бонуса не получают.
+
+        Штраф _TYPE_MISMATCH_PENALTY за несовпадение типа товара:
+        если category_leaf задан И в query нет model-токенов (одежда без
+        артикула) И category_leaf отсутствует в tile-title → score -= 30.
+        Для электроники с артикулом штраф не применяется.
         """
         try:
             from rapidfuzz import fuzz
@@ -1166,6 +1179,7 @@ class OzonCardSource(AttributeSource):
         best_tile: Optional[dict] = None
         best_score = 0.0
         q = _normalize_for_fuzzy(query)
+        cat_leaf_low = category_leaf.strip().lower() if category_leaf else None
         for tile in tiles:
             title = (tile.get("title") or "").strip()
             if not title:
@@ -1175,6 +1189,13 @@ class OzonCardSource(AttributeSource):
             # Бонус: есть хотя бы один общий артикул-токен → точное совпадение модели
             if q_models and q_models & _extract_model_tokens(title):
                 score += _MODEL_BONUS
+            # Штраф за тип товара: только для товаров без артикула (одежда)
+            # и когда тип (category_leaf) отсутствует в заголовке тайла.
+            # Пример: query «Куртка The North Face» + tile «Шорты The North Face» →
+            #   cat_leaf_low «куртка» не входит в «шорты the north face» → штраф.
+            # Для электроники с артикулом (q_models непустое) штраф не срабатывает.
+            if cat_leaf_low and not q_models and cat_leaf_low not in title.lower():
+                score -= _TYPE_MISMATCH_PENALTY
             if score > best_score:
                 best_score = score
                 best_tile = tile
