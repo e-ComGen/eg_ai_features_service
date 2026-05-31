@@ -189,39 +189,93 @@ _BRAND_LINE_STRICT_WHITELIST: frozenset[str] = frozenset(name.lower() for name i
     "Тип",                                   # «Блок питания компьютера» по умолчанию
 })
 
-# Generic-префиксы которые срезаются при нормализации для cache key
+# Generic-префиксы — универсальные слова, которые срезаются как fallback
+# (когда category_name не задан или не покрывает случай)
 _GENERIC_PREFIXES = (
     "блок питания", "блок", "питания",
     "power supply", "power", "supply", "unit",
 )
 
 
-def _compress_search_query(product_name: str, brand: Optional[str], max_tokens: int = 5) -> str:
-    """Сжимает product_name для Ozon search.
+def _strip_category_prefix(text: str, category_name: Optional[str]) -> str:
+    """Срезает ведущие слова категории из начала text (case-insensitive).
+
+    Алгоритм:
+      1. Попробовать совпадение с полной фразой категории (напр. «Микроволновая печь»).
+      2. Если не совпало — итеративно срезать каждое слово категории, пока
+         оно стоит в начале text. Это покрывает случай «Блок питания Cooler Master»
+         при leaf «Блок питания компьютера»: срезается «Блок», затем «питания».
+
+    Возвращает текст после среза (или исходный, если ничего не срезалось).
+    """
+    if not category_name:
+        return text
+    result = text.strip()
+    low = result.lower()
+    cat_low = category_name.strip().lower()
+
+    # Попытка 1: полная фраза
+    if low.startswith(cat_low):
+        return result[len(cat_low):].strip()
+
+    # Попытка 2: итеративный побуквенный срез слов категории
+    cat_words = [w for w in cat_low.split() if len(w) > 2]
+    for word in cat_words:
+        low = result.lower()
+        if low.startswith(word):
+            result = result[len(word):].strip()
+        # не break — пробуем следующее слово категории тоже (если оно стоит следом)
+
+    return result
+
+
+def _compress_search_query(
+    product_name: str,
+    brand: Optional[str],
+    max_tokens: int = 5,
+    category_name: Optional[str] = None,
+) -> str:
+    """Сжимает product_name для Ozon search до «бренд + модель».
 
     Ozon отдаёт пустую SPA-страницу для слишком специфичных запросов
     ("Блок питания Cooler Master MWE Gold 750 V2 Full Modular 750W ATX"
     → 10KB пустота). Нормальный SSR приходит для запросов
-    «brand + model line» (5-6 терминов).
+    «brand + model line» (3-5 терминов).
 
     Логика:
-      1. Strip leading generic prefix («Блок питания», «Power supply»).
+      1. Strip leading category prefix (из category_name, напр. «Монитор», «Наушники»).
+         Если category_name не задан — fallback на _GENERIC_PREFIXES (БП-кейс).
       2. Взять первые max_tokens токенов.
       3. Если brand задан и его нет в результате — prepend.
+
+    category_name — leaf из ExtractionContext.category_path (последний элемент).
     """
     result = product_name.strip()
-    low = result.lower()
-    for prefix in _GENERIC_PREFIXES:
-        if low.startswith(prefix):
-            result = result[len(prefix):].strip()
-            low = result.lower()
-            break
+
+    # ---- Шаг 1: срезать категорийный префикс ----
+    # Основной сигнал: имя категории из контекста (generic, без хардкода)
+    after_cat = _strip_category_prefix(result, category_name)
+    stripped = after_cat != result
+    if stripped:
+        result = after_cat
+    else:
+        # Fallback: старые _GENERIC_PREFIXES (работают как раньше для БП и похожих)
+        low = result.lower()
+        for prefix in _GENERIC_PREFIXES:
+            if low.startswith(prefix):
+                result = result[len(prefix):].strip()
+                break
+
+    # ---- Шаг 2: взять первые max_tokens токенов (бренд + модель) ----
     tokens = result.split()[:max_tokens]
     compact = " ".join(tokens).strip()
+
+    # ---- Шаг 3: если бренд не попал в начало — prepend ----
     if brand and brand.strip():
         b = brand.strip()
         if b.lower() not in compact.lower():
             compact = f"{b} {compact}".strip()
+
     return compact or product_name.strip()
 
 
@@ -478,8 +532,11 @@ class OzonCardSource(AttributeSource):
             # ультра-короткий 3-токенный fallback (часто помогает на
             # редких/старых моделях вроде «AeroCool Cylon 600W»).
             full_name = context.product_name.strip()
-            primary_query = _compress_search_query(full_name, context.brand, max_tokens=5)
-            fallback_query = _compress_search_query(full_name, context.brand, max_tokens=3)
+            # Берём leaf-имя категории (последний элемент category_path) для
+            # category-aware компрессии запроса (срезаем «Монитор», «Наушники» и т.д.)
+            cat_leaf = context.category_path[-1] if context.category_path else None
+            primary_query = _compress_search_query(full_name, context.brand, max_tokens=5, category_name=cat_leaf)
+            fallback_query = _compress_search_query(full_name, context.brand, max_tokens=3, category_name=cat_leaf)
 
             queries_to_try: list[str] = [primary_query]
             if fallback_query and fallback_query != primary_query:
