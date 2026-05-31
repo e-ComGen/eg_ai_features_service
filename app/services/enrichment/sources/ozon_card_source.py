@@ -103,7 +103,9 @@ _CONF_BRAND_LINE = 0.85
 # содержит "Блок питания + brand + model + V3 80 Plus Gold (MPE-XXX-...)", т.е.
 # много шума вокруг query "brand + model").
 _EXACT_THRESHOLD = 78.0
-_BRAND_LINE_THRESHOLD = 60.0
+_BRAND_LINE_THRESHOLD = 65.0  # v17 had 75.0 — слишком жёстко, убил 73→0 OzonCard fills.
+                              # 65 — компромисс: brand_line whitelist всё равно ограничивает
+                              # копирование model-specific attrs.
 
 # Retry: HTML < этого размера или 0 tiles → retry (Ozon **рандомно** отдаёт
 # обрезанную SPA-страницу 10KB без SSR data; та же query 2-3 попытки спустя
@@ -144,6 +146,47 @@ _BRAND_LINE_BLACKLIST: frozenset[str] = frozenset(name.lower() for name in {
     "Название модели",
     "ID товара",
     "ID карточки",
+})
+
+# Brand-line STRICT WHITELIST — главный фильтр для brand_line режима.
+#
+# Threshold 75-77 (brand_line) означает «близкая модель того же бренда, но
+# НЕ тот же товар». Spec attrs (Мощность, Длина/Ширина/Высота, Кол-во SATA/
+# Molex, Гарантия, Сертификат 80 PLUS, Подсветка, Разъёмы) — модель-
+# специфичны и копирование их с соседней модели = галлюцинация.
+#
+# Безопасны для копирования с brand-line карточки только brand-/линейка-
+# уровневые атрибуты: бренд, производитель, страна-изготовитель, цвет,
+# ТН ВЭД (классификация на уровне типа товара), назначение.
+#
+# Применяется case-insensitive substring match: char_name из Ozon-карточки
+# проходит если ЛЮБОЙ entry из whitelist встречается как substring в нём
+# (например «Цвет товара» → match «цвет товара», «Цвет товара (основной)»).
+#
+# Exact режим (≥78) не использует whitelist — копируется всё.
+_BRAND_LINE_STRICT_WHITELIST: frozenset[str] = frozenset(name.lower() for name in {
+    # Brand/manufacturer (как было)
+    "Бренд",
+    "Производитель",
+    "Страна-изготовитель",
+    # Color/appearance (как было)
+    "Цвет товара",
+    # Classification (как было)
+    "ТН ВЭД",
+    "Назначение",
+    # NEW Phase 2 #1: brand-line-safe spec attrs.
+    # Эти атрибуты одинаковы в продуктовой линейке бренда независимо от
+    # конкретной модели (Phase 1 #5 recovery: вернули 30+ valid OzonCard
+    # fills для Zalman/Deepcool/FSP — гарантия/PFC/охлаждение/80PLUS
+    # фактически brand-line-уровневые, а не модель-специфичные).
+    "Гарантия",                              # одинакова в брендовой линейке
+    "Гарантийный срок",                      # синоним «Гарантии»
+    "Подсветка",                             # enum-based на дизайне линейки
+    "Оплётка проводов",                      # одинакова в продуктовом классе
+    "Сертификат 80 PLUS",                    # часто одинаков (Bronze/Gold/Platinum)
+    "Корректор коэффициента мощности (PFC)", # 99% Активный для современных БП
+    "Система охлаждения",                    # 95% Активная (с вентилятором)
+    "Тип",                                   # «Блок питания компьютера» по умолчанию
 })
 
 # Generic-префиксы которые срезаются при нормализации для cache key
@@ -293,7 +336,9 @@ class OzonCardSource(AttributeSource):
         # Cache hit?
         if cache_key in self._cache:
             self._cache.move_to_end(cache_key)
-            return self._filter_for_targets(self._cache[cache_key], effective)
+            # Фильтруем по полному targets (не effective): already_filled атрибуты
+            # тоже должны дойти до merger-а — он выберет лучшее через consensus.
+            return self._filter_for_targets(self._cache[cache_key], targets)
 
         # Network calls
         try:
@@ -307,7 +352,9 @@ class OzonCardSource(AttributeSource):
             return []
 
         self._cache_put(cache_key, all_values)
-        return self._filter_for_targets(all_values, effective)
+        # Аналогично: фильтруем по полному targets — merger решает через consensus,
+        # а не отбрасываем уже заполненные до merger-а.
+        return self._filter_for_targets(all_values, targets)
 
     def get_judge(self) -> LlmJudge:
         return self._judge
@@ -754,12 +801,22 @@ class OzonCardSource(AttributeSource):
             char_val = c["value"].strip()
             char_name_low = char_name.lower()
 
-            # brand_line: блокируем только явно model-specific шум
-            # (Артикул/MPN/Серийник/EAN — гарантированно отличаются между
-            # моделями даже одного бренда). Всё остальное копируем — фильтр
-            # по targets+Ozon dict ниже отсечёт нерелевантные сами.
-            if mode == "brand_line" and char_name_low in _BRAND_LINE_BLACKLIST:
-                continue
+            # brand_line: STRICT WHITELIST — копируем ТОЛЬКО brand-/линейка-
+            # уровневые атрибуты (бренд, цвет, страна, ТН ВЭД, назначение).
+            # Spec attrs (мощность, размеры, кол-во разъёмов, гарантия,
+            # сертификат 80 PLUS, подсветка) — модель-специфичны и брать
+            # их с соседней модели = галлюцинация. Whitelist match —
+            # case-insensitive substring (любой entry из whitelist должен
+            # встречаться как substring в char_name_low). BLACKLIST остаётся
+            # дополнительным фильтром (страховка от Артикул/MPN/EAN если они
+            # случайно проходят whitelist substring match).
+            if mode == "brand_line":
+                if char_name_low in _BRAND_LINE_BLACKLIST:
+                    continue
+                if not any(
+                    allowed in char_name_low for allowed in _BRAND_LINE_STRICT_WHITELIST
+                ):
+                    continue
 
             # 1) Exact lowercase match
             target_id = name_to_target_id.get(char_name_low)

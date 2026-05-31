@@ -7,7 +7,7 @@
 from typing import Any, Optional, Type
 from .base import MarketplaceStrategy, ValidationResult
 from app.services.enrichment.base import (
-    AttributeValue, TargetAttribute, ExtractionContext,
+    AttributeValue, TargetAttribute, ExtractionContext, Source,
 )
 from app.services.enrichment.strategies.dictionaries.ozon_loader import (
     get_ozon_characteristics_for_type,
@@ -19,8 +19,24 @@ from app.services.enrichment.strategies.dictionaries.ozon_loader import (
 from app.services.enrichment.strategies.dictionaries.ozon_runtime_lookup import (
     search_value as _runtime_search_value,
 )
+from app.services.enrichment.strategies.dictionaries.category_defaults import (
+    CATEGORY_DEFAULTS,
+    CATEGORY_CONDITIONAL_DEFAULTS,
+)
 from pydantic import BaseModel, model_validator
 from app.services.enrichment.prompt_router import classify_target
+
+
+# Cross-fill rules: если src_attr заполнен, а dst_attr пуст — копируем значение.
+# Используется в post_process_values для zero-LLM дозаливки атрибутов-дубликатов.
+_OZON_CROSSFILL: tuple[tuple[int, int], ...] = (
+    (4381, 9024),  # Партномер → Код продавца
+)
+
+# Confidence для значений, проставленных детерминированно (CategoryDefaults / cross-fill).
+_DEFAULT_CONFIDENCE = 0.85
+# Confidence для conditional-defaults (стандарт формы-фактора — вероятный, но не гарантия).
+_CONDITIONAL_DEFAULT_CONFIDENCE = 0.70
 
 
 # Атрибуты которые Ozon требует от продавца напрямую или генерит сам
@@ -238,6 +254,122 @@ class OzonStrategy(MarketplaceStrategy):
                         reason=f"Contains banned phrase: '{phrase}'"
                     )
         return ValidationResult(is_valid=True, normalized_value=value)
+
+    def post_process_values(
+        self,
+        values: list[AttributeValue],
+        targets: list[TargetAttribute],
+        context: Optional[ExtractionContext],
+    ) -> list[AttributeValue]:
+        """Zero-LLM дозаливка: category defaults + conditional defaults + cross-fill.
+
+        Шаги:
+        1. CATEGORY_DEFAULTS[context.category_id]: добавляем для каждого attr_id,
+           который есть в targets и НЕ присутствует в values.
+        2. CATEGORY_CONDITIONAL_DEFAULTS: если в товаре найден триггер-токен (через
+           значение атрибута form_factor или product_name), проставляем стандартные
+           значения для зависимых атрибутов (напр., габариты ATX-БП = 150×140×86 мм).
+           Confidence ниже (0.70) — это «вероятный стандарт», judge/merge могут
+           перекрыть лучшим источником.
+        3. Cross-fill: для каждой пары (src, dst) из _OZON_CROSSFILL — если src
+           заполнен и dst пуст, копируем value.
+
+        Статичные правки идут с confidence=0.85, conditional — 0.70, всё с
+        source=DESCRIPTION, чтобы pipeline мог их перетрясти judge при необходимости.
+        """
+        if context is None:
+            return values
+
+        target_ids: set[int] = {t.id for t in targets}
+        existing_ids: set[int] = {v.attribute_id for v in values}
+        extras: list[AttributeValue] = []
+
+        # (A) CategoryDefaults — статичные значения категории.
+        # Структура: {attr_id: (value_text, value_id_or_None)}.
+        # Если value_id задан — пишем напрямую (минимум одна гарантия резолва);
+        # иначе вызываем resolve_value_ids чтобы найти id через ozon_loader.
+        cat_defaults = CATEGORY_DEFAULTS.get(context.category_id, {})
+        for attr_id, default_payload in cat_defaults.items():
+            if attr_id not in target_ids or attr_id in existing_ids:
+                continue
+            value_text, default_vid = default_payload
+            av = AttributeValue(
+                attribute_id=attr_id,
+                value=value_text,
+                confidence=_DEFAULT_CONFIDENCE,
+                source=Source.DESCRIPTION,
+                evidence="category default",
+            )
+            if default_vid is not None:
+                av.value_id = default_vid
+            else:
+                # Fallback: пробуем найти value_id через словарь.
+                self.resolve_value_ids(av, context)
+            extras.append(av)
+            existing_ids.add(attr_id)
+
+        # (B) Conditional defaults — зависимые от другого атрибута / названия товара.
+        # Пример: для блока питания форм-фактор ATX подразумевает стандартизированные
+        # габариты 150×140×86 мм; если sources не извлекли длину/ширину/высоту, ставим.
+        cond_rules = CATEGORY_CONDITIONAL_DEFAULTS.get(context.category_id, [])
+        if cond_rules:
+            # Собираем «поисковую строку» — значения form_factor атрибутов + product_name.
+            # form_factor определяем по semantic_type у target — это работает для всех
+            # категорий, не привязано к конкретному attr_id.
+            form_factor_target_ids: set[int] = {
+                t.id for t in targets if t.semantic_type == "form_factor"
+            }
+            search_tokens: list[str] = []
+            for v in values:
+                if v.attribute_id in form_factor_target_ids and v.value is not None:
+                    if isinstance(v.value, list):
+                        search_tokens.extend(str(x) for x in v.value)
+                    else:
+                        search_tokens.append(str(v.value))
+            if context.product_name:
+                search_tokens.append(context.product_name)
+            search_blob = " ".join(search_tokens).upper()
+
+            for kind, token, attr_defaults in cond_rules:
+                if kind != "form_factor_contains":
+                    continue
+                if token.upper() not in search_blob:
+                    continue
+                # Первое совпавшее правило выигрывает — применяем и выходим.
+                for attr_id, default_value in attr_defaults.items():
+                    if attr_id not in target_ids or attr_id in existing_ids:
+                        continue
+                    extras.append(AttributeValue(
+                        attribute_id=attr_id,
+                        value=default_value,
+                        confidence=_CONDITIONAL_DEFAULT_CONFIDENCE,
+                        source=Source.DESCRIPTION,
+                        evidence=f"conditional default for form_factor={token}",
+                    ))
+                    existing_ids.add(attr_id)
+                break
+
+        # (C) Cross-fill: src→dst если dst пуст
+        values_by_id: dict[int, AttributeValue] = {v.attribute_id: v for v in values}
+        for src_id, dst_id in _OZON_CROSSFILL:
+            if dst_id in existing_ids or dst_id not in target_ids:
+                continue
+            src_av = values_by_id.get(src_id)
+            if src_av is None or src_av.value is None:
+                continue
+            av = AttributeValue(
+                attribute_id=dst_id,
+                value=src_av.value,
+                confidence=_DEFAULT_CONFIDENCE,
+                source=Source.DESCRIPTION,
+                evidence=f"cross-fill from attr {src_id}",
+            )
+            # Резолвим value_id для cross-fill тоже (если дубликат-атрибут enum).
+            self.resolve_value_ids(av, context)
+            extras.append(av)
+            existing_ids.add(dst_id)
+
+        return list(values) + extras
 
     def resolve_value_ids(
         self,

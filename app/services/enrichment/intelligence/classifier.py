@@ -19,7 +19,7 @@ class ClassifierDecision(BaseModel):
     """Решение Classifier для одной характеристики."""
     attribute_id: int
     suggested_sources: list[Source] = Field(
-        ..., min_length=1, max_length=3,
+        default_factory=list, min_length=0, max_length=3,
         description="Источники по приоритету (cheapest first). Может быть пустой для give-up.",
         validation_alias=AliasChoices("suggested_sources", "sources"),
     )
@@ -66,6 +66,9 @@ class LlmClassifier:
             "1b. Attributes printed on packaging, labels, or stickers (certifications like 80 PLUS, "
             "model number, manufacturer, country of origin, article number, warranty period, EAN/UPC, "
             "connector type printed on body): include 'vision' alongside other sources when context has photos.\n"
+            "1c. Short category-bound enums (when attribute has ≤5 allowed_values and is determined by the "
+            "product category itself — e.g. Назначение=Для ПК for PSU, Серийник=Да for electronics, "
+            "Тип устройства for narrow category): ALWAYS include 'llm_knowledge' in sources.\n"
             "2. NEVER assign numeric/measurable attributes (weight, volume, calories, proteins, fats, "
             "carbohydrates, vitamins, shelf life, dimensions, battery capacity) to 'vision' alone.\n"
             "3. Product composition/ingredient facts (flavor, taste, ingredients, sugar content, "
@@ -76,6 +79,9 @@ class LlmClassifier:
             "6. Precise numeric product specs (exact weight, dimensions, battery) of well-known products: "
             "['llm_knowledge', 'web_search'].\n"
             "7. Precise specs of obscure/niche products: ['web_search'].\n"
+            "7b. Customs/classification codes (attribute name contains 'ТН ВЭД', 'OKPD', "
+            "'код ЕАЭС', 'код товара'): ALWAYS include 'web_search' first — these require "
+            "live database lookup, LLM knowledge of customs codes is unreliable.\n"
             "8. Nothing fits: [] (give up).\n"
             "Return short reasoning (max 200 chars)."
         )
@@ -98,7 +104,12 @@ class LlmClassifier:
             return {a.id: [Source.LLM_KNOWLEDGE] for a in unfilled_attributes}
 
         context.llm_calls_so_far += 1
-        result = {d.attribute_id: d.suggested_sources for d in parsed.decisions}
+        # Auto-fallback: give-up (sources=[]) → LLM_KNOWLEDGE as safe default.
+        # Better to attempt llm_knowledge than skip the attribute entirely.
+        result = {
+            d.attribute_id: (d.suggested_sources if d.suggested_sources else [Source.LLM_KNOWLEDGE])
+            for d in parsed.decisions
+        }
 
         # Safety net: numeric attrs routed to llm_knowledge-only get web_search appended.
         # LLM classifiers tend to over-trust knowledge for numeric food/product specs;
@@ -108,5 +119,24 @@ class LlmClassifier:
             sources = result.get(attr_id, [])
             if sources and Source.WEB_SEARCH not in sources:
                 result[attr_id] = sources + [Source.WEB_SEARCH]
+
+        # Force-route: code-lookup attributes (ТН ВЭД, OKPD, EAEU codes) ALWAYS need
+        # live database lookup — LLM knowledge of customs codes is unreliable and
+        # the LLM classifier sometimes routes these to llm_knowledge only. Web_search
+        # is mandatory; llm_knowledge kept as cheap fallback. See Phase 2 #3 fix:
+        # v18 regression where Classifier stopped routing attr 22232 (ТН ВЭД) to
+        # web_search for 5 PSU products (CM MWE, CM V850 SFX, Zalman, EVGA, Chieftec).
+        always_websearch_keywords = ("ТН ВЭД", "OKPD", "OKPD2", "код ЕАЭС", "код товара")
+        for attr in unfilled_attributes:
+            name_lower = attr.name
+            if any(kw in name_lower for kw in always_websearch_keywords):
+                sources = result.get(attr.id, [])
+                if Source.WEB_SEARCH not in sources:
+                    # Prepend web_search (highest priority for code lookups)
+                    result[attr.id] = [Source.WEB_SEARCH] + [
+                        s for s in sources if s != Source.WEB_SEARCH
+                    ]
+                    if Source.LLM_KNOWLEDGE not in result[attr.id]:
+                        result[attr.id].append(Source.LLM_KNOWLEDGE)
 
         return result

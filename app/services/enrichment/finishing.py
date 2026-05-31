@@ -1,8 +1,12 @@
-"""FinishingExtractor — финальный проход: повторная попытка для обязательных пустых атрибутов.
+"""FinishingExtractor — финальный проход: повторная попытка для пустых атрибутов.
 
-Запускается после основного pipeline только если остались незаполненные is_required targets.
+Запускается после основного pipeline если остались незаполненные targets (required или optional).
 Переиспользует существующие AttributeSource-инстансы с усиленной инструкцией в промпте.
 Ожидаемый прирост recall: +9-18pp на required fields (WDC-PAVE benchmark).
+
+Лимит: не более MAX_FINISHING_TARGETS за один проход. Required-атрибуты получают приоритет
+перед optional — это не меняет стоимость (1 LLM call на source), но гарантирует что при лимите
+required-attrs не вытесняются optional.
 """
 import logging
 from typing import Optional
@@ -15,6 +19,12 @@ from app.services.enrichment.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Максимальное число атрибутов за один finishing-проход.
+# Required идут первыми, optional добиваются до лимита.
+# Один source делает 1 LLM call вне зависимости от числа targets — лимит
+# защищает от слишком длинного промпта, а не от числа LLM calls.
+_MAX_FINISHING_TARGETS = 15
 
 # Instruction prepended to system_prompt when running in focused recovery mode
 _FOCUSED_PREFIX = (
@@ -55,24 +65,30 @@ class FinishingExtractor:
             Дополнительные AttributeValue от focused pass. Пустой список если нечего делать.
         """
         filled_ids = {av.attribute_id for av in already_filled}
-        missing_required = [
-            t for t in targets
-            if t.is_required and t.id not in filled_ids
-        ]
-        if not missing_required:
-            logger.debug("[Finishing] no missing required attributes — skip")
+        # Включаем и required, и optional — required получают приоритет при лимите
+        missing_all = [t for t in targets if t.id not in filled_ids]
+        if not missing_all:
+            logger.debug("[Finishing] no missing attributes — skip")
             return []
 
+        # Required первыми, optional в конце; обрезаем до лимита
+        missing_required = [t for t in missing_all if t.is_required]
+        missing_optional = [t for t in missing_all if not t.is_required]
+        missing_targets = (missing_required + missing_optional)[:_MAX_FINISHING_TARGETS]
+
         logger.debug(
-            "[Finishing] %d missing required attributes: %s",
-            len(missing_required),
-            [t.id for t in missing_required],
+            "[Finishing] %d missing targets (required=%d, optional=%d, limit=%d): %s",
+            len(missing_targets),
+            len([t for t in missing_targets if t.is_required]),
+            len([t for t in missing_targets if not t.is_required]),
+            _MAX_FINISHING_TARGETS,
+            [t.id for t in missing_targets],
         )
 
         results: list[AttributeValue] = []
         for source in self._sources:
             applicable = [
-                t for t in missing_required
+                t for t in missing_targets
                 if source.is_applicable(context, t)
             ]
             if not applicable:

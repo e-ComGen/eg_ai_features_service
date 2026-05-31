@@ -15,7 +15,7 @@ Spec: docs/architecture/pipeline.md, section "Stage 3 / VisionSource".
 """
 import logging
 from typing import Optional
-from pydantic import BaseModel, Field, AliasChoices
+from pydantic import BaseModel, Field, AliasChoices, model_validator
 from app.services.enrichment.base import (
     AttributeSource, AttributeValue, TargetAttribute, ExtractionContext,
     Source, LlmJudge,
@@ -75,6 +75,16 @@ class _VisionExtractionResponse(BaseModel):
         description="Идентификаторы прочитанные с фото для обогащения context (MPN/EAN/article)"
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_null_values(cls, data):
+        if isinstance(data, dict) and isinstance(data.get("extracted"), list):
+            data["extracted"] = [
+                e for e in data["extracted"]
+                if isinstance(e, dict) and e.get("value") is not None
+            ]
+        return data
+
 
 class VisionSource(AttributeSource):
     def __init__(
@@ -124,6 +134,16 @@ class VisionSource(AttributeSource):
         if not effective_targets:
             return []
 
+        # Регистрируем allowed_values enum-targets у judge, чтобы он мог
+        # fast-accept enum values matching allowed list verbatim (skip strict LLM judging).
+        enum_allowed = {
+            t.id: t.allowed_values
+            for t in effective_targets
+            if t.allowed_values
+        }
+        if enum_allowed:
+            self._judge.register_allowed_values(enum_allowed)
+
         # Step 1: vision call (cached per product_id)
         if context.product_id not in self._vision_cache:
             vision_text = await self._vision.produce_description(
@@ -147,6 +167,11 @@ class VisionSource(AttributeSource):
             "Only include attributes that are CLEARLY visible. If unsure, skip. "
             "Evidence should quote the relevant phrase from the vision description. "
             "If the target has is_collection=true, return a JSON array of values; otherwise a single scalar.\n\n"
+            "FOR ENUM TARGETS (with allowed= list): output MUST be one of the listed allowed values "
+            "VERBATIM (no paraphrasing, no translation, no case changes). If the vision description "
+            "uses different wording (e.g. 'Фронтальный' when allowed=['ARGB','RGB','Отсутствует',"
+            "'Одноцветная']) — map it to the closest allowed value if the mapping is unambiguous; "
+            "otherwise omit the attribute. Do not guess.\n\n"
             "IDENTIFIERS: if the vision description explicitly mentions a Manufacturer Part Number "
             "(MPN, format like MPE-7501-AFAAG / R-PK650D-FA0B-EU / 90YE00A4-B0NA00), an EAN/UPC "
             "barcode (12-13 digits), or an article number (артикул) read from a product label / "

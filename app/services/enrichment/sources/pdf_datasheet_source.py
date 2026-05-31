@@ -16,7 +16,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
-from pydantic import BaseModel, Field, AliasChoices, create_model
+from pydantic import BaseModel, Field, AliasChoices, create_model, model_validator
 
 from app.services.enrichment.base import (
     AttributeSource, AttributeValue, TargetAttribute, ExtractionContext,
@@ -108,6 +108,16 @@ class _PdfExtractedAttr(BaseModel):
 
 class _PdfExtractionResponse(BaseModel):
     extracted: list[_PdfExtractedAttr]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_null_values(cls, data):
+        if isinstance(data, dict) and isinstance(data.get("extracted"), list):
+            data["extracted"] = [
+                e for e in data["extracted"]
+                if isinstance(e, dict) and e.get("value") is not None
+            ]
+        return data
 
 
 class PdfDatasheetSource(AttributeSource):
@@ -226,6 +236,7 @@ class PdfDatasheetSource(AttributeSource):
             queries.append(f'site:gzhls.at "{mpn}"')
         if brand:
             queries.append(f'"{brand} {model}" specifications filetype:pdf')
+            queries.append(f'"{brand} {model}" datasheet')  # generic fallback (no site:/filetype: filter)
         queries.append(f'site:gzhls.at "{model}"')
 
         for q in queries:
@@ -305,6 +316,14 @@ class PdfDatasheetSource(AttributeSource):
             f"Product (for context): {brand} {model}\n"
             f"Source URL (do not trust as authority): {url[:120]}\n\n"
             f"Target attributes:\n{targets_block}\n\n"
+            "EXTRACTION HINTS:\n"
+            "- Weight: if PDF says \"X kg\", convert to grams (X * 1000). Target unit is grams (г).\n"
+            "- Dimensions: physical CHASSIS dimensions only (NOT cable lengths). "
+            "If mm, convert to cm (divide by 10).\n"
+            "- Country of origin: look for \"Made in\", \"Origin\", \"Manufactured in\". "
+            "If not found, leave empty.\n"
+            "- Cable connector counts: from cable table extract SATA / Molex / PCIe 6+2 / "
+            "CPU 4+4 counts separately.\n\n"
             "Return JSON {'extracted': [{attribute_id, value, confidence, evidence}]} "
             "where 'evidence' quotes the matching phrase from the PDF (≤200 chars)."
         )
@@ -342,6 +361,36 @@ class PdfDatasheetSource(AttributeSource):
                 semantic_type=t.semantic_type,
                 is_collection=t.is_collection,
             ))
+
+        # Emit PDF URL для "Документ PDF" (8790) и "Название файла PDF" (8789),
+        # если эти targets запрошены. URL уже успешно скачан/валидирован — это
+        # бесплатное (zero-LLM) проставление авторитетного значения.
+        existing_ids = {av.attribute_id for av in out}
+        if url:
+            if 8790 in target_by_id and 8790 not in existing_ids:
+                t8790 = target_by_id[8790]
+                out.append(AttributeValue(
+                    attribute_id=8790,
+                    value=url,
+                    confidence=0.95,
+                    source=Source.PDF_DATASHEET,
+                    evidence=f"PDF: {url[:60]}",
+                    semantic_type=t8790.semantic_type,
+                    is_collection=t8790.is_collection,
+                ))
+            if 8789 in target_by_id and 8789 not in existing_ids:
+                t8789 = target_by_id[8789]
+                parsed_path = urlparse(url).path
+                fname = parsed_path.rsplit("/", 1)[-1] or url
+                out.append(AttributeValue(
+                    attribute_id=8789,
+                    value=fname,
+                    confidence=0.95,
+                    source=Source.PDF_DATASHEET,
+                    evidence=f"PDF basename: {fname[:60]}",
+                    semantic_type=t8789.semantic_type,
+                    is_collection=t8789.is_collection,
+                ))
         return out
 
     def get_judge(self) -> LlmJudge:

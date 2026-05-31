@@ -52,7 +52,7 @@ import re
 from typing import Any, Optional
 
 import httpx
-from pydantic import BaseModel, Field, AliasChoices
+from pydantic import BaseModel, Field, AliasChoices, model_validator
 
 from app.services.enrichment.base import (
     AttributeSource,
@@ -191,6 +191,16 @@ class _ExtractedAttr(BaseModel):
 
 class _ExtractionResponse(BaseModel):
     extracted: list[_ExtractedAttr]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_null_values(cls, data):
+        if isinstance(data, dict) and isinstance(data.get("extracted"), list):
+            data["extracted"] = [
+                e for e in data["extracted"]
+                if isinstance(e, dict) and e.get("value") is not None
+            ]
+        return data
 
 
 # ---------------------------------------------------------------------------

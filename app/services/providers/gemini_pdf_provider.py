@@ -94,7 +94,7 @@ class GeminiPdfProvider:
                 model=self._model,
                 messages=messages,
                 temperature=0.0,
-                max_tokens=2500,
+                max_tokens=4096,
                 response_format={"type": "json_object"},
                 timeout=timeout,
             )

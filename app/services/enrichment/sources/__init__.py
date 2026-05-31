@@ -9,6 +9,7 @@ from .pdf_datasheet_source import PdfDatasheetSource
 from .ozon_card_source import OzonCardSource
 from .wb_card_source import WbCardSource
 from .ugc_source import UgcSource
+from .tnved_source import TnvedSource
 
 __all__ = [
     "DescriptionSource",
@@ -21,4 +22,5 @@ __all__ = [
     "OzonCardSource",
     "WbCardSource",
     "UgcSource",
+    "TnvedSource",
 ]

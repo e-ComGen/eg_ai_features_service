@@ -41,7 +41,13 @@ _VISION_SYSTEM_PROMPT = (
     "or article number (артикул) — explicitly mention each one labelled in your output, "
     "e.g. 'MPN: MPE-7501-AFAAG', 'EAN: 4710562760552', 'Article: 90YE00A4-B0NA00'. "
     "Only include identifiers that you can clearly read/transcribe directly from the photo — "
-    "do not guess. If no identifier is visible, do not invent one."
+    "do not guess. If no identifier is visible, do not invent one.\n\n"
+    "PSU/COMPUTER CABLES INSPECTION:\n"
+    "- Are PSU cables BRAIDED/SLEEVED (тканевая оплётка), FLAT RIBBON, or BARE (without sleeve)?\n"
+    "- Cable sleeve color and texture.\n"
+    "- Individual sleeve per cable (индивидуальная) or grouped?\n"
+    "- RGB illumination on PSU fan grille, chassis logo, or PCIe cable ends:\n"
+    "  - ARGB (addressable RGB), RGB (static colored), single-color (одноцветная), or NONE."
 )
 
 _VISION_USER_TEMPLATE = (

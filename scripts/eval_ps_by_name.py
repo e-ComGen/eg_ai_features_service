@@ -48,6 +48,7 @@ if _CACHE_FILE.exists():
     print(f"[Dict] mini-cache: {len(_cats)} categories", flush=True)
 
 from app.services.enrichment.strategies.dictionaries.ozon_loader import get_ozon_characteristics_for_type
+from app.services.enrichment.strategies.dictionaries.ozon_field_classifier import is_platform_field
 from app.services.enrichment.base import ExtractionContext, TargetAttribute
 from app.services.enrichment.pipeline import PipelineOrchestrator
 from app.services.enrichment.strategies.factory import get_strategy
@@ -57,6 +58,7 @@ from app.services.enrichment.sources.pdf_datasheet_source import PdfDatasheetSou
 from app.services.enrichment.sources.ozon_card_source import OzonCardSource
 from app.services.enrichment.sources.wb_card_source import WbCardSource
 from app.services.enrichment.sources.ugc_source import UgcSource
+from app.services.enrichment.sources.tnved_source import TnvedSource
 
 DESCRIPTION_CATEGORY_ID = 17028612
 TYPE_ID = 91910
@@ -87,6 +89,11 @@ PRODUCTS = [
 
 
 def build_targets(chars: list[dict]) -> list[TargetAttribute]:
+    # ВАЖНО: пайплайн получает ВСЕ поля. is_platform_field НЕ используется здесь
+    # как фильтр — эвристика по тексту описания не имеет права молча удалять
+    # работу (однажды отрезала required-поле «Название модели для объединения»
+    # из-за слова «объединить» в описании → required рухнул 96%→66%).
+    # Классификатор остаётся ТОЛЬКО инструментом отчётности (honest-метрика).
     out = []
     for c in chars:
         allowed = None
@@ -98,6 +105,7 @@ def build_targets(chars: list[dict]) -> list[TargetAttribute]:
             type="text",
             allowed_values=allowed,
             is_collection=c.get("is_collection", False),
+            is_required=c.get("is_required", False),
         ))
     return out
 
@@ -119,6 +127,8 @@ async def main():
     icecat = IceCatSource()  # читает ICECAT_EMAIL, ICECAT_TOKEN из .env
     pdf_datasheet = PdfDatasheetSource()  # Serper + Gemini 2.5 Flash PDF native
     ozon_card = OzonCardSource()  # Scrappey, reads SCRAPPEY_KEY from env
+    # TnvedSource: один инстанс на весь батч → кэш по category_id переживает все товары
+    tnved = TnvedSource()
     # WB и UGC отключены: WB Scrappey envelope-error на search.wb.ru endpoint;
     # UGC зависит от nm_id discovery который сейчас не работает.
     orchestrator = PipelineOrchestrator(
@@ -127,6 +137,7 @@ async def main():
         icecat_source=icecat,
         pdf_datasheet_source=pdf_datasheet,
         ozon_card_source=ozon_card,
+        tnved_source=tnved,
     )
 
     t_start = time.time()
@@ -206,10 +217,44 @@ async def main():
     avg_req = sum(sum(1 for f in r["filled"] if char_by_id.get(f["attribute_id"], {}).get("is_required")) for r in results) / n / total_req if total_req else 0
     avg_opt = sum(sum(1 for f in r["filled"] if not char_by_id.get(f["attribute_id"], {}).get("is_required")) for r in results) / n / total_opt if total_opt else 0
 
+    # Honest coverage: denominator excludes non-extractable platform fields.
+    # coverage_optional_raw uses ALL optional chars (comparable to v17-v19).
+    # coverage_optional_honest uses only extractable optional chars as denominator.
+    extractable_opt_ids = {
+        c["id"] for c in chars
+        if not c.get("is_required") and not is_platform_field(c)
+    }
+    total_opt_extractable = len(extractable_opt_ids)
+    # Прозрачность: явно печатаем какие optional исключены из honest-знаменателя
+    # как платформенные. Никаких тихих обрезаний — в новой категории сразу видно.
+    excluded_platform = [
+        c["name"] for c in chars
+        if not c.get("is_required") and is_platform_field(c)
+    ]
+    print(
+        f"[honest] excluded {len(excluded_platform)} platform fields from honest "
+        f"denominator: {excluded_platform}",
+        flush=True,
+    )
+    avg_opt_honest = (
+        sum(
+            sum(1 for f in r["filled"]
+                if f["attribute_id"] in extractable_opt_ids)
+            for r in results
+        ) / n / total_opt_extractable
+        if total_opt_extractable else 0
+    )
+
     print("\n" + "=" * 70, flush=True)
     print(f"AGGREGATE  ({n} products, {t_elapsed:.1f}s)", flush=True)
     print("=" * 70, flush=True)
     print(f"Coverage required: {avg_req*100:.1f}%  optional: {avg_opt*100:.1f}%", flush=True)
+    print(
+        f"Coverage optional_raw={avg_opt*100:.1f}%  "
+        f"optional_honest={avg_opt_honest*100:.1f}%  "
+        f"(extractable denominator: {total_opt_extractable}/{total_opt} optional)",
+        flush=True,
+    )
     print(f"Sources: {dict(source_counts)}", flush=True)
     print(f"value_id resolution: {value_id_resolved}/{value_id_total} ({value_id_resolved/max(value_id_total,1)*100:.1f}%)", flush=True)
     print(f"\nTop attrs filled (fill rate across {n} products):", flush=True)
@@ -270,7 +315,11 @@ async def main():
         "n": n,
         "elapsed_sec": t_elapsed,
         "coverage_required": avg_req,
-        "coverage_optional": avg_opt,
+        "coverage_optional_raw": avg_opt,       # всe optional (сравнимость с v17-v19)
+        "coverage_optional": avg_opt,           # alias for backwards compat
+        "coverage_optional_honest": avg_opt_honest,  # знаменатель без платформенных полей
+        "optional_extractable_count": total_opt_extractable,
+        "optional_total_count": total_opt,
         "sources": dict(source_counts),
         "value_id_resolved": value_id_resolved,
         "value_id_total": value_id_total,

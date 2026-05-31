@@ -11,7 +11,7 @@ Steps:
 Spec: docs/architecture/pipeline.md, section "Stage 4 / WebSearchSource".
 """
 from typing import Optional
-from pydantic import BaseModel, Field, AliasChoices
+from pydantic import BaseModel, Field, AliasChoices, model_validator
 from app.services.enrichment.base import (
     AttributeSource, AttributeValue, TargetAttribute, ExtractionContext,
     Source, LlmJudge,
@@ -39,6 +39,16 @@ class _WebExtractedAttr(BaseModel):
 
 class _WebExtractionResponse(BaseModel):
     extracted: list[_WebExtractedAttr]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_null_values(cls, data):
+        if isinstance(data, dict) and isinstance(data.get("extracted"), list):
+            data["extracted"] = [
+                e for e in data["extracted"]
+                if isinstance(e, dict) and e.get("value") is not None
+            ]
+        return data
 
 
 class WebSearchSource(AttributeSource):

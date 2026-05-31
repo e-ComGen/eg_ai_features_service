@@ -7,7 +7,7 @@
 Spec: docs/architecture/pipeline.md, section "Stage 2 / LlmKnowledgeSource".
 """
 from typing import Optional
-from pydantic import BaseModel, Field, AliasChoices
+from pydantic import BaseModel, Field, AliasChoices, model_validator
 from app.services.enrichment.base import (
     AttributeSource, AttributeValue, TargetAttribute, ExtractionContext,
     Source, LlmJudge,
@@ -34,6 +34,16 @@ class _KnowledgeAttr(BaseModel):
 
 class _KnowledgeResponse(BaseModel):
     known_attributes: list[_KnowledgeAttr]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_null_values(cls, data):
+        if isinstance(data, dict) and isinstance(data.get("known_attributes"), list):
+            data["known_attributes"] = [
+                e for e in data["known_attributes"]
+                if isinstance(e, dict) and e.get("value") is not None
+            ]
+        return data
 
 
 class LlmKnowledgeSource(AttributeSource):

@@ -7,7 +7,7 @@
 Spec: docs/architecture/pipeline.md, section "Stage 0 / DescriptionSource".
 """
 from typing import Optional
-from pydantic import BaseModel, Field, AliasChoices
+from pydantic import BaseModel, Field, AliasChoices, model_validator
 from app.services.enrichment.base import (
     AttributeSource, AttributeValue, TargetAttribute, ExtractionContext,
     Source, LlmJudge,
@@ -35,6 +35,16 @@ class _ExtractedAttr(BaseModel):
 class _ExtractionResponse(BaseModel):
     """Top-level response — list of extracted attributes."""
     extracted: list[_ExtractedAttr]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_null_values(cls, data):
+        if isinstance(data, dict) and isinstance(data.get("extracted"), list):
+            data["extracted"] = [
+                e for e in data["extracted"]
+                if isinstance(e, dict) and e.get("value") is not None
+            ]
+        return data
 
 
 class DescriptionSource(AttributeSource):

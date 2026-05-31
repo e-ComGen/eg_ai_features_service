@@ -28,6 +28,7 @@ from app.services.enrichment.sources import (
     OzonCardSource,
     WbCardSource,
     UgcSource,
+    TnvedSource,
 )
 from app.services.enrichment.intelligence import LlmClassifier, CostPredictor
 from app.services.enrichment.confidence_aware_judge import ConfidenceAwareJudgeWrapper
@@ -60,6 +61,7 @@ class PipelineOrchestrator:
         ozon_card_source: Optional[OzonCardSource] = None,
         wb_card_source: Optional[WbCardSource] = None,
         ugc_source: Optional[UgcSource] = None,
+        tnved_source: Optional[TnvedSource] = None,
         classifier: Optional[LlmClassifier] = None,
         cost_predictor: Optional[CostPredictor] = None,
         strategy: Optional[MarketplaceStrategy] = None,
@@ -91,6 +93,10 @@ class PipelineOrchestrator:
         # UgcSource: отзывы и Q&A с Ozon/WB для compat/physical attrs.
         # None → UGC stage пропускается.
         self._ugc: Optional[UgcSource] = ugc_source
+        # TnvedSource: per-category резолвер ТН ВЭД ЕАЭС с кэшем.
+        # Создаётся ОДИН раз → кэш переживает все товары батча.
+        # None → по умолчанию создаём инстанс (всегда нужен для Ozon).
+        self._tnved: TnvedSource = tnved_source or TnvedSource()
         self._judges: dict[Source, ConfidenceAwareJudgeWrapper] = {
             src: ConfidenceAwareJudgeWrapper(s.get_judge())
             for src, s in self._sources.items()
@@ -347,6 +353,12 @@ class PipelineOrchestrator:
                 )
                 all_values += new_avs
 
+        # Stage 4.7: TnvedSource — per-category резолвер ТН ВЭД ЕАЭС.
+        # Запускается после всех товарных sources: кэш по category_id уже тёплый
+        # если несколько товаров одной категории обрабатываются параллельно.
+        new_avs = await self._run_tnved_stage(context, targets, already_filled=filled_so_far)
+        all_values += new_avs
+
         # Stage 5: Finishing pass — focused re-extraction for empty required attributes
         all_values += await self._run_finishing(context, targets, all_values)
 
@@ -361,11 +373,14 @@ class PipelineOrchestrator:
         """Merge + strategy post-process + strategy validation. Used at every early-exit point."""
         merged = self._merge(all_values)
 
-        # Привязываем словарные value_id(s) (Ozon) или no-op для других стратегий
-        merged = [self._strategy.resolve_value_ids(v, context) for v in merged]
-
-        # Strategy post-processing (e.g. casing normalisation for known enums)
+        # Strategy post-processing FIRST (добавляет CategoryDefaults + cross-fills с source=DESCRIPTION).
+        # Должно идти ДО resolve_value_ids, иначе свежедобавленные AVs не получат value_id.
         merged = self._strategy.post_process_values(merged, targets, context)
+
+        # Привязываем словарные value_id(s) (Ozon) или no-op для других стратегий.
+        # Прогоняем ВСЕ AVs включая только что добавленные CategoryDefaults — иначе они
+        # уходят в БД с value_id=NULL и проваливают value_id_resolution метрику.
+        merged = [self._strategy.resolve_value_ids(v, context) for v in merged]
 
         # Strategy validation — drop or normalise individual values
         filtered: list[AttributeValue] = []
@@ -510,6 +525,32 @@ class PipelineOrchestrator:
             except Exception as e:
                 logger.warning(
                     "[Pipeline] ugc judge failed for attr %s: %s",
+                    value.attribute_id, e,
+                )
+        return results
+
+    async def _run_tnved_stage(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: Optional[list[AttributeValue]] = None,
+    ) -> list[AttributeValue]:
+        """Запустить TnvedSource (per-category кэш). Ошибки не прерывают pipeline."""
+        try:
+            extracted = await self._tnved.extract(context, targets, already_filled=already_filled)
+        except Exception as e:
+            logger.warning("[Pipeline] tnved source failed: %s", e, exc_info=True)
+            return []
+        # TnvedJudge — детерминированный (10 цифр), всегда применяем
+        results: list[AttributeValue] = []
+        for value in extracted:
+            try:
+                valid = await self._tnved.get_judge().validate(value, context)
+                if valid:
+                    results.append(value)
+            except Exception as e:
+                logger.warning(
+                    "[Pipeline] tnved judge failed for attr %s: %s",
                     value.attribute_id, e,
                 )
         return results
