@@ -9,6 +9,8 @@ Spec: docs/architecture/pipeline.md, section "PipelineOrchestrator".
 import logging
 from typing import Optional
 
+from pydantic import BaseModel, Field
+
 from app.services.enrichment.base import (
     Source,
     SOURCE_PRIORITY,
@@ -31,6 +33,7 @@ from app.services.enrichment.sources import (
     TnvedSource,
 )
 from app.services.enrichment.intelligence import LlmClassifier, CostPredictor
+from app.services.providers.factory import get_main_manager
 from app.services.enrichment.confidence_aware_judge import ConfidenceAwareJudgeWrapper
 from app.services.enrichment.strategies.base import MarketplaceStrategy
 from app.services.enrichment.strategies.default_strategy import DefaultStrategy
@@ -160,6 +163,7 @@ class PipelineOrchestrator:
         remaining = self._remaining_targets(targets, all_values)
         if not remaining:
             all_values += await self._run_finishing(context, targets, all_values)
+            all_values += await self._generate_annotation(context, targets, all_values)
             return self._finalize(all_values, targets, context)
 
         # Stage 0.45: WbCardSource — копия характеристик с похожего WB-товара
@@ -175,6 +179,7 @@ class PipelineOrchestrator:
             remaining = self._remaining_targets(targets, all_values)
             if not remaining:
                 all_values += await self._run_finishing(context, targets, all_values)
+                all_values += await self._generate_annotation(context, targets, all_values)
                 return self._finalize(all_values, targets, context)
 
         # Stage 0.5: OzonCardSource — копия характеристик с похожего Ozon-товара.
@@ -193,6 +198,7 @@ class PipelineOrchestrator:
             remaining = self._remaining_targets(targets, all_values)
             if not remaining:
                 all_values += await self._run_finishing(context, targets, all_values)
+                all_values += await self._generate_annotation(context, targets, all_values)
                 return self._finalize(all_values, targets, context)
 
         # Stage 0.55: IceCatSource — brand-verified спеки без LLM (IceCat Open API).
@@ -210,6 +216,7 @@ class PipelineOrchestrator:
             remaining = self._remaining_targets(targets, all_values)
             if not remaining:
                 all_values += await self._run_finishing(context, targets, all_values)
+                all_values += await self._generate_annotation(context, targets, all_values)
                 return self._finalize(all_values, targets, context)
 
         # Stage 0.6: PdfDatasheetSource — official manufacturer datasheet PDF (Gemini native).
@@ -224,6 +231,7 @@ class PipelineOrchestrator:
             remaining = self._remaining_targets(targets, all_values)
             if not remaining:
                 all_values += await self._run_finishing(context, targets, all_values)
+                all_values += await self._generate_annotation(context, targets, all_values)
                 return self._finalize(all_values, targets, context)
 
         # Stage 0.7: CompetitorRagSource — дешёвый RAG без LLM (0 API calls)
@@ -237,6 +245,7 @@ class PipelineOrchestrator:
             remaining = self._remaining_targets(targets, all_values)
             if not remaining:
                 all_values += await self._run_finishing(context, targets, all_values)
+                all_values += await self._generate_annotation(context, targets, all_values)
                 return self._finalize(all_values, targets, context)
 
         # Stage 1: Classifier — 1 LLM call for routing decisions
@@ -258,6 +267,7 @@ class PipelineOrchestrator:
             remaining = self._remaining_targets(targets, all_values)
             if not remaining:
                 all_values += await self._run_finishing(context, targets, all_values)
+                all_values += await self._generate_annotation(context, targets, all_values)
                 return self._finalize(all_values, targets, context)
 
         # Stage 3: VisionSource — attrs with VISION in suggested AND image_urls present
@@ -276,6 +286,7 @@ class PipelineOrchestrator:
             remaining = self._remaining_targets(targets, all_values)
             if not remaining:
                 all_values += await self._run_finishing(context, targets, all_values)
+                all_values += await self._generate_annotation(context, targets, all_values)
                 return self._finalize(all_values, targets, context)
 
         # Stage 4 gate: CostPredictor — check if web search is worth running
@@ -327,6 +338,7 @@ class PipelineOrchestrator:
 
         if not websearch_targets:
             all_values += await self._run_finishing(context, targets, all_values)
+            all_values += await self._generate_annotation(context, targets, all_values)
             return self._finalize(all_values, targets, context)
 
         if force_ws:
@@ -362,7 +374,95 @@ class PipelineOrchestrator:
         # Stage 5: Finishing pass — focused re-extraction for empty required attributes
         all_values += await self._run_finishing(context, targets, all_values)
 
+        # Stage 5.5: Аннотация generation — generative step, not extraction.
+        # Runs AFTER all sources and finishing so it can use the full set of filled attrs.
+        all_values += await self._generate_annotation(context, targets, all_values)
+
         return self._finalize(all_values, targets, context)
+
+    async def _generate_annotation(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        all_values: list[AttributeValue],
+    ) -> list[AttributeValue]:
+        """Stage 5.5: генерация поля «Аннотация» из уже собранных характеристик.
+
+        Аннотация — генерируемое маркетинговое описание, не извлекаемое.
+        Запускается ПОСЛЕ всех источников. Judge не нужен — это генерация, не извлечение.
+        Пропускается если Аннотация уже заполнена или не входит в targets.
+        """
+        # Detect Аннотация target (case-insensitive)
+        annotation_target = next(
+            (t for t in targets if t.name.lower() == "аннотация"),
+            None,
+        )
+        if annotation_target is None:
+            return []
+
+        # Skip if already filled with high confidence
+        already_filled_ids = {v.attribute_id for v in all_values if v.is_confident()}
+        if annotation_target.id in already_filled_ids:
+            return []
+
+        # Build characteristics summary from filled values
+        filled_by_id: dict[int, AttributeValue] = {}
+        for v in all_values:
+            prev = filled_by_id.get(v.attribute_id)
+            if prev is None or v.confidence > prev.confidence:
+                filled_by_id[v.attribute_id] = v
+
+        target_names: dict[int, str] = {t.id: t.name for t in targets}
+        char_lines = []
+        for attr_id, av in filled_by_id.items():
+            if attr_id == annotation_target.id:
+                continue
+            name = target_names.get(attr_id, str(attr_id))
+            char_lines.append(f"  {name}: {av.value}")
+
+        chars_block = "\n".join(char_lines) if char_lines else "  (нет данных)"
+
+        class _AnnotationResponse(BaseModel):
+            annotation: str = Field(..., description="Маркетинговое описание товара 2-4 предложения")
+
+        system_prompt = (
+            "Ты маркетолог. Составь маркетинговое описание товара 2-4 предложения "
+            "на основе предоставленных характеристик. Текст должен быть живым, "
+            "продающим, без перечислений через запятую. Только текст описания, без заголовков."
+        )
+        user_text = (
+            f"Товар: {context.product_name}\n"
+            f"Бренд: {context.brand or 'неизвестен'}\n"
+            f"Категория: {' / '.join(context.category_path) or 'н/д'}\n\n"
+            f"Характеристики:\n{chars_block}\n\n"
+            f"Составь маркетинговое описание товара 2-4 предложения."
+        )
+
+        try:
+            llm = get_main_manager()
+            parsed, _ = await llm.structured_request(
+                system_prompt=system_prompt,
+                user_text=user_text,
+                response_model=_AnnotationResponse,
+            )
+        except Exception as e:
+            logger.warning("[Pipeline] annotation generation failed: %s", e, exc_info=True)
+            return []
+
+        if parsed is None or not parsed.annotation.strip():
+            return []
+
+        context.llm_calls_so_far += 1
+        return [
+            AttributeValue(
+                attribute_id=annotation_target.id,
+                value=parsed.annotation.strip(),
+                confidence=0.9,
+                source=Source.LLM_KNOWLEDGE,
+                evidence="generated from collected attributes",
+                is_collection=False,
+            )
+        ]
 
     def _finalize(
         self,

@@ -471,6 +471,44 @@ def _normalize_for_fuzzy(s: str) -> str:
     return s.lower()
 
 
+# Стоп-слова-классификаторы: общая русская грамматика, НЕ категорийный хардкод.
+# Убираем первое слово-классификатор, если оно одно из этих — оно несёт
+# нулевую семантическую нагрузку относительно самого атрибута.
+_CHAR_NAME_STOPWORDS = frozenset({
+    "тип", "вид", "количество", "число", "наличие",
+    "способ", "метод", "класс", "степень",
+})
+
+import re as _re
+_SPLIT_RE = _re.compile(r"[\s\-–—/]+")
+
+
+def _norm_char_name(s: str) -> str:
+    """Нормализация имени характеристики для сопоставления.
+
+    Алгоритм:
+    1. lower
+    2. split по пробелам и разделителям [-–—/]
+    3. удалить стоп-слова-классификаторы из НАЧАЛА токен-цепочки
+       (убираем только пока идут стоп-слова подряд, не трогаем середину)
+    4. склеить токены пробелом
+
+    Примеры:
+        «Тип интерфейса USB»  → «интерфейс usb»
+        «Количество SIM-карт» → «sim карт»
+        «USB-интерфейс»        → «usb интерфейс»
+        «Комплектация»         → «комплектация»
+        «Что в комплекте»      → «что в комплекте»  (нет стоп-слова в начале)
+        «В комплекте»          → «в комплекте»
+        «Наличие Bluetooth»    → «bluetooth»
+    """
+    tokens = _SPLIT_RE.split(s.lower().strip())
+    # удаляем ведущие стоп-слова
+    while tokens and tokens[0] in _CHAR_NAME_STOPWORDS:
+        tokens = tokens[1:]
+    return " ".join(tokens) if tokens else s.lower()
+
+
 def _extract_model_tokens(s: str) -> set:
     """Извлечь токены-артикулы (латиница+цифры, длина ≥ 3) из строки.
 
@@ -1201,13 +1239,15 @@ class OzonCardSource(AttributeSource):
             if isinstance(oc, dict) and "id" in oc and "name" in oc:
                 attr_id_to_dict_name[int(oc["id"])] = str(oc["name"])
 
-        # target_id → lowercase set имён
+        # target_id → lowercase set имён (raw + нормализованные)
         target_names_low: dict[int, set[str]] = {}
         for t in targets:
-            names = {t.name.lower()}
+            raw_low = t.name.lower()
+            names = {raw_low, _norm_char_name(t.name)}
             dn = attr_id_to_dict_name.get(t.id)
             if dn:
                 names.add(dn.lower())
+                names.add(_norm_char_name(dn))
             target_names_low[t.id] = names
 
         # Inverted: lowercase name → target.id
@@ -1237,6 +1277,7 @@ class OzonCardSource(AttributeSource):
             char_name = c["name"].strip()
             char_val = c["value"].strip()
             char_name_low = char_name.lower()
+            char_name_norm = _norm_char_name(char_name)
 
             # brand_line: пропускаем ТОЛЬКО numeric-атрибуты (мощность,
             # размеры, объём и т.п. — модель-специфичны, брать с соседней
@@ -1248,22 +1289,42 @@ class OzonCardSource(AttributeSource):
                 if char_name_low in _BRAND_LINE_BLACKLIST:
                     continue
 
-            # 1) Exact lowercase match
+            # 1) Exact lowercase match (raw, затем нормализованное)
             target_id = name_to_target_id.get(char_name_low)
-            # 2) Substring match
+            if target_id is None and char_name_norm != char_name_low:
+                target_id = name_to_target_id.get(char_name_norm)
+            # 2) Substring match (raw и нормализованное против всего словаря)
             if target_id is None:
                 for tn, tid in name_to_target_id.items():
                     if char_name_low in tn or tn in char_name_low:
                         target_id = tid
                         break
-            # 3) Fuzzy fallback
+            if target_id is None and char_name_norm != char_name_low:
+                for tn, tid in name_to_target_id.items():
+                    if char_name_norm in tn or tn in char_name_norm:
+                        target_id = tid
+                        break
+            # 3) Fuzzy fallback (нормализованная форма как кандидат)
             if target_id is None and process is not None and all_target_names:
+                # пробуем нормализованную форму первой — она ближе семантически
+                query = char_name_norm if char_name_norm else char_name_low
                 best = process.extractOne(
-                    char_name_low, all_target_names, scorer=fuzz.WRatio,
+                    query, all_target_names, scorer=fuzz.WRatio,
                 )
                 if best is not None and best[1] >= 88:
                     target_id = name_to_target_id[best[0]]
+                # если не нашли по норме — пробуем сырое имя
+                if target_id is None and query != char_name_low:
+                    best2 = process.extractOne(
+                        char_name_low, all_target_names, scorer=fuzz.WRatio,
+                    )
+                    if best2 is not None and best2[1] >= 88:
+                        target_id = name_to_target_id[best2[0]]
 
+            if target_id is None:
+                logger.debug(
+                    "[OzonCard] MISS char=%r norm=%r", char_name, char_name_norm
+                )
             if target_id is None or target_id in used_ids:
                 continue
 

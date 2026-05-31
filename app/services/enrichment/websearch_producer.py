@@ -164,12 +164,56 @@ class WebSearchProducer:
             )
             return None
 
+        # --- Full-page fetch: top-1-2 HTTPS links from organic results ---
+        _PAGE_FETCH_TIMEOUT = 20      # seconds total for all page fetches
+        _PAGE_TEXT_CAP = 4500         # chars to keep per product (LLM context guard)
+
+        top_urls = [
+            r.link
+            for r in results.organic_results[:5]
+            if getattr(r, "link", None) and str(r.link).startswith("https://")
+        ][:2]
+
+        page_section = ""
+        if top_urls:
+            try:
+                from app.services.url_fetcher import fetch_all as _fetch_all
+                raw_page_text = await asyncio.wait_for(
+                    _fetch_all(top_urls),
+                    timeout=_PAGE_FETCH_TIMEOUT,
+                )
+                if raw_page_text:
+                    page_section = (
+                        "=== Текст страницы со спецификациями ===\n"
+                        + raw_page_text[:_PAGE_TEXT_CAP]
+                        + "\n"
+                    )
+                    logger.debug(
+                        "WebSearchProducer (serper): fetched %d chars from %d page(s) for %r.",
+                        len(raw_page_text),
+                        len(top_urls),
+                        product_name,
+                    )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "WebSearchProducer (serper): page fetch timed out (%ds) for %r — using snippets only.",
+                    _PAGE_FETCH_TIMEOUT,
+                    product_name,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "WebSearchProducer (serper): page fetch failed for %r: %s — using snippets only.",
+                    product_name,
+                    exc,
+                )
+        # -------------------------------------------------------------------
+
         # Build context from top snippets
         snippets = [
             f"[{r.position}] {r.title}\n{r.snippet}"
             for r in results.organic_results[:5]
         ]
-        search_context = "\n\n".join(snippets)
+        search_context = page_section + "\n\n".join(snippets)
 
         # 1 LLM call: extract characteristics from snippets
         user_text = (

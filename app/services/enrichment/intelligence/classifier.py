@@ -139,4 +139,19 @@ class LlmClassifier:
                     if Source.LLM_KNOWLEDGE not in result[attr.id]:
                         result[attr.id].append(Source.LLM_KNOWLEDGE)
 
+        # Force-route: warranty / country-of-origin / комплектация always need web_search.
+        # Without photos (no vision), llm_knowledge returns empty for obscure products.
+        # Web search finds warranty terms and manufacturing country from product pages.
+        warranty_country_keywords = (
+            "гарантия", "гарантийный", "warranty",
+            "страна", "произведено", "производитель",
+            "комплектация", "комплект",
+        )
+        for attr in unfilled_attributes:
+            name_lower = attr.name.lower()
+            if any(kw in name_lower for kw in warranty_country_keywords):
+                sources = result.get(attr.id, [])
+                if Source.WEB_SEARCH not in sources:
+                    result[attr.id] = sources + [Source.WEB_SEARCH]
+
         return result
