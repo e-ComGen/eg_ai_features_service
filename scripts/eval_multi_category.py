@@ -157,6 +157,12 @@ async def main():
     t_start = time.time()
     eval_limit = int(os.environ.get("EVAL_LIMIT", str(len(PRODUCTS))))
     products_to_run = PRODUCTS[:eval_limit]
+    # EVAL_FILTER=подстрока1,подстрока2 — оставить только товары, чьё имя содержит
+    # любую из подстрок (для точечных прогонов по подмножеству, напр. одежде).
+    _filter = os.environ.get("EVAL_FILTER", "").strip()
+    if _filter:
+        subs = [s.strip().lower() for s in _filter.split(",") if s.strip()]
+        products_to_run = [p for p in products_to_run if any(s in p[2].lower() for s in subs)]
 
     concurrency = int(os.environ.get("EVAL_CONCURRENCY", "8"))
     sem = asyncio.Semaphore(concurrency)
