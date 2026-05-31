@@ -33,10 +33,12 @@ Anti-block:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
+import ssl
 import uuid
 from collections import OrderedDict
 from typing import Any, Optional
@@ -196,15 +198,179 @@ _GENERIC_PREFIXES = (
     "power supply", "power", "supply", "unit",
 )
 
+# Стоп-слова (русская грамматика): предлоги, союзы, гендерные прилагательные.
+# Срезаются как ведущие токены ПОСЛЕ стрипа категории, если они не бренд
+# и не модельный идентификатор. Это НЕ категорийный хардкод — чисто грамматика.
+_LEADING_STOPWORDS: frozenset[str] = frozenset({
+    # предлоги / союзы
+    "для", "и", "с", "со", "в", "на", "к", "по", "из", "от", "под", "при",
+    # гендерные/возрастные прилагательные (одиночные токены)
+    "мужской", "мужская", "мужское", "мужские",
+    "женский", "женская", "женское", "женские",
+    "детский", "детская", "детское", "детские",
+    "унисекс",
+    # относительные прилагательные-описания (тип товара как adjective перед брендом)
+    "городской", "городская", "городское",
+    "спортивный", "спортивная", "спортивное",
+    "модель",
+    # разговорные/сленговые наименования типа товара (не бренды!)
+    "худи",   # «Толстовка худи Champion» — «худи» = тип, не бренд
+})
+
+# Единицы измерения — суффиксы после числа в одном токене-спеке.
+# Порядок важен: более длинные варианты первыми, чтобы regex жадно захватил max.
+_UNIT_SUFFIXES_RE = re.compile(
+    r"(?:"
+    r"гб|тб|мб|gb|tb|mb"         # объём хранения (перед g/m/w чтобы не смешались)
+    r"|квт|kw|вт"                 # мощность
+    r"|мгц|ггц|mhz|ghz"           # частота
+    r"|мм|mm|см|cm"               # длина
+    r"|кг|kg"                     # масса
+    r"|дб|db"                     # уровень шума
+    r"|rpm"                       # обороты
+    r"|дюйм(?:а|ов)?"             # дюймы
+    r"|inch(?:es)?"               # дюймы en
+    r"|мл|ml"                     # жидкость
+    r"|нм|nm"                     # нанометры
+    r"|ампер|amp"                 # ток
+    r"|w"                         # ватт (одна буква — в конце чтобы не смешать с kw)
+    r")$",
+    re.IGNORECASE,
+)
+
+# Спек-токен: число + единица слитно, или «NxM GB», или чистое число, или NxG (5G/4G)
+_SPEC_TOKEN_RE = re.compile(
+    r"^\d+(?:[.,]\d+)?(?:"
+    r"гб|тб|мб|gb|tb|mb"
+    r"|квт|kw"
+    r"|мгц|ггц|mhz|ghz"
+    r"|мм|mm|см|cm"
+    r"|кг|kg"
+    r"|дб|db"
+    r"|rpm"
+    r"|дюйм(?:а|ов)?"
+    r"|inch(?:es)?"
+    r"|мл|ml"
+    r"|нм|nm"
+    r"|ампер|amp"
+    r"|вт|w"           # ватт — в конце
+    r")$"
+    r"|^\d+[gG]$"              # 5G, 4G
+    r"|^\d+/\d+[gGbB]+$"      # 8/256GB, 6/128GB
+    r"|^\d+$",                 # чисто числовой (22, 27, 750)
+    re.IGNORECASE,
+)
+
+# Модельный идентификатор: содержит хотя бы одну пару букв (не единица) + цифры.
+# Примеры: TAT3A011, 27GP850-B, WGG2540MOE, HR2470, RMC-M90, EC685.M, DST7050/20, V2, A55.
+# НЕ модельные: 5G, 850W, 100ml, 8/256GB (они ловятся _SPEC_TOKEN_RE первыми).
+_MODEL_ID_RE = re.compile(r"(?:[A-Za-zА-Яа-яёЁ]\d|\d[A-Za-zА-Яа-яёЁ])")
+
+
+def _is_spec_token(tok: str) -> bool:
+    """True если токен — чистый спек (число+единица или чисто цифровой).
+
+    Спеки: 27, 22, 5G, 8/256GB, 850W, 750W, 100ml, 45mm
+    НЕ спеки (модельные ID): 27GP850-B, WGG2540MOE, TAT3A011, V2, A55, HR2470
+    """
+    # Spec-token regex проверяем ПЕРВЫМ — он точнее (число+единица не является моделью)
+    if _SPEC_TOKEN_RE.match(tok):
+        return True
+    # Если есть смесь букв+цифр НЕ покрытая спек-паттерном — это модельный ID
+    if _MODEL_ID_RE.search(tok):
+        return False
+    return False
+
+
+# Standalone unit words (единицы измерения без числа) — тоже спек-хвосты.
+# Используется для «LG UltraGear 27GP850-B 27 дюймов»: «дюймов» — standalone unit.
+_UNIT_STANDALONE_RE = re.compile(
+    r"^(?:"
+    r"гб|тб|мб|gb|tb|mb"
+    r"|квт|kw|вт|w"
+    r"|мгц|ггц|mhz|ghz"
+    r"|мм|mm|см|cm|м"
+    r"|кг|kg|г"
+    r"|дб|db"
+    r"|rpm"
+    r"|дюйм(?:а|ов|е)?"
+    r"|дюймов|дюйма"
+    r"|inch(?:es)?"
+    r"|мл|ml|л"
+    r"|нм|nm"
+    r"|ампер|amp"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _is_spec_or_unit_token(tok: str) -> bool:
+    """True если токен — спек-число+единица, чистое число, или standalone единица."""
+    if _is_spec_token(tok):
+        return True
+    # Standalone unit word (дюймов, мм, W, kg и т.п.)
+    if _UNIT_STANDALONE_RE.match(tok):
+        return True
+    return False
+
+
+def _count_meaningful_tokens(tokens: list[str]) -> int:
+    """Считает «значимые» токены — не спеки и не стоп-слова.
+
+    Значимые = бренд, модель, описательное слово (то, что несёт смысл запроса).
+    Чистые числа/единицы и ведущие стоп-слова не считаются.
+    """
+    return sum(
+        1 for t in tokens
+        if not _is_spec_or_unit_token(t) and t.lower() not in _LEADING_STOPWORDS
+    )
+
+
+def _strip_trailing_specs(tokens: list[str]) -> list[str]:
+    """Убирает хвостовые спек-токены из конца списка, сохраняя модельные ID.
+
+    Примеры:
+      ['LG', 'UltraGear', '27GP850-B', '27', 'дюймов']
+        → срезаем 'дюймов' (unit), '27' (число) → ['LG', 'UltraGear', '27GP850-B']
+      ['Samsung', 'Galaxy', 'A55', '5G', '8/256GB']
+        → срезаем '8/256GB' (спек), '5G' (спек) → ['Samsung', 'Galaxy', 'A55']
+      ['Bosch', 'WGG2540MOE'] → без изменений (WGG2540MOE — модельный ID)
+      ['Penny', 'Board', '22'] → НЕ срезаем '22', т.к. после среза осталось бы
+        только 2 значимых токена ('Penny', 'Board') — минимальный порог. Вернётся
+        оригинал если бы было < 2 значимых; здесь ровно 2 → всё равно не срезаем.
+
+    Защита от over-strip: если после потенциального среза остаётся ≤ 2 значимых
+    токенов (не-спек, не-стоп) — стрип прекращается. Это сохраняет «Penny Board 22»
+    как есть: «22» — числовой спек, но без него осталось бы ровно 2 значимых слова.
+    Правило «≤ 2» означает: стрипуем только если значимых токенов останется ≥ 3.
+    Это гарантирует бренд + линейка + хотя бы одно отличительное слово в запросе.
+
+    Samsung Galaxy A55: meaningful=['Samsung','Galaxy','A55'] → 3 ≥ 3, стрипуем '5G'
+      → meaningful=['Samsung','Galaxy','A55'] 3 ≥ 3, стрипуем '8/256GB' → OK.
+    LG UltraGear 27GP850-B 27 дюймов: meaningful=['LG','UltraGear','27GP850-B'] → 3,
+      стрипуем 'дюймов' → 3 ≥ 3, стрипуем '27' → 3 ≥ 3 → OK (27GP850-B — модельный ID).
+    Penny Board 22: meaningful=['Penny','Board'] → 2 ≤ 2, НЕ стрипуем '22' → остаётся.
+    """
+    result = list(tokens)
+    while result and _is_spec_or_unit_token(result[-1]):
+        # Проверяем: сколько значимых токенов останется ПОСЛЕ среза этого хвоста?
+        candidate = result[:-1]
+        if _count_meaningful_tokens(candidate) <= 2:
+            # Срезать нельзя — слишком мало значимых токенов (нужно ≥ 3: бренд + модель + что-то)
+            break
+        result.pop()
+    return result or tokens  # не возвращаем пустой список
+
 
 def _strip_category_prefix(text: str, category_name: Optional[str]) -> str:
     """Срезает ведущие слова категории из начала text (case-insensitive).
 
     Алгоритм:
       1. Попробовать совпадение с полной фразой категории (напр. «Микроволновая печь»).
-      2. Если не совпало — итеративно срезать каждое слово категории, пока
-         оно стоит в начале text. Это покрывает случай «Блок питания Cooler Master»
-         при leaf «Блок питания компьютера»: срезается «Блок», затем «питания».
+      2. Если не совпало — итеративно срезать любые токены text, которые встречаются
+         в категории (как набор значимых слов), пока они стоят в начале text.
+         Это покрывает «Стиральная машина Bosch» при leaf «Стиральная машина»:
+         оба слова «стиральная» и «машина» присутствуют в категории → срезаются оба.
 
     Возвращает текст после среза (или исходный, если ничего не срезалось).
     """
@@ -218,15 +384,32 @@ def _strip_category_prefix(text: str, category_name: Optional[str]) -> str:
     if low.startswith(cat_low):
         return result[len(cat_low):].strip()
 
-    # Попытка 2: итеративный побуквенный срез слов категории
-    cat_words = [w for w in cat_low.split() if len(w) > 2]
-    for word in cat_words:
-        low = result.lower()
-        if low.startswith(word):
-            result = result[len(word):].strip()
-        # не break — пробуем следующее слово категории тоже (если оно стоит следом)
+    # Попытка 2: срезать ведущие токены text, которые входят в НАБОР слов категории.
+    # «Стиральная машина Bosch» + leaf «Стиральная машина» →
+    #   cat_word_set = {'стиральная', 'машина'}, tokens = ['стиральная', 'машина', 'bosch']
+    #   'стиральная' ∈ set → срезать, 'машина' ∈ set → срезать, 'bosch' ∉ set → стоп.
+    cat_word_set = {w for w in cat_low.split() if len(w) > 2}
+    if cat_word_set:
+        words = result.split()
+        i = 0
+        while i < len(words) and words[i].lower() in cat_word_set:
+            i += 1
+        if i > 0:
+            return " ".join(words[i:]).strip()
 
     return result
+
+
+def _strip_leading_stopwords(tokens: list[str]) -> list[str]:
+    """Срезает ведущие стоп-слова (предлоги, гендерные adj) из списка токенов.
+
+    Останавливается на первом токене, которого нет в _LEADING_STOPWORDS.
+    Никогда не возвращает пустой список — если все токены стоп-слова, возвращает исходный.
+    """
+    i = 0
+    while i < len(tokens) and tokens[i].lower() in _LEADING_STOPWORDS:
+        i += 1
+    return tokens[i:] if i < len(tokens) else tokens
 
 
 def _compress_search_query(
@@ -245,8 +428,12 @@ def _compress_search_query(
     Логика:
       1. Strip leading category prefix (из category_name, напр. «Монитор», «Наушники»).
          Если category_name не задан — fallback на _GENERIC_PREFIXES (БП-кейс).
-      2. Взять первые max_tokens токенов.
-      3. Если brand задан и его нет в результате — prepend.
+      2. Strip ведущих стоп-слов (предлоги/гендерные adj) после стрипа категории.
+      3. Strip хвостовых спек-токенов (число+единица: «27 дюймов», «8/256GB», «850W»).
+         Модельные идентификаторы (27GP850-B, WGG2540MOE) сохраняются.
+      4. Взять первые max_tokens токенов.
+      5. Если brand задан, не пустой, не является стоп-словом и его нет в результате
+         — prepend.
 
     category_name — leaf из ExtractionContext.category_path (последний элемент).
     """
@@ -266,17 +453,67 @@ def _compress_search_query(
                 result = result[len(prefix):].strip()
                 break
 
-    # ---- Шаг 2: взять первые max_tokens токенов (бренд + модель) ----
-    tokens = result.split()[:max_tokens]
+    # ---- Шаг 2: срезать ведущие стоп-слова ----
+    tokens_after_cat = result.split()
+    tokens_after_cat = _strip_leading_stopwords(tokens_after_cat)
+    result = " ".join(tokens_after_cat)
+
+    # ---- Шаг 3: срезать хвостовые спек-токены ----
+    all_tokens = result.split()
+    all_tokens = _strip_trailing_specs(all_tokens)
+
+    # ---- Шаг 4: взять первые max_tokens токенов (бренд + модель) ----
+    tokens = all_tokens[:max_tokens]
     compact = " ".join(tokens).strip()
 
-    # ---- Шаг 3: если бренд не попал в начало — prepend ----
+    # ---- Шаг 5: если бренд не попал в начало — prepend ----
+    # Не добавляем бренд если он:
+    #  а) сам является стоп-словом (bad brand_guess от words[1]: «для», «мужская»)
+    #  б) является словом из категории (brand_guess «машина» для «Стиральная машина»,
+    #     «книга» для «Электронная книга», «гитара» для «Акустическая гитара» и т.п.)
     if brand and brand.strip():
         b = brand.strip()
-        if b.lower() not in compact.lower():
+        b_low = b.lower()
+        is_stopword_brand = b_low in _LEADING_STOPWORDS
+        # Проверяем: не является ли brand словом из категории
+        cat_word_set: set[str] = set()
+        if category_name:
+            cat_word_set = {w.lower() for w in category_name.split() if len(w) > 2}
+        is_cat_word_brand = b_low in cat_word_set
+        if not is_stopword_brand and not is_cat_word_brand and b_low not in compact.lower():
             compact = f"{b} {compact}".strip()
 
     return compact or product_name.strip()
+
+
+def _normalize_for_fuzzy(s: str) -> str:
+    """Нормализация строки перед fuzzy-сравнением.
+
+    Цель — убрать пунктуационный шум, чтобы точные совпадения модели не
+    тонули из-за апострофов/дефисов/пробелов.  Не меняет смысловые цифры
+    и буквы, только пунктуацию.
+
+    Примеры:
+        "De’Longhi EC685.M"  → "delonghi ec685.m"
+        "Delonghi Dedica EC685.M" → "delonghi dedica ec685.m"
+        "REDMOND RMC-M902S"  → "redmond rmc-m902s"  (дефис в артикуле сохраняется)
+    """
+    # Убираем апострофы всех видов (U+0027, U+2019, U+02BC)
+    s = s.replace("’", "").replace("ʼ", "").replace("’", "")
+    # lower
+    return s.lower()
+
+
+def _extract_model_tokens(s: str) -> set:
+    """Извлечь токены-артикулы (латиница+цифры, длина ≥ 3) из строки.
+
+    Используется для бонуса: если query и tile имеют общий артикул —
+    это надёжный сигнал совпадения (EC685.M, WH-1000XM5, RMC-M90).
+    Бонус применяется только к точным токен-пересечениям, поэтому
+    соседние модели (M90 vs M902S, 4624 vs 4621) бонуса не получают.
+    """
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9.\-]*[0-9][A-Za-z0-9.\-]*", s)
+    return {t.lower() for t in tokens if len(t) >= 3}
 
 
 def _normalize_model(product_name: str, brand: Optional[str]) -> str:
@@ -430,24 +667,30 @@ class OzonCardSource(AttributeSource):
 
         Возвращает None если все попытки fail.
         """
+        _RETRY_DELAYS = (1.0, 2.0, 4.0)  # backoff seconds для попыток 1, 2, 3
+
         for attempt in range(_MAX_RETRIES + 1):
             content = await self._scrappey_fetch_once(client, target_url)
             if content is None:
-                # Hard fail (network, HTTP4xx, DataDome) — retry имеет смысл
+                # Hard fail (network/SSL, HTTP4xx, DataDome) — retry с backoff
                 if attempt < _MAX_RETRIES:
+                    delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
                     logger.info(
-                        "[OzonCard] retry #%d (hard fail) %s",
-                        attempt + 1, target_url[:80],
+                        "[OzonCard] retry #%d (hard fail, backoff %.0fs) %s",
+                        attempt + 1, delay, target_url[:80],
                     )
+                    await asyncio.sleep(delay)
                     continue
                 return None
             if len(content) < min_len:
                 # Soft fail — короткий HTML, бывает = пустая SPA. Retry.
                 if attempt < _MAX_RETRIES:
+                    delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
                     logger.info(
-                        "[OzonCard] retry #%d (short %d chars) %s",
-                        attempt + 1, len(content), target_url[:80],
+                        "[OzonCard] retry #%d (short %d chars, backoff %.0fs) %s",
+                        attempt + 1, len(content), delay, target_url[:80],
                     )
+                    await asyncio.sleep(delay)
                     continue
                 logger.info(
                     "[OzonCard] final HTML still too short (%d chars) for %s",
@@ -471,8 +714,18 @@ class OzonCardSource(AttributeSource):
                 json=payload,
                 headers={"Content-Type": "application/json"},
             )
-        except (httpx.TimeoutException, httpx.HTTPError) as exc:
-            logger.info("[OzonCard] Scrappey network err: %s", exc)
+        except (
+            ssl.SSLError,
+            httpx.ConnectError,
+            httpx.RemoteProtocolError,
+            httpx.TransportError,
+            httpx.TimeoutException,
+            httpx.HTTPError,
+        ) as exc:
+            logger.info("[OzonCard] Scrappey network/SSL err (transient): %s", exc)
+            # Возвращаем специальный sentinel чтобы _scrappey_fetch сделал retry
+            # с backoff. None означает hard-fail (см. _scrappey_fetch).
+            # Используем тот же None — caller уже retry-ует на None.
             return None
 
         if r.status_code >= 400:
@@ -515,6 +768,203 @@ class OzonCardSource(AttributeSource):
 
         return content
 
+    async def _fetch_card_raw(
+        self,
+        context: ExtractionContext,
+        client: httpx.AsyncClient,
+    ) -> dict:
+        """Внутренний helper: search → match → /features/ → сырые характеристики.
+
+        Возвращает dict с полями:
+          query, tiles_count, match_score, match_class, card_url,
+          raw_chars (list[dict]), image_urls (list[str]),
+          stage ("no_tiles"|"low_match"|"fetch_fail"|"parse_empty"|"ok")
+
+        Не вызывает LLM. Используется и в _do_extract, и в probe.
+        """
+        full_name = context.product_name.strip()
+        cat_leaf = context.category_path[-1] if context.category_path else None
+        primary_query = _compress_search_query(full_name, context.brand, max_tokens=5, category_name=cat_leaf)
+        fallback_query = _compress_search_query(full_name, context.brand, max_tokens=3, category_name=cat_leaf)
+
+        queries_to_try: list[str] = [primary_query]
+        if fallback_query and fallback_query != primary_query:
+            queries_to_try.append(fallback_query)
+
+        query: Optional[str] = None
+        tiles: list[dict] = []
+        for q in queries_to_try:
+            logger.info(
+                "[OzonCard] search query: '%s' (was: '%s')",
+                q, full_name[:80],
+            )
+            html = await self._scrappey_fetch(client, f"{_OZON_SEARCH_URL}?text={q}")
+            if html is None:
+                continue
+            parsed = self._parse_search_tiles_html(html)
+            if parsed:
+                query, tiles = q, parsed
+                break
+            logger.info("[OzonCard] no tiles на query='%s' — пробую fallback", q[:60])
+
+        used_query = query or primary_query
+
+        if not tiles or query is None:
+            logger.info("[OzonCard] no search tiles ни для primary ни для fallback")
+            return {
+                "query": used_query,
+                "tiles_count": 0,
+                "match_score": None,
+                "match_class": "none",
+                "card_url": None,
+                "card_title": "",
+                "raw_chars": [],
+                "image_urls": [],
+                "stage": "no_tiles",
+            }
+
+        top_tile, top_score = self._pick_best_match(query, tiles[:_MAX_SEARCH_TILES])
+        mode = self._classify_match(top_score) if top_tile is not None else "skip"
+
+        if top_tile is None or mode == "skip":
+            logger.info(
+                "[OzonCard] best score=%.1f < %.0f — skip",
+                top_score, _BRAND_LINE_THRESHOLD,
+            )
+            return {
+                "query": used_query,
+                "tiles_count": len(tiles),
+                "match_score": top_score,
+                "match_class": "none",
+                "card_url": None,
+                "card_title": (top_tile.get("title") or "") if top_tile else "",
+                "raw_chars": [],
+                "image_urls": [],
+                "stage": "low_match",
+            }
+
+        title = (top_tile.get("title") or "").strip()
+        slug = (top_tile.get("slug") or "").strip()
+        pid = (top_tile.get("pid") or "").strip()
+
+        card_url: Optional[str] = None
+        if slug and pid:
+            card_url = f"{_OZON_PRODUCT_BASE}{slug}-{pid}/"
+
+        if not slug or not pid:
+            logger.info("[OzonCard] no slug/pid in top tile")
+            return {
+                "query": used_query,
+                "tiles_count": len(tiles),
+                "match_score": top_score,
+                "match_class": mode,
+                "card_url": None,
+                "card_title": title,
+                "raw_chars": [],
+                "image_urls": [],
+                "stage": "fetch_fail",
+            }
+
+        logger.info(
+            "[OzonCard] match=%s score=%.1f title='%s' pid=%s",
+            mode, top_score, title[:80], pid,
+        )
+
+        # ---- FEATURES (HTML SSR) ----
+        features_url = f"{_OZON_PRODUCT_BASE}{slug}-{pid}/features/"
+        features_html = await self._scrappey_fetch(client, features_url)
+        if features_html is None:
+            return {
+                "query": used_query,
+                "tiles_count": len(tiles),
+                "match_score": top_score,
+                "match_class": mode,
+                "card_url": card_url,
+                "card_title": title,
+                "raw_chars": [],
+                "image_urls": [],
+                "stage": "fetch_fail",
+            }
+
+        chars = self._parse_characteristics_html(features_html)
+        image_urls = self._extract_image_urls(features_html)
+
+        if not chars:
+            logger.info("[OzonCard] no characteristics в /features/ for pid=%s", pid)
+            return {
+                "query": used_query,
+                "tiles_count": len(tiles),
+                "match_score": top_score,
+                "match_class": mode,
+                "card_url": card_url,
+                "card_title": title,
+                "raw_chars": [],
+                "image_urls": image_urls,
+                "stage": "parse_empty",
+            }
+
+        return {
+            "query": used_query,
+            "tiles_count": len(tiles),
+            "match_score": top_score,
+            "match_class": mode,
+            "card_url": card_url,
+            "card_title": title,
+            "raw_chars": chars,
+            "image_urls": image_urls,
+            "stage": "ok",
+        }
+
+    async def probe(self, context: ExtractionContext) -> dict:
+        """Диагностика матчинга карточки БЕЗ LLM-экстракции.
+
+        Выполняет: search → match → /features/ → parse chars.
+        Не вызывает LLM. Возвращает диагностический dict:
+          {
+            "query": str,
+            "tiles_count": int,
+            "match_score": float|None,
+            "match_class": "exact"|"brand_line"|"none",
+            "card_url": str|None,
+            "raw_chars": int,
+            "image_urls": int,
+            "stage": "no_tiles"|"low_match"|"fetch_fail"|"parse_empty"|"ok"|"error",
+            "found": bool,
+          }
+        """
+        try:
+            async with httpx.AsyncClient(
+                timeout=_HTTP_TIMEOUT,
+                follow_redirects=True,
+            ) as client:
+                raw = await self._fetch_card_raw(context, client)
+        except Exception as exc:
+            return {
+                "query": "",
+                "tiles_count": 0,
+                "match_score": None,
+                "match_class": "none",
+                "card_url": None,
+                "raw_chars": 0,
+                "image_urls": 0,
+                "stage": "error",
+                "found": False,
+                "error": str(exc),
+            }
+
+        return {
+            "query": raw["query"],
+            "tiles_count": raw["tiles_count"],
+            "match_score": raw["match_score"],
+            "match_class": raw["match_class"],
+            "card_url": raw["card_url"],
+            "best_tile_title": raw.get("card_title") or "",
+            "raw_chars": len(raw["raw_chars"]),
+            "image_urls": len(raw["image_urls"]),
+            "stage": raw["stage"],
+            "found": raw["stage"] == "ok" and len(raw["raw_chars"]) > 0,
+        }
+
     async def _do_extract(
         self,
         context: ExtractionContext,
@@ -525,77 +975,15 @@ class OzonCardSource(AttributeSource):
             timeout=_HTTP_TIMEOUT,
             follow_redirects=True,
         ) as client:
-            # ---- SEARCH (HTML) ----
-            # Ozon SSR пустой для длинных/слишком специфичных запросов —
-            # сжимаем product_name до brand+model+ключевая_спека.
-            # Если 5-токенный compress + 3 retries дали SPA — пробуем
-            # ультра-короткий 3-токенный fallback (часто помогает на
-            # редких/старых моделях вроде «AeroCool Cylon 600W»).
-            full_name = context.product_name.strip()
-            # Берём leaf-имя категории (последний элемент category_path) для
-            # category-aware компрессии запроса (срезаем «Монитор», «Наушники» и т.д.)
-            cat_leaf = context.category_path[-1] if context.category_path else None
-            primary_query = _compress_search_query(full_name, context.brand, max_tokens=5, category_name=cat_leaf)
-            fallback_query = _compress_search_query(full_name, context.brand, max_tokens=3, category_name=cat_leaf)
+            raw = await self._fetch_card_raw(context, client)
 
-            queries_to_try: list[str] = [primary_query]
-            if fallback_query and fallback_query != primary_query:
-                queries_to_try.append(fallback_query)
-
-            search_html: Optional[str] = None
-            query: Optional[str] = None
-            tiles: list[dict] = []
-            for q in queries_to_try:
-                logger.info(
-                    "[OzonCard] search query: '%s' (was: '%s')",
-                    q, full_name[:80],
-                )
-                html = await self._scrappey_fetch(client, f"{_OZON_SEARCH_URL}?text={q}")
-                if html is None:
-                    continue
-                parsed = self._parse_search_tiles_html(html)
-                if parsed:
-                    search_html, query, tiles = html, q, parsed
-                    break
-                logger.info("[OzonCard] no tiles на query='%s' — пробую fallback", q[:60])
-
-            if not tiles or query is None:
-                logger.info("[OzonCard] no search tiles ни для primary ни для fallback")
+            if raw["stage"] != "ok":
                 return []
 
-            top_tile, top_score = self._pick_best_match(query, tiles[:_MAX_SEARCH_TILES])
-            if top_tile is None:
-                return []
-            mode = self._classify_match(top_score)
-            if mode == "skip":
-                logger.info(
-                    "[OzonCard] best score=%.1f < %.0f — skip",
-                    top_score, _BRAND_LINE_THRESHOLD,
-                )
-                return []
-
-            title = (top_tile.get("title") or "").strip()
-            slug = (top_tile.get("slug") or "").strip()
-            pid = (top_tile.get("pid") or "").strip()
-            if not slug or not pid:
-                logger.info("[OzonCard] no slug/pid in top tile")
-                return []
-
-            logger.info(
-                "[OzonCard] match=%s score=%.1f title='%s' pid=%s",
-                mode, top_score, title[:80], pid,
-            )
-
-            # ---- FEATURES (HTML SSR) ----
-            features_url = f"{_OZON_PRODUCT_BASE}{slug}-{pid}/features/"
-            features_html = await self._scrappey_fetch(client, features_url)
-            if features_html is None:
-                return []
-
-            chars = self._parse_characteristics_html(features_html)
-            if not chars:
-                logger.info("[OzonCard] no characteristics в /features/ for pid=%s", pid)
-                return []
+            chars = raw["raw_chars"]
+            top_score = raw["match_score"] or 0.0
+            mode = raw["match_class"]
+            title = raw.get("card_title") or ""
 
             # ---- IMAGES (для downstream VisionSource) ----
             # Mutating context.image_urls — pipeline передаёт context по ссылке
@@ -603,15 +991,15 @@ class OzonCardSource(AttributeSource):
             # на товарах где OzonCard нашёл tile. Vision дополнит «визуальные»
             # attrs (цвет, RGB-подсветка, форм-фактор) которые сложно достать
             # из текста характеристик.
-            new_image_urls = self._extract_image_urls(features_html)
+            new_image_urls = raw["image_urls"]
             if new_image_urls:
                 existing = set(context.image_urls or [])
                 added = [u for u in new_image_urls if u not in existing]
                 if added:
                     context.image_urls = list(context.image_urls or []) + added
                     logger.info(
-                        "[OzonCard] +%d image URLs для VisionSource (pid=%s)",
-                        len(added), pid,
+                        "[OzonCard] +%d image URLs для VisionSource",
+                        len(added),
                     )
 
             # ---- MAP & EMIT ----
@@ -761,21 +1149,32 @@ class OzonCardSource(AttributeSource):
         query: str,
         tiles: list[dict],
     ) -> tuple[Optional[dict], float]:
-        """Top-1 по rapidfuzz (partial_ratio + token_sort_ratio averaged)."""
+        """Top-1 по rapidfuzz (partial_ratio + token_sort_ratio averaged).
+
+        Бонус +5 за общий артикул (model token) между query и tile —
+        чтобы точные совпадения модели (EC685.M, WH-1000XM5 и т.п.)
+        не тонули из-за описательных слов в tile-title.
+        Соседние модели (M90 vs M902S, 4624 vs 4621) бонуса не получают.
+        """
         try:
             from rapidfuzz import fuzz
         except ImportError:
             return (tiles[0], 100.0) if tiles else (None, 0.0)
 
+        _MODEL_BONUS = 5.0
+        q_models = _extract_model_tokens(query)
         best_tile: Optional[dict] = None
         best_score = 0.0
-        q = query.lower()
+        q = _normalize_for_fuzzy(query)
         for tile in tiles:
             title = (tile.get("title") or "").strip()
             if not title:
                 continue
-            t = title.lower()
+            t = _normalize_for_fuzzy(title)
             score = (fuzz.partial_ratio(q, t) + fuzz.token_sort_ratio(q, t)) / 2.0
+            # Бонус: есть хотя бы один общий артикул-токен → точное совпадение модели
+            if q_models and q_models & _extract_model_tokens(title):
+                score += _MODEL_BONUS
             if score > best_score:
                 best_score = score
                 best_tile = tile
