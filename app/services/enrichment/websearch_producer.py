@@ -166,7 +166,7 @@ class WebSearchProducer:
 
         # --- Full-page fetch: top-1-2 HTTPS links from organic results ---
         _PAGE_FETCH_TIMEOUT = 20      # seconds total for all page fetches
-        _PAGE_TEXT_CAP = 4500         # chars to keep per product (LLM context guard)
+        _PAGE_TEXT_CAP = 6000         # chars to keep per product (LLM context guard)
 
         top_urls = [
             r.link
@@ -183,6 +183,11 @@ class WebSearchProducer:
                     timeout=_PAGE_FETCH_TIMEOUT,
                 )
                 if raw_page_text:
+                    # Каталог-страницы (asus.com/techspec и т.п.) повторяют спеки
+                    # для каждого SKU линейки 5-10 раз → boilerplate вытесняет
+                    # ключевые спеки за cap. Дедуп строк (order-preserving) даёт
+                    # ~38% сжатия, ключевое (USB/Wi-Fi/HDMI) влезает в окно.
+                    raw_page_text = "\n".join(dict.fromkeys(raw_page_text.split("\n")))
                     page_section = (
                         "=== Текст страницы со спецификациями ===\n"
                         + raw_page_text[:_PAGE_TEXT_CAP]
