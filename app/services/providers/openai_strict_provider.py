@@ -78,7 +78,7 @@ class OpenAIStrictProvider:
                 model=self._model,
                 messages=messages,
                 temperature=0.0,
-                max_tokens=2000,
+                max_tokens=6000,
                 response_format={
                     "type": "json_schema",
                     "json_schema": {

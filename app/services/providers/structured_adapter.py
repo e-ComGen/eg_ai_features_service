@@ -95,7 +95,7 @@ class StructuredLlmManager:
                 messages=messages,
                 model=self._model,
                 temperature=0.2,
-                max_tokens=2000,
+                max_tokens=6000,
                 response_format={"type": "json_object"},
             )
         except Exception as exc:

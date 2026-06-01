@@ -27,7 +27,7 @@ class LlmProvider(ABC):
         messages: list[dict],
         model: str,
         temperature: float = 0.0,
-        max_tokens: int = 2000,
+        max_tokens: int = 6000,
         response_format: Optional[dict] = None,  # e.g. {"type": "json_object"}
         timeout: int = 60,
     ) -> LlmResponse:

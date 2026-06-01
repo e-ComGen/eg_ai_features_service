@@ -58,7 +58,7 @@ class OpenRouterProvider(LlmProvider):
         messages: list[dict],
         model: str = "google/gemini-2.5-flash",
         temperature: float = 0.0,
-        max_tokens: int = 2000,
+        max_tokens: int = 6000,
         response_format: Optional[dict] = None,
         timeout: int = 60,
     ) -> LlmResponse:

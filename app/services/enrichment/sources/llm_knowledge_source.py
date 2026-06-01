@@ -93,7 +93,8 @@ class LlmKnowledgeSource(AttributeSource):
             return []
 
         # Build prompt с type-aware подсказками
-        targets_block = "\n".join([format_target_line(t) for t in effective_targets])
+        # Батчинг: разбиваем targets на чанки по CHUNK_SIZE, context не дублируем
+        CHUNK_SIZE = 30
         already_preamble, already_rule = build_already_filled_block(already_filled or [])
 
         system_prompt = (
@@ -112,33 +113,46 @@ class LlmKnowledgeSource(AttributeSource):
             + build_meta_guidance()
             + already_rule
         )
-        user_text = (
+
+        context_prefix = (
             f"Product: {context.product_name}\n"
             f"Brand: {context.brand or 'unknown'}\n"
             f"Category: {' / '.join(context.category_path) or 'n/a'}\n\n"
             + already_preamble
-            + f"Target attributes:\n{targets_block}\n\n"
-            f"Return only attributes you confidently know. Field name: 'known_attributes'."
         )
 
-        response_model = self._strategy.build_response_model(_KnowledgeResponse, targets)
-        # Маршрутизация: enum-heavy модели → OpenAI strict mode для token-level enforcement
-        llm = self._llm
-        if getattr(response_model, "__has_enum_constraints__", False):
-            strict = get_openai_strict_manager()
-            if strict is not None:
-                llm = strict
-        parsed, tokens = await llm.structured_request(
-            system_prompt=system_prompt,
-            user_text=user_text,
-            response_model=response_model,
-        )
-        if parsed is None:
-            return []
-
-        context.llm_calls_so_far += 1
+        chunks = [
+            effective_targets[i: i + CHUNK_SIZE]
+            for i in range(0, len(effective_targets), CHUNK_SIZE)
+        ]
 
         target_by_id = {t.id: t for t in targets}
+        all_extracted: list[_KnowledgeAttr] = []
+
+        for chunk in chunks:
+            targets_block = "\n".join([format_target_line(t) for t in chunk])
+            user_text = (
+                context_prefix
+                + f"Target attributes:\n{targets_block}\n\n"
+                f"Return only attributes you confidently know. Field name: 'known_attributes'."
+            )
+
+            response_model = self._strategy.build_response_model(_KnowledgeResponse, chunk)
+            # Маршрутизация: enum-heavy модели → OpenAI strict mode для token-level enforcement
+            llm = self._llm
+            if getattr(response_model, "__has_enum_constraints__", False):
+                strict = get_openai_strict_manager()
+                if strict is not None:
+                    llm = strict
+            parsed, _tokens = await llm.structured_request(
+                system_prompt=system_prompt,
+                user_text=user_text,
+                response_model=response_model,
+            )
+            context.llm_calls_so_far += 1
+            if parsed is not None:
+                all_extracted.extend(parsed.known_attributes)
+
         return [
             AttributeValue(
                 attribute_id=a.attribute_id,
@@ -151,7 +165,7 @@ class LlmKnowledgeSource(AttributeSource):
                 is_collection=target_by_id[a.attribute_id].is_collection
                               if a.attribute_id in target_by_id else False,
             )
-            for a in parsed.known_attributes
+            for a in all_extracted
         ]
 
     def get_judge(self) -> LlmJudge:
