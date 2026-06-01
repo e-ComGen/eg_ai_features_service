@@ -34,7 +34,19 @@ _OZON_CROSSFILL_PAIRS: tuple[tuple[int, int], ...] = (
     (4381, 9024),   # Партномер ↔ Код продавца (MPN)
     (9048, 12141),  # Название модели (для объединения в одну карточку) ↔
                     # Название модели для шаблона наименования
+    (9048, 9336),   # Название модели (для объединения) ↔ Модель/Марка
 )
+
+# R1: Атрибут «Объединить на одной карточке» (8292) — строится из бренд+модель.
+# Если поле пусто ИЛИ содержит буквальный label поля (невалидно), деривируем.
+_CARD_GROUP_ATTR_ID = 8292
+# Стоп-слова категории/гендера, которые нужно срезать из product_name при деривации 8292
+_CARD_GROUP_STOPWORDS: frozenset[str] = frozenset({
+    "мужской", "мужская", "мужское", "мужские",
+    "женский", "женская", "женское", "женские",
+    "детский", "детская", "детское", "детские",
+    "унисекс",
+})
 
 # Confidence для значений, проставленных детерминированно (CategoryDefaults / cross-fill).
 _DEFAULT_CONFIDENCE = 0.85
@@ -69,6 +81,61 @@ _OZON_TYPE_MAP: dict[str, str] = {
 def _ozon_type_to_attr_type(ozon_type: str) -> str:
     """Перевести Ozon API type string в TargetAttribute.type."""
     return _OZON_TYPE_MAP.get(ozon_type, "text")
+
+
+def _derive_card_group_value(
+    product_name: str,
+    brand: Optional[str],
+    category_leaf: Optional[str],
+) -> str:
+    """Деривировать значение «Объединить на одной карточке» (8292): бренд + модельная строка.
+
+    Алгоритм (generic — без хардкода категорий):
+      1. Срезаем категорийный префикс (leaf name) — как в ozon_card_source._strip_category_prefix.
+      2. Срезаем ведущие гендерные стоп-слова (_CARD_GROUP_STOPWORDS).
+      3. Берём первые 5 токенов (бренд + модель, без спек-хвоста).
+
+    Пример: Футболка мужская Nike Sportswear Club + leaf Футболка
+      -> срезаем Футболка -> мужская Nike Sportswear Club
+      -> срезаем мужская  -> Nike Sportswear Club
+      -> первые 5 токенов -> Nike Sportswear Club
+    """
+    result = product_name.strip()
+
+    # Шаг 1: срезаем категорийный префикс
+    if category_leaf:
+        low = result.lower()
+        cat_low = category_leaf.strip().lower()
+        if low.startswith(cat_low):
+            result = result[len(cat_low):].strip()
+        else:
+            cat_words = {w for w in cat_low.split() if len(w) > 2}
+            if cat_words:
+                words = result.split()
+                i = 0
+                while i < len(words) and words[i].lower() in cat_words:
+                    i += 1
+                if i > 0:
+                    result = " ".join(words[i:]).strip()
+
+    # Шаг 2: срезаем ведущие гендерные стоп-слова
+    tokens = result.split()
+    i = 0
+    while i < len(tokens) and tokens[i].lower() in _CARD_GROUP_STOPWORDS:
+        i += 1
+    if i > 0 and i < len(tokens):
+        tokens = tokens[i:]
+
+    # Шаг 3: первые 5 токенов = бренд + модельная строка
+    result = " ".join(tokens[:5]).strip()
+
+    # Если brand задан и не попал — prepend (защита от случаев где он выпал при срезе)
+    if brand and brand.strip():
+        b = brand.strip()
+        if b.lower() not in result.lower():
+            result = f"{b} {result}".strip()
+
+    return result or product_name.strip()
 
 
 def _build_char_index(characteristics: list[dict]) -> dict[int, dict]:
@@ -398,6 +465,50 @@ class OzonStrategy(MarketplaceStrategy):
                 existing_ids.add(dst_id)
                 # Обновляем индекс чтобы не заполнять dst ещё раз если пара встретится снова
                 values_by_id[dst_id] = av
+
+        # (D) Детерминированный дериватив для атрибута 8292
+        # «Объединить на одной карточке» — уникальный ключ карточки = бренд + модель.
+        # Заполняем если:
+        #   - 8292 входит в targets
+        #   - 8292 ещё не заполнен (existing_ids) ИЛИ заполнен невалидным placeholder-ом
+        #     (label поля, например буквальный текст «Объединить на одной карточке»).
+        if _CARD_GROUP_ATTR_ID in target_ids and context.product_name:
+            # Находим target для 8292 чтобы получить name (label)
+            card_group_target = next(
+                (t for t in targets if t.id == _CARD_GROUP_ATTR_ID), None
+            )
+            field_label = (card_group_target.name if card_group_target else "").lower()
+            existing_val: Optional[str] = None
+            if _CARD_GROUP_ATTR_ID in existing_ids:
+                existing_av = values_by_id.get(_CARD_GROUP_ATTR_ID)
+                if existing_av and existing_av.value is not None:
+                    existing_val = str(existing_av.value).strip()
+            # Считаем невалидным: пусто ИЛИ значение совпадает с именем поля/label
+            is_invalid = (
+                existing_val is None
+                or existing_val == ""
+                or (field_label and existing_val.lower() == field_label)
+            )
+            if is_invalid:
+                cat_leaf = context.category_path[-1] if context.category_path else None
+                derived = _derive_card_group_value(
+                    context.product_name, context.brand, cat_leaf
+                )
+                if derived:
+                    av_8292 = AttributeValue(
+                        attribute_id=_CARD_GROUP_ATTR_ID,
+                        value=derived,
+                        confidence=_DEFAULT_CONFIDENCE,
+                        source=Source.DESCRIPTION,
+                        evidence="deterministic: brand+model",
+                    )
+                    if _CARD_GROUP_ATTR_ID in existing_ids:
+                        # Заменяем невалидный placeholder: убираем старый из extras и values
+                        extras = [e for e in extras if e.attribute_id != _CARD_GROUP_ATTR_ID]
+                        values = [v for v in values if v.attribute_id != _CARD_GROUP_ATTR_ID]
+                    extras.append(av_8292)
+                    existing_ids.add(_CARD_GROUP_ATTR_ID)
+                    values_by_id[_CARD_GROUP_ATTR_ID] = av_8292
 
         return list(values) + extras
 
