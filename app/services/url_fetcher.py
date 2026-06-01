@@ -17,12 +17,17 @@ All fetches are:
   - Limited to 10 s timeout per URL
   - Run in parallel via asyncio.gather
   - Non-fatal: individual URL failures are logged and skipped
+  - Retried on transient errors (429/5xx/timeout/connect) with exponential backoff
+  - Cached on disk (SHA-256 key, only successful non-empty results)
 """
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Literal, Optional
 
@@ -46,6 +51,158 @@ _HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+# ---------------------------------------------------------------------------
+# Retry configuration
+# ---------------------------------------------------------------------------
+
+_RETRY_ATTEMPTS = 3                    # total attempts (1 original + 2 retries)
+_RETRY_BACKOFF = [1.0, 2.0, 4.0]      # seconds between retries
+# HTTP status codes that are transient and worth retrying
+_TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+# Errors that indicate a hard block / missing page — do NOT retry
+_HARD_FAIL_STATUSES = {403, 404}
+
+# ---------------------------------------------------------------------------
+# Disk cache
+# ---------------------------------------------------------------------------
+
+# Cache directory lives beside this file's project root; override via env var.
+_CACHE_DIR = os.environ.get(
+    "FETCH_CACHE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".fetch_cache"),
+)
+
+
+def _cache_key(url: str) -> str:
+    """SHA-256 hex digest of the URL, used as cache file name."""
+    return hashlib.sha256(url.encode()).hexdigest()
+
+
+def _cache_path(url: str) -> str:
+    return os.path.join(_CACHE_DIR, _cache_key(url) + ".txt")
+
+
+def _cache_read(url: str) -> Optional[str]:
+    """Return cached text for URL, or None on miss."""
+    path = _cache_path(url)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        if text:
+            logger.debug("cache hit: %s", url)
+            return text
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.debug("cache read error for %r: %s", url, exc)
+    return None
+
+
+def _cache_write(url: str, text: str) -> None:
+    """Persist text for URL only when text is non-empty."""
+    if not text:
+        return
+    try:
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+        path = _cache_path(url)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        logger.debug("cache write: %s", url)
+    except Exception as exc:
+        logger.debug("cache write error for %r: %s", url, exc)
+
+
+# ---------------------------------------------------------------------------
+# Retry helper
+# ---------------------------------------------------------------------------
+
+async def _get_with_retry(
+    url: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    extra_headers: Optional[dict] = None,
+) -> Optional[httpx.Response]:
+    """
+    Perform an HTTP GET with retry + exponential backoff on transient errors.
+
+    Transient (retried):  429, 5xx, TimeoutException, ConnectError,
+                          RemoteProtocolError.
+    Hard failure (skipped): 403, 404 — return None immediately, no retry.
+    Other HTTP errors:    return None after logging.
+
+    Returns the Response on success, None on final failure.
+    Respects Retry-After header on 429.
+    """
+    headers = dict(_HEADERS)
+    if extra_headers:
+        headers.update(extra_headers)
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                headers=headers,
+                follow_redirects=True,
+            ) as client:
+                resp = await client.get(url)
+
+            if resp.status_code in _HARD_FAIL_STATUSES:
+                logger.warning(
+                    "fetch hard-fail HTTP %s for %r — not retrying",
+                    resp.status_code, url,
+                )
+                return None
+
+            if resp.status_code in _TRANSIENT_STATUSES:
+                wait = _retry_wait(resp, attempt)
+                logger.warning(
+                    "fetch HTTP %s for %r (attempt %d/%d) — retrying in %.1fs",
+                    resp.status_code, url, attempt + 1, _RETRY_ATTEMPTS, wait,
+                )
+                await asyncio.sleep(wait)
+                last_exc = httpx.HTTPStatusError(
+                    f"HTTP {resp.status_code}", request=resp.request, response=resp
+                )
+                continue
+
+            resp.raise_for_status()   # raise for any other 4xx/5xx
+            return resp
+
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+            wait = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
+            logger.warning(
+                "fetch transient error for %r (attempt %d/%d, %s) — retrying in %.1fs",
+                url, attempt + 1, _RETRY_ATTEMPTS, type(exc).__name__, wait,
+            )
+            last_exc = exc
+            await asyncio.sleep(wait)
+
+        except httpx.HTTPStatusError as exc:
+            # Non-transient, non-hard HTTP error (e.g. 401, 405) — give up
+            logger.warning("fetch HTTP error for %r: %s", url, exc)
+            return None
+
+        except Exception as exc:
+            logger.warning("fetch unexpected error for %r: %s", url, exc)
+            return None
+
+    logger.warning("fetch gave up after %d attempts for %r: %s", _RETRY_ATTEMPTS, url, last_exc)
+    return None
+
+
+def _retry_wait(resp: httpx.Response, attempt: int) -> float:
+    """Return seconds to wait before the next retry, honouring Retry-After."""
+    ra = resp.headers.get("Retry-After")
+    if ra:
+        try:
+            return max(0.0, float(ra))
+        except ValueError:
+            pass
+        # Retry-After may also be an HTTP-date — skip parsing, use backoff
+    return _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
+
+
+# ---------------------------------------------------------------------------
 
 @dataclass
 class FetchResult:
@@ -102,11 +259,17 @@ async def fetch_wildberries(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optiona
         f"https://card.wb.ru/cards/v2/detail"
         f"?appType=1&curr=rub&dest=-1257786&spp=27&nm={nm_id}"
     )
+
+    # Check cache first (cache key on the canonical api_url)
+    cached = _cache_read(api_url)
+    if cached is not None:
+        return FetchResult(url=url, content=cached, source_type="wb")
+
     try:
-        async with httpx.AsyncClient(timeout=timeout, headers=_HEADERS, follow_redirects=True) as client:
-            resp = await client.get(api_url)
-            resp.raise_for_status()
-            data = resp.json()
+        resp = await _get_with_retry(api_url, timeout=timeout)
+        if resp is None:
+            return None
+        data = resp.json()
 
         # Extract useful text fields from the WB API response
         parts: list[str] = []
@@ -129,6 +292,8 @@ async def fetch_wildberries(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optiona
         if not content:
             content = json.dumps(data, ensure_ascii=False)
         content = content[:MAX_CONTENT_BYTES]
+
+        _cache_write(api_url, content)
         return FetchResult(url=url, content=content, source_type="wb")
 
     except Exception as exc:
@@ -145,11 +310,15 @@ async def fetch_aliexpress(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optional
     Attempt to extract JSON-LD from AliExpress product page.
     Falls back to generic extraction.
     """
+    cached = _cache_read(url)
+    if cached is not None:
+        return FetchResult(url=url, content=cached, source_type="ali")
+
     try:
-        async with httpx.AsyncClient(timeout=timeout, headers=_HEADERS, follow_redirects=True) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            html = resp.text
+        resp = await _get_with_retry(url, timeout=timeout)
+        if resp is None:
+            return None
+        html = resp.text
 
         # Try JSON-LD first
         ld_matches = re.findall(
@@ -172,12 +341,14 @@ async def fetch_aliexpress(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optional
 
         if parts:
             content = "\n".join(parts)[:MAX_CONTENT_BYTES]
+            _cache_write(url, content)
             return FetchResult(url=url, content=content, source_type="ali")
 
         # Fallback to generic
         result = await _extract_generic_from_html(url, html)
         if result:
             result.source_type = "ali"
+            _cache_write(url, result.content)
         return result
 
     except Exception as exc:
@@ -194,11 +365,15 @@ async def fetch_ozon(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optional[Fetch
     Attempt to extract __NEXT_DATA__ or __INITIAL_STATE__ from Ozon product page.
     Falls back to generic extraction.
     """
+    cached = _cache_read(url)
+    if cached is not None:
+        return FetchResult(url=url, content=cached, source_type="ozon")
+
     try:
-        async with httpx.AsyncClient(timeout=timeout, headers=_HEADERS, follow_redirects=True) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            html = resp.text
+        resp = await _get_with_retry(url, timeout=timeout)
+        if resp is None:
+            return None
+        html = resp.text
 
         # Try __NEXT_DATA__
         m = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, re.DOTALL)
@@ -211,6 +386,7 @@ async def fetch_ozon(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optional[Fetch
                 _extract_ozon_props(page_props, parts)
                 if parts:
                     content = "\n".join(parts)[:MAX_CONTENT_BYTES]
+                    _cache_write(url, content)
                     return FetchResult(url=url, content=content, source_type="ozon")
             except (json.JSONDecodeError, TypeError, AttributeError):
                 pass
@@ -221,6 +397,7 @@ async def fetch_ozon(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optional[Fetch
             try:
                 data = json.loads(m2.group(1))
                 text_dump = json.dumps(data, ensure_ascii=False)[:MAX_CONTENT_BYTES]
+                _cache_write(url, text_dump)
                 return FetchResult(url=url, content=text_dump, source_type="ozon")
             except (json.JSONDecodeError, TypeError):
                 pass
@@ -229,6 +406,7 @@ async def fetch_ozon(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optional[Fetch
         result = await _extract_generic_from_html(url, html)
         if result:
             result.source_type = "ozon"
+            _cache_write(url, result.content)
         return result
 
     except Exception as exc:
@@ -259,22 +437,28 @@ async def fetch_url_content(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optiona
     """
     Generic HTTPS-only fetch with main-content extraction.
     Uses trafilatura if available, otherwise falls back to basic HTML stripping.
+    Retries on transient errors; returns cached result on repeated calls.
     """
     if not url.startswith("https://"):
         logger.warning("fetch_url_content: rejected non-HTTPS URL %r", url)
         return None
 
+    # Cache check
+    cached = _cache_read(url)
+    if cached is not None:
+        return FetchResult(url=url, content=cached, source_type="generic")
+
     try:
-        async with httpx.AsyncClient(timeout=timeout, headers=_HEADERS, follow_redirects=True) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            html = resp.text
+        resp = await _get_with_retry(url, timeout=timeout)
+        if resp is None:
+            return None
+        html = resp.text
 
-        return await _extract_generic_from_html(url, html)
+        result = await _extract_generic_from_html(url, html)
+        if result:
+            _cache_write(url, result.content)
+        return result
 
-    except httpx.TimeoutException:
-        logger.warning("fetch_url_content: timeout for %r", url)
-        return None
     except Exception as exc:
         logger.warning("fetch_url_content failed for %r: %s", url, exc)
         return None

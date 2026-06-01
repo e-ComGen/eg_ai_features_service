@@ -160,6 +160,16 @@ class WebSearchSource(AttributeSource):
             if parsed is not None:
                 all_extracted.extend(parsed.extracted)
 
+        # Дедуп + защита от кросс-чанк галлюцинаций: оставляем только id, которые
+        # реально были в effective_targets, первое вхождение на id.
+        _eff_ids = {t.id for t in effective_targets}
+        _seen: set[int] = set()
+        all_extracted = [
+            a for a in all_extracted
+            if a.attribute_id in _eff_ids
+            and not (a.attribute_id in _seen or _seen.add(a.attribute_id))
+        ]
+
         return [
             AttributeValue(
                 attribute_id=a.attribute_id,
