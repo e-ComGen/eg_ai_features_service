@@ -4,6 +4,9 @@ pydantic
 redis
 openai>=2.0.0
 rapidfuzz
+# RU morphology for dictionary value matching (adjective→noun stem affinity)
+pymorphy3
+pymorphy3-dicts-ru
 sentence-transformers
 numpy
 python-dotenv

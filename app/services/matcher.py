@@ -1,9 +1,24 @@
 import pickle
 import os
+import re
 import numpy as np
 from rapidfuzz import fuzz
 from sentence_transformers import SentenceTransformer, util
 import torch
+
+# Морфология (RU): прилагательное-кандидат → существительное-основа словаря Ozon.
+# Лемматизация + сопоставление общей основы (корня), без хардкода словарей синонимов.
+try:
+    import pymorphy3
+    _MORPH = pymorphy3.MorphAnalyzer()
+except Exception:  # pragma: no cover - морфология опциональна
+    _MORPH = None
+
+# Стоп-токены, которые не несут смысловой нагрузки при сопоставлении лемм.
+_LEMMA_STOPWORDS = {
+    "и", "или", "для", "из", "с", "со", "на", "в", "не", "по", "the", "a", "of",
+}
+_TOKEN_RE = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
 
 
 class MatcherService:
@@ -19,6 +34,11 @@ class MatcherService:
         # Файл для хранения векторов (замена Redis)
         self.vector_file = 'vectors.pkl'
         self.vector_cache = self._load_vectors()
+
+        # Кэш лемм по строкам и кэш лемматизированных allowed-списков по id(list).
+        # Критично для перфоманса: один и тот же enum не лемматизируем повторно.
+        self._lemma_token_cache: dict[str, list[str]] = {}
+        self._options_lemma_cache: dict[int, list[list[str]]] = {}
 
         print(f"✅ Model loaded. Vector cache size: {len(self.vector_cache)}")
 
@@ -54,6 +74,105 @@ class MatcherService:
         self._save_vectors()
 
         return vector
+
+    def _lemmatize_tokens(self, text: str) -> list[str]:
+        """Лемматизировать значимые токены строки к нормальной форме.
+
+        Кэшируется по исходной строке. Прилагательные нормализуются к своей
+        нормальной форме (pymorphy не превращает прил.→сущ., поэтому связка
+        прил.↔основа-сущ. делается позже через общую основу/корень).
+        """
+        if _MORPH is None:
+            return []
+        if text in self._lemma_token_cache:
+            return self._lemma_token_cache[text]
+        lemmas: list[str] = []
+        for tok in _TOKEN_RE.findall(text.lower()):
+            if tok in _LEMMA_STOPWORDS or len(tok) < 3:
+                continue
+            try:
+                lemmas.append(_MORPH.parse(tok)[0].normal_form)
+            except Exception:
+                lemmas.append(tok)
+        self._lemma_token_cache[text] = lemmas
+        return lemmas
+
+    @staticmethod
+    def _stem_affinity(a: str, b: str) -> float:
+        """Близость двух лемм по общей основе (корню).
+
+        Возвращает 0..1. Высокое значение означает однокоренные слова
+        (прил. ↔ сущ.): `хлопковый`↔`хлопок`, `эластичный`↔`эластан`.
+        Требует длинной общей приставки-корня — разные корни дают ~0.
+        """
+        if not a or not b:
+            return 0.0
+        common = 0
+        for x, y in zip(a, b):
+            if x == y:
+                common += 1
+            else:
+                break
+        shorter = min(len(a), len(b))
+        if shorter == 0:
+            return 0.0
+        # Минимум 4 общих символа корня — иначе считаем совпадение случайным
+        # (`всесезонный` vs `демисезон` имеют общий хвост, но разный корень → 0).
+        if common < 4:
+            return 0.0
+        return common / shorter
+
+    def _lemma_fallback_match(self, target: str, options: list[str]) -> str | None:
+        """Морфологический fallback: связать прил.-кандидат с сущ.-основой словаря.
+
+        Лемматизирует target и каждый allowed (с кэшем на список options),
+        считает близость по общей основе, принимает ТОЛЬКО однозначного
+        победителя с заметным отрывом от второго места. Иначе None.
+        """
+        if _MORPH is None:
+            return None
+        target_lemmas = self._lemmatize_tokens(target)
+        if not target_lemmas:
+            return None
+
+        cache_key = id(options)
+        options_lemmas = self._options_lemma_cache.get(cache_key)
+        if options_lemmas is None or len(options_lemmas) != len(options):
+            options_lemmas = [self._lemmatize_tokens(opt) for opt in options]
+            self._options_lemma_cache[cache_key] = options_lemmas
+
+        STEM_THRESHOLD = 0.60     # минимальная доля общего корня
+        MARGIN = 0.15             # отрыв лучшего от второго — гард от неоднозначности
+
+        scores: list[float] = []
+        for opt_lemmas in options_lemmas:
+            if not opt_lemmas:
+                scores.append(0.0)
+                continue
+            # Лучшая пара токенов (любой токен target ↔ любой токен allowed).
+            best_pair = 0.0
+            for tl in target_lemmas:
+                for ol in opt_lemmas:
+                    if tl == ol:
+                        best_pair = max(best_pair, 1.0)
+                    else:
+                        best_pair = max(best_pair, self._stem_affinity(tl, ol))
+            scores.append(best_pair)
+
+        best_idx = int(np.argmax(scores))
+        best_score = scores[best_idx]
+        if best_score < STEM_THRESHOLD:
+            return None
+
+        # Гард от ложных совпадений: второй по близости не должен быть рядом.
+        second = 0.0
+        for i, s in enumerate(scores):
+            if i != best_idx and s > second:
+                second = s
+        if best_score - second < MARGIN:
+            return None
+
+        return options[best_idx]
 
     def find_best_match(self, target: str, options: list[str]) -> str | None:
         if not options or not target:
@@ -105,6 +224,13 @@ class MatcherService:
 
         if best_vec_score >= 0.60:
             return candidate
+
+        # --- ЭТАП 3: Морфология (прил.-кандидат → сущ.-основа словаря) ---
+        # Спасает RU-прилагательные от источников: `хлопковый`→`Хлопок`,
+        # `эластичный`→`Эластан`. Только однозначные совпадения по общей основе.
+        lemma_match = self._lemma_fallback_match(target, options)
+        if lemma_match is not None:
+            return lemma_match
 
         print(f"\n💀 [MATCHING FAILED] -------------------------------")
         print(f"   📥 AI Output:    '{target}'")
