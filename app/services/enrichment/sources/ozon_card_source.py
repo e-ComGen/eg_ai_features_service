@@ -425,6 +425,16 @@ def _compress_search_query(
     tokens_after_cat = _strip_leading_stopwords(tokens_after_cat)
     result = " ".join(tokens_after_cat)
 
+    # ---- Шаг 2.5: восстановить тип категории если осталось < 3 значимых токенов ----
+    # «Платье женское befree летнее» → после среза категории «Платье» и стоп-слова
+    # «женское» → «befree летнее» (2 токена, нет типа товара). Ozon-заголовки начинаются
+    # с типа («Платье befree…»), поэтому без него fuzzy-score падает ниже порога.
+    # Препендируем ПЕРВОЕ слово category_name обратно — generic, без хардкода категорий.
+    if category_name and _count_meaningful_tokens(tokens_after_cat) < 3:
+        first_cat_word = category_name.strip().split()[0]
+        if first_cat_word.lower() not in result.lower():
+            result = f"{first_cat_word} {result}".strip()
+
     # ---- Шаг 3: срезать хвостовые спек-токены ----
     all_tokens = result.split()
     all_tokens = _strip_trailing_specs(all_tokens)

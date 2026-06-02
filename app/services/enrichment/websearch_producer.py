@@ -25,7 +25,9 @@ _WS_USER_TEMPLATE = (
     "\n"
     "Search manufacturer websites, official retailer pages, or trusted review sites. "
     "Return a plain-text summary of the product characteristics you found "
-    "(dimensions, weight, material, colour, capacity, power, etc.). "
+    "(dimensions, weight, material, colour, capacity, power, etc.; "
+    "for apparel/footwear/textiles also include: fabric/material composition, season, "
+    "fit/cut/style, care instructions if available). "
     "If you cannot find reliable information, state that explicitly — do NOT invent specs."
 )
 
@@ -33,7 +35,9 @@ _SERPER_EXTRACTION_SYSTEM = (
     "You are a product data extractor. "
     "Below are web search snippets about a specific product. "
     "Extract and summarise the technical characteristics and specifications you find "
-    "(dimensions, weight, material, colour, capacity, power, connectivity, etc.). "
+    "(dimensions, weight, material, colour, capacity, power, connectivity, etc.; "
+    "for apparel/footwear/textiles also include: fabric/material composition, season, "
+    "fit/cut/style, care instructions, gender, and age group if mentioned). "
     "Write a concise plain-text summary. "
     "Do NOT invent any specs not present in the snippets. "
     "If the snippets don't contain useful data, say so explicitly."
