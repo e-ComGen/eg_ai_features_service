@@ -124,6 +124,59 @@ class WebSearchProducer:
             return await self._produce_via_openai(product_name, brand, ean, mpn, timeout)
 
     # ------------------------------------------------------------------
+    # Boilerplate guard (generic, no domain hardcode)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _looks_like_boilerplate(text: str) -> bool:
+        """Generic heuristic: True if `text` is mostly markup/scripts or has
+        almost no «spec signal», so it should NOT be fed to the LLM.
+
+        Two checks (either trips the guard):
+          1. Markup ratio: high density of `<`, `{`, `}`, `function`/`var `/
+             stylesheet tokens relative to length → trafilatura failed and we
+             got raw JS/CSS instead of content.
+          2. Spec-signal density: real specs contain digits + colons + units
+             («Состав: 95% хлопок»). Near-zero of those over a long blob → noise.
+
+        Pure heuristic, no hardcoded domains.
+        """
+        if not text:
+            return True
+
+        n = len(text)
+        lowered = text.lower()
+
+        # --- 1. Markup / script density ---
+        markup_chars = lowered.count("<") + lowered.count("{") + lowered.count("}")
+        markup_tokens = (
+            lowered.count("function")
+            + lowered.count("var ")
+            + lowered.count("</")
+            + lowered.count("px;")
+            + lowered.count("rgba(")
+            + lowered.count("@media")
+            + lowered.count("script")
+            + lowered.count("stylesheet")
+        )
+        # Each token ~ several "junk" chars; weight them.
+        junk_score = markup_chars + markup_tokens * 8
+        if n > 0 and (junk_score / n) > 0.04:
+            return True
+
+        # --- 2. Spec-signal density ---
+        # Real specs are dense with digits and key:value colons.
+        digits = sum(c.isdigit() for c in text)
+        colons = text.count(":")
+        # For a non-trivial blob, expect some digits and at least a few colons.
+        if n >= 400:
+            if digits == 0 or colons < 2:
+                return True
+            if (digits / n) < 0.004 and colons < 4:
+                return True
+
+        return False
+
+    # ------------------------------------------------------------------
     # Serper path: Google search + LLM extraction
     # ------------------------------------------------------------------
     async def _produce_via_serper(
@@ -168,6 +221,19 @@ class WebSearchProducer:
             )
             return None
 
+        # --- Snippets are the PRIMARY signal ---
+        # Serper organic snippets уже содержат реальные спеки
+        # («Сезон: …; Материал: …; Состав: …»). Retail-HTML-фетч часто = 403
+        # или JS/CSS-мусор, который РАЗБАВЛЯЕТ полезные сниппеты и вытесняет их
+        # за cap. Поэтому сниппеты идут ПЕРВЫМИ в context (гарантированно доходят
+        # до LLM), а текст страницы добавляется ПОСЛЕ и только если прошёл гард
+        # от boilerplate.
+        snippets = [
+            f"[{r.position}] {r.title}\n{r.snippet}"
+            for r in results.organic_results[:5]
+        ]
+        snippet_section = "\n\n".join(snippets)
+
         # --- Full-page fetch: top-1-2 HTTPS links from organic results ---
         _PAGE_FETCH_TIMEOUT = 20      # seconds total for all page fetches
         _PAGE_TEXT_CAP = 6000         # chars to keep per product (LLM context guard)
@@ -192,17 +258,28 @@ class WebSearchProducer:
                     # ключевые спеки за cap. Дедуп строк (order-preserving) даёт
                     # ~38% сжатия, ключевое (USB/Wi-Fi/HDMI) влезает в окно.
                     raw_page_text = "\n".join(dict.fromkeys(raw_page_text.split("\n")))
-                    page_section = (
-                        "=== Текст страницы со спецификациями ===\n"
-                        + raw_page_text[:_PAGE_TEXT_CAP]
-                        + "\n"
-                    )
-                    logger.debug(
-                        "WebSearchProducer (serper): fetched %d chars from %d page(s) for %r.",
-                        len(raw_page_text),
-                        len(top_urls),
-                        product_name,
-                    )
+                    # Boilerplate-гард: если страница — преимущественно
+                    # разметка/скрипты (антибот вернул JS/CSS-мусор вместо
+                    # контента) ИЛИ почти нет «спек-сигнала» — ОТБРОСИТЬ, чтобы
+                    # не разбавлять сниппеты. Эвристика генеричная, без хардкода.
+                    if self._looks_like_boilerplate(raw_page_text):
+                        logger.debug(
+                            "WebSearchProducer (serper): page text looks like boilerplate "
+                            "for %r — dropped, using snippets only.",
+                            product_name,
+                        )
+                    else:
+                        page_section = (
+                            "\n\n=== Текст страницы со спецификациями ===\n"
+                            + raw_page_text[:_PAGE_TEXT_CAP]
+                            + "\n"
+                        )
+                        logger.debug(
+                            "WebSearchProducer (serper): fetched %d chars from %d page(s) for %r.",
+                            len(raw_page_text),
+                            len(top_urls),
+                            product_name,
+                        )
             except asyncio.TimeoutError:
                 logger.warning(
                     "WebSearchProducer (serper): page fetch timed out (%ds) for %r — using snippets only.",
@@ -217,12 +294,8 @@ class WebSearchProducer:
                 )
         # -------------------------------------------------------------------
 
-        # Build context from top snippets
-        snippets = [
-            f"[{r.position}] {r.title}\n{r.snippet}"
-            for r in results.organic_results[:5]
-        ]
-        search_context = page_section + "\n\n".join(snippets)
+        # Snippets first (primary), page text appended after (secondary, guarded).
+        search_context = snippet_section + page_section
 
         # 1 LLM call: extract characteristics from snippets
         user_text = (
