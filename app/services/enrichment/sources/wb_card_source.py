@@ -3,8 +3,12 @@
 Старый путь ходил на ``search.wb.ru`` — WB банит серверный IP (0 заполнений).
 Новый путь полностью минует anti-bot WB:
 
-  1. **Сжать запрос**: ``_compress_search_query`` (category-aware, из ozon_card_source)
-     чистит «грязный» product_name (срез категорийного префикса, стоп-слов, спеков).
+  1. **Построить запрос**: ``_build_wb_query`` чистит product_name через
+     ``_compress_search_query`` (срез стоп-слов/спеков/бренд-дублей), НО, в
+     отличие от Ozon, ОБЯЗАТЕЛЬНО сохраняет ТИП-слово товара («куртка»,
+     «футболка») — для WB Serper-поиска тип критичен (без него выдача уходит в
+     чужой класс товара). Тип берётся динамически: первое сущ. category leaf или
+     ведущее сущ. названия (pymorphy3), без хардкода списков типов.
   2. **Найти nm_id через Serper** (НЕ search.wb.ru). Запрос вида
      ``inurl:catalog detail.aspx <query>`` → ~100% прямых ссылок на карточки WB.
      Из organic-результатов nm_id вытаскивается регэкспом, предпочитая домен
@@ -18,8 +22,12 @@
   4. **Распарсить характеристики**: ``options[]``, ``grouped_options[].options``,
      ``compositions[]`` (Состав) → пары name→value.
   5. **Выбрать лучший кандидат** среди скачанных card.json: ``_pick_best_card``
-     сначала отсекает нерелевантные по матч-скору (``_pick_best_match``: model-token
-     бонус, type-mismatch penalty по ``imt_name``/``subj_name``), затем среди
+     сначала применяет ЖЁСТКИЙ ТИП-ГЕЙТ (``_type_compatible``: карточка с
+     ``subj_name``/``subj_root_name`` чужого типа — «шорты/жакет» под цель
+     «куртка» — отбраковывается, а не штрафуется; если все кандидаты не того
+     типа → честный 0), затем отсекает нерелевантные по матч-скору
+     (``_pick_best_match``: model-token бонус, type-mismatch penalty по
+     ``imt_name``/``subj_name``), затем среди
      релевантных при сопоставимом скоре предпочитает карточку с бОльшим числом
      полезных options (богатую, не пустую). card.json качаем по кандидатам по
      порядку, останавливаясь на _MAX_FETCHED_CARDS успешно скачанных (404 не
@@ -54,7 +62,9 @@ from app.services.enrichment.prompt_router import filter_already_filled_targets
 from app.services.enrichment.sources.ozon_card_source import (
     _compress_search_query,
     _extract_model_tokens,
+    _is_spec_or_unit_token,
     _normalize_model,
+    _LEADING_STOPWORDS,
 )
 from app.services.enrichment.strategies.dictionaries.ozon_loader import (
     get_ozon_characteristics_for_type,
@@ -63,6 +73,88 @@ from app.services.enrichment.strategies.dictionaries.ozon_loader import (
 from app.services.providers.factory import get_web_search_client
 
 logger = logging.getLogger(__name__)
+
+# Морфология (RU): лемматизация тип-слова товара, чтобы «куртка»↔«куртки»,
+# «футболка»↔«футболки» сходились, а «куртка» vs «шорты» — нет. Опциональна:
+# при отсутствии pymorphy3 деградируем к сравнению по нормализованным токенам.
+try:  # pragma: no cover — морфология опциональна
+    import pymorphy3
+    _MORPH = pymorphy3.MorphAnalyzer()
+except Exception:  # noqa: BLE001
+    _MORPH = None
+
+_TYPE_TOKEN_RE = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
+
+
+def _lemma(word: str) -> str:
+    """Лемма слова (нормальная форма). Fallback — lowercase сам токен."""
+    w = word.strip().lower()
+    if not w or _MORPH is None:
+        return w
+    try:
+        return _MORPH.parse(w)[0].normal_form
+    except Exception:  # noqa: BLE001
+        return w
+
+
+def _is_noun_lemma(word: str) -> bool:
+    """True если слово (по pymorphy) — существительное. Без морфологии — всегда True."""
+    if _MORPH is None:
+        return True
+    try:
+        p = _MORPH.parse(word.strip().lower())
+        return bool(p) and "NOUN" in p[0].tag
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _target_type_lemma(
+    product_name: str,
+    cat_leaf: Optional[str],
+) -> Optional[str]:
+    """Лемма ТИП-слова целевого товара (динамически, без хардкода списков).
+
+    Источник, по приоритету:
+      1. category leaf (`category_path[-1]`) — первое существительное-токен
+         («Куртки» → «куртка», «Платья женские» → «платье»). Самый надёжный
+         сигнал типа: категория задаётся явно.
+      2. fallback — ведущее существительное product_name после среза
+         стоп-слов («Куртка мужская …» → «куртка»).
+
+    Возвращает лемму типа или None если тип определить нельзя.
+    """
+    # 1. Категория-leaf: первое значимое существительное.
+    if cat_leaf:
+        for tok in _TYPE_TOKEN_RE.findall(cat_leaf.lower()):
+            if len(tok) < 3 or tok in _LEADING_STOPWORDS:
+                continue
+            lem = _lemma(tok)
+            if _is_noun_lemma(tok):
+                return lem
+    # 2. Ведущее существительное названия товара.
+    for tok in _TYPE_TOKEN_RE.findall(product_name.lower()):
+        if len(tok) < 3 or tok in _LEADING_STOPWORDS or _is_spec_or_unit_token(tok):
+            continue
+        # Латиница/цифры (бренд/артикул) типом не считаем.
+        if not re.search(r"[а-яё]", tok):
+            break
+        if _is_noun_lemma(tok):
+            return _lemma(tok)
+        # первое русское слово не сущ. (напр. прилагательное) — пропускаем дальше
+    return None
+
+
+def _card_subj_lemmas(card: dict) -> set[str]:
+    """Леммы тип-слов карточки из subj_name / subj_root_name (множество)."""
+    out: set[str] = set()
+    for key in ("subj_name", "subj_root_name"):
+        val = card.get(key)
+        if isinstance(val, str) and val.strip():
+            for tok in _TYPE_TOKEN_RE.findall(val.lower()):
+                if len(tok) >= 3 and tok not in _LEADING_STOPWORDS:
+                    out.add(_lemma(tok))
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Конфигурация
@@ -176,6 +268,62 @@ def _basket_nn_from_table(nm_id: int) -> str:
         if vol <= threshold:
             return nn
     return _BASKET_DEFAULT
+
+
+def _build_wb_query(
+    full_name: str,
+    brand: Optional[str],
+    cat_leaf: Optional[str],
+    max_tokens: int,
+) -> str:
+    """Строит Serper-запрос для WB, СОХРАНЯЯ тип-слово товара.
+
+    Проблема: ``_compress_search_query`` (Ozon) срезает категорийный префикс —
+    тип-существительное («куртка», «футболка»). Для Ozon SSR это ок (заголовки
+    начинаются с типа, fuzzy всё равно матчит). Для WB Serper-поиска фатально:
+    по «The North Face Resolve» (без «куртка») Serper отдаёт 2 ссылки, и
+    единственная живая — женские шорты. Тип-слово критично сужает выдачу к
+    правильному классу товара.
+
+    Решение: компрессим как раньше (чистим спеки/стоп-слова/бренд-дубли), затем
+    ПРЕПЕНДИМ тип-слово (cat_leaf-первое-слово или ведущее сущ. названия), если
+    его ещё нет в запросе. Тип берём динамически, без хардкода списков.
+    """
+    base = _compress_search_query(
+        full_name, brand, max_tokens=max_tokens, category_name=cat_leaf
+    )
+    type_word = _wb_query_type_word(full_name, cat_leaf)
+    if not type_word:
+        return base
+    # Уже присутствует (по лемме любого токена запроса) — не дублируем.
+    base_lemmas = {_lemma(t) for t in _TYPE_TOKEN_RE.findall(base.lower())}
+    if _lemma(type_word) in base_lemmas:
+        return base
+    return f"{type_word} {base}".strip()
+
+
+def _wb_query_type_word(product_name: str, cat_leaf: Optional[str]) -> Optional[str]:
+    """Тип-слово (в исходной словоформе) для подстановки в Serper-запрос.
+
+    Приоритет — первое значимое слово category leaf (как пишут на WB:
+    «Куртки» → «Куртки»), затем ведущее русское существительное названия.
+    Возвращаем словоформу как есть (Serper токенизирует, лемма не нужна).
+    """
+    if cat_leaf:
+        for tok in cat_leaf.split():
+            low = tok.lower()
+            if len(low) >= 3 and low not in _LEADING_STOPWORDS and re.search(r"[а-яё]", low):
+                if _is_noun_lemma(low):
+                    return tok
+    for tok in product_name.split():
+        low = tok.lower()
+        if len(low) < 3 or low in _LEADING_STOPWORDS or _is_spec_or_unit_token(low):
+            continue
+        if not re.search(r"[а-яё]", low):
+            break
+        if _is_noun_lemma(low):
+            return tok
+    return None
 
 
 def _card_url(nn: str, nm_id: int) -> str:
@@ -309,11 +457,13 @@ class WbCardSource(AttributeSource):
         """Полный flow: compress → Serper(nm_id) → CDN card.json → pick → map → AVs."""
         full_name = context.product_name.strip()
         cat_leaf = context.category_path[-1] if context.category_path else None
-        primary_query = _compress_search_query(
-            full_name, context.brand, max_tokens=5, category_name=cat_leaf
+        # Целевой тип товара (лемма) — для query-builder и тип-гейта при выборе.
+        target_type = _target_type_lemma(full_name, cat_leaf)
+        primary_query = _build_wb_query(
+            full_name, context.brand, cat_leaf, max_tokens=5
         )
-        fallback_query = _compress_search_query(
-            full_name, context.brand, max_tokens=3, category_name=cat_leaf
+        fallback_query = _build_wb_query(
+            full_name, context.brand, cat_leaf, max_tokens=3
         )
 
         queries_to_try: list[str] = [primary_query]
@@ -367,8 +517,8 @@ class WbCardSource(AttributeSource):
                 len(cards), attempted, len(nm_ids),
             )
 
-            # ---- PICK BEST (match-фильтр → среди релевантных богатую) ----
-            best = self._pick_best_card(used_query, cat_leaf, cards)
+            # ---- PICK BEST (тип-гейт → match-фильтр → среди релевантных богатую) ----
+            best = self._pick_best_card(used_query, cat_leaf, target_type, cards)
             if best is None:
                 return []
             nm_id, card, title, score = best
@@ -635,14 +785,21 @@ class WbCardSource(AttributeSource):
         self,
         query: str,
         cat_leaf: Optional[str],
+        target_type: Optional[str],
         cards: list[tuple[int, dict]],
     ) -> Optional[tuple[int, dict, str, float]]:
-        """Выбрать карточку среди скачанных: сначала матч, потом богатство.
+        """Выбрать карточку среди скачанных: тип-гейт → матч → богатство.
 
         Прежняя стратегия брала ОДИН лучший по fuzzy-скору вслепую — если у
         лидера была бедная карточка (3 options), мы теряли соседнюю богатую с
         чуть меньшим скором. Новая логика:
 
+          0. ЖЁСТКИЙ ТИП-ГЕЙТ: если известен целевой тип (`target_type`, лемма),
+             отбрасываем кандидатов, чей `subj_name`/`subj_root_name` несовместим
+             с типом (цель «куртка» → карточка «шорты/свитшот/брюки» отвергается,
+             а не штрафуется). Совместимость — по совпадению лемм + мягкий гард
+             однокоренных форм (футболка↔футболки). Если ВСЕ кандидаты не того
+             типа — лучше вернуть None (честный 0), чем подмешать чужой тип.
           1. Скорим каждый кандидат по заголовку (imt_name/subj_name) через
              _pick_best_match (model-token бонус, type-mismatch штраф) и считаем
              число полезных options (_extract_options).
@@ -654,6 +811,34 @@ class WbCardSource(AttributeSource):
 
         Возвращает (nm_id, card, title, score) или None.
         """
+        # ---- Шаг 0: жёсткий тип-гейт ----
+        if target_type:
+            gated: list[tuple[int, dict]] = []
+            rejected: list[str] = []
+            for nm_id, card in cards:
+                subj_lemmas = _card_subj_lemmas(card)
+                if not subj_lemmas:
+                    # subj не задан — не можем судить о типе, пропускаем дальше
+                    # (fuzzy/score-фильтр ниже отработает по заголовку).
+                    gated.append((nm_id, card))
+                    continue
+                if self._type_compatible(target_type, subj_lemmas):
+                    gated.append((nm_id, card))
+                else:
+                    rejected.append(f"nm={nm_id}(subj={'/'.join(sorted(subj_lemmas))})")
+            if rejected:
+                logger.info(
+                    "[WbCard] тип-гейт: цель='%s' отбраковал %d/%d карточек: %s",
+                    target_type, len(rejected), len(cards), ", ".join(rejected),
+                )
+            if not gated:
+                logger.info(
+                    "[WbCard] тип-гейт: НИ ОДНОЙ карточки типа '%s' — честный 0 "
+                    "(не подмешиваем чужой тип)", target_type,
+                )
+                return None
+            cards = gated
+
         scored: list[dict] = []
         for nm_id, card in cards:
             title = self._card_title(card)
@@ -697,6 +882,37 @@ class WbCardSource(AttributeSource):
             )
 
         return (best["nm_id"], best["card"], best["title"], best["score"])
+
+    @staticmethod
+    def _type_compatible(target_type: str, subj_lemmas: set[str]) -> bool:
+        """Совместим ли тип карточки (subj-леммы) с целевым типом (лемма).
+
+        Жёсткий гейт по типу одежды/товара:
+          - точное совпадение лемм («куртка» ∈ {«куртка»}) → True;
+          - однокоренные формы через общую основу (футболка↔футболочка,
+            куртка↔курточка) → мягко True (стем-affinity ≥ порога);
+          - разные корни (куртка vs шорты/свитшот/брюки) → False (реджект).
+
+        Гард от ложного реджекта: учитываем ТОЛЬКО морфологически близкие формы,
+        не синонимы разных корней. Это намеренно: «футболка» и «майка» — разные
+        леммы, но карточка-«майка» под цель-«футболка» отсекается жёстко, как и
+        просили (лучше честный 0, чем чужой тип). Семантические синонимы тут НЕ
+        раскрываем — только формы одного корня.
+        """
+        if target_type in subj_lemmas:
+            return True
+        # Однокоренные формы: длинная общая основа (≥ 5 симв.) при близкой длине.
+        for subj in subj_lemmas:
+            common = 0
+            for x, y in zip(target_type, subj):
+                if x == y:
+                    common += 1
+                else:
+                    break
+            shorter = min(len(target_type), len(subj))
+            if shorter and common >= 5 and common / shorter >= 0.7:
+                return True
+        return False
 
     @staticmethod
     def _card_title(card: dict) -> str:
