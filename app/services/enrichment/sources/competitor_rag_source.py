@@ -162,6 +162,8 @@ class CompetitorRagSource(AttributeSource):
         self._min_consensus = min_consensus
         self._embed_model_name = embed_model_name
         self._client = None   # lazy-init при первом использовании
+        # True после graceful fallback на embedded-индекс (сервер был недоступен).
+        self._fellback_to_embedded = False
         self._judge = CompetitorRagJudge()
         # LLM-менеджер для relevance filter — инициализируется лениво
         self._llm_manager = llm_manager
@@ -170,13 +172,84 @@ class CompetitorRagSource(AttributeSource):
         """Lazy-init Qdrant client. HTTP server mode if QDRANT_URL set, else local."""
         if self._client is None:
             from qdrant_client import QdrantClient  # type: ignore
-            if self._qdrant_url:
+            if self._qdrant_url and not self._fellback_to_embedded:
                 self._client = QdrantClient(url=self._qdrant_url, timeout=60)
                 logger.info("[CompetitorRagSource] using Qdrant server at %s", self._qdrant_url)
             else:
-                self._client = QdrantClient(path=self._index_path)
-                logger.info("[CompetitorRagSource] using Qdrant local mode at %s", self._index_path)
+                self._client = self._build_embedded_client()
         return self._client
+
+    def _build_embedded_client(self):
+        """Создать embedded (local file-based) Qdrant-клиент на _index_path.
+
+        Local mode мемори-мапит sqlite-хранилище, не грузит индекс целиком в RAM.
+        Первичная инициализация может занять ~1-1.5 мин на 3.7 ГБ индексе, далее
+        запросы ~1-2с. Используется как штатный режим (QDRANT_URL не задан) и как
+        fallback при недоступности сервера.
+        """
+        from qdrant_client import QdrantClient  # type: ignore
+        client = QdrantClient(path=self._index_path)
+        logger.info("[CompetitorRagSource] using Qdrant local mode at %s", self._index_path)
+        return client
+
+    def _fallback_to_embedded(self, exc: Exception) -> bool:
+        """Переключиться на embedded-индекс при недоступности Qdrant-сервера.
+
+        Вызывается, когда запрос к серверному клиенту упал по сетевой причине.
+        Если локальный индекс существует на диске — пересоздаём клиент в local mode
+        и возвращаем True (можно повторить запрос). Иначе — False (фейл наверх).
+        """
+        if self._fellback_to_embedded:
+            # Уже в embedded-режиме — повторный fallback невозможен, это уже не серверная ошибка.
+            return False
+        if not os.path.isdir(self._index_path):
+            logger.error(
+                "[CompetitorRagSource] Qdrant server unreachable (%s) and no local "
+                "embedded index at %s — cannot fallback. Запусти Qdrant (QDRANT_URL=%s) "
+                "или положи индекс на диск.",
+                exc, self._index_path, self._qdrant_url,
+            )
+            return False
+        logger.warning(
+            "[CompetitorRagSource] Qdrant server unreachable (%s) -> fallback to embedded "
+            "index at %s. Первичная загрузка ~1 мин (mmap, без OOM).",
+            exc, self._index_path,
+        )
+        # Закрываем серверный клиент и пересоздаём в embedded-режиме.
+        old = self._client
+        self._client = None
+        self._fellback_to_embedded = True
+        try:
+            if old is not None:
+                old.close()
+        except Exception:
+            pass
+        self._client = self._build_embedded_client()
+        return True
+
+    @staticmethod
+    def _is_connection_error(exc: Exception) -> bool:
+        """Эвристика: ошибка похожа на недоступность Qdrant-сервера (сеть/timeout/5xx).
+
+        Покрывает requests/httpx connection errors, qdrant ResponseHandlingException,
+        UnexpectedResponse с 5xx и таймауты — всё, что значит «сервер не отвечает».
+        """
+        from qdrant_client.http.exceptions import (  # type: ignore
+            ResponseHandlingException,
+            UnexpectedResponse,
+        )
+        if isinstance(exc, ResponseHandlingException):
+            return True
+        if isinstance(exc, UnexpectedResponse):
+            # 5xx / 503 — серверная недоступность; 4xx — это уже наша ошибка запроса.
+            status = getattr(exc, "status_code", None)
+            return status is None or status >= 500
+        text = f"{type(exc).__name__}: {exc}".lower()
+        markers = (
+            "connection", "connect", "timed out", "timeout", "refused",
+            "unreachable", "503", "502", "504", "max retries", "newconnectionerror",
+        )
+        return any(m in text for m in markers)
 
     def _get_llm_manager(self):
         """Lazy-инициализация LLM-менеджера (DeepSeek по умолчанию)."""
@@ -321,7 +394,6 @@ class CompetitorRagSource(AttributeSource):
         `categories` содержит эту строку (через text-payload-index). Это резко
         снижает шум на запросах типа "EVGA SuperNOVA" (иначе ловит замки EVVA).
         """
-        client = self._get_client()
         query_filter = None
         if category_filter_text:
             from qdrant_client.models import Filter, FieldCondition, MatchText
@@ -331,13 +403,28 @@ class CompetitorRagSource(AttributeSource):
                     match=MatchText(text=category_filter_text),
                 )]
             )
-        response = client.query_points(
-            collection_name=self._collection_name,
-            query=query_vector,
-            limit=self._top_k,
-            with_payload=True,
-            query_filter=query_filter,
-        )
+
+        try:
+            response = self._get_client().query_points(
+                collection_name=self._collection_name,
+                query=query_vector,
+                limit=self._top_k,
+                with_payload=True,
+                query_filter=query_filter,
+            )
+        except Exception as exc:
+            # Сервер недоступен? Грациозно падаем на embedded-индекс и повторяем 1 раз.
+            if self._is_connection_error(exc) and self._fallback_to_embedded(exc):
+                response = self._get_client().query_points(
+                    collection_name=self._collection_name,
+                    query=query_vector,
+                    limit=self._top_k,
+                    with_payload=True,
+                    query_filter=query_filter,
+                )
+            else:
+                raise
+
         neighbors = []
         for hit in response.points:
             if hit.payload:
