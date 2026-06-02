@@ -108,6 +108,23 @@ _TYPE_MISMATCH_PENALTY = 30.0
 _CONF_EXACT = 0.93
 _CONF_BRAND_LINE = 0.85
 
+# Serper-snippet fallback confidence.
+# Срабатывает ТОЛЬКО когда Scrappey-путь вернул 0 характеристик (Scrappey мёртв
+# или отдал пустоту). Сниппет частичный (3-6 полей из карточки), поэтому conf
+# ниже brand_line, НО ≥ 0.80 — достаточно, чтобы fill попал в filled_so_far и
+# merger его засчитал, если более уверенный источник не нашёл значение.
+_CONF_SNIPPET = 0.80
+
+# Сколько organic-результатов запрашивать у Serper для fallback.
+_SERPER_NUM_RESULTS = 5
+_SERPER_TIMEOUT = 15
+
+# Regex для извлечения pid из ссылки вида /product/<slug>-<pid>/ или
+# product/...-123456789 в любом тексте (link или snippet).
+_SERPER_PID_RE = re.compile(r"/product/[a-z0-9\-]*?-(\d{5,})/?", re.IGNORECASE)
+# fallback: «Артикул: 1240096510» в сниппете.
+_SERPER_ARTICUL_RE = re.compile(r"(?:артикул|sku)\D{0,3}(\d{5,})", re.IGNORECASE)
+
 # Similarity thresholds (понижены для (V2/V3/Plus/Bronze) вариаций — title часто
 # содержит "Блок питания + brand + model + V3 80 Plus Gold (MPE-XXX-...)", т.е.
 # много шума вокруг query "brand + model").
@@ -993,7 +1010,14 @@ class OzonCardSource(AttributeSource):
             raw = await self._fetch_card_raw(context, client)
 
             if raw["stage"] != "ok":
-                return []
+                # Scrappey недоступен/пуст (no_tiles / fetch_fail / parse_empty / low_match).
+                # БЕСПЛАТНАЯ подстраховка: Serper-сниппет Ozon-страницы. Не трогает
+                # Scrappey-путь — срабатывает ТОЛЬКО на его нулевом результате.
+                logger.info(
+                    "[OzonCard] Scrappey-путь дал stage=%s (0 chars) → snippet-fallback",
+                    raw["stage"],
+                )
+                return await self._serper_snippet_fallback(context, targets)
 
             chars = raw["raw_chars"]
             top_score = raw["match_score"] or 0.0
@@ -1155,6 +1179,163 @@ class OzonCardSource(AttributeSource):
                         })
         return out
 
+    @staticmethod
+    def _parse_snippet_pairs(snippet: str) -> list[dict]:
+        """Генерично парсит пары «Имя: значение» из Serper-сниппета Ozon-страницы.
+
+        Сниппет /features/ страницы выглядит как:
+          «Артикул: 1240096510; Сезон: На любой сезон; Материал: Трикотаж;
+           Состав материала: полиэстер 67%, акрил 20%; Коллекция: ...»
+
+        Парсинг полностью generic (без хардкода имён/значений):
+          1. split по разделителям пар: `;`, `•`, переводы строк.
+          2. для каждого куска split по ПЕРВОМУ `:` → (name, value).
+          3. чистка: trim, схлопывание пробелов, отбрасывание пустых и слишком
+             длинных «значений» (вероятно мусор/маркетинг-текст без ':').
+
+        Возвращает [{name, value, value_ids:[]}] совместимо с _map_characteristics.
+        """
+        if not snippet:
+            return []
+        # Разделители между парами. Запятая НЕ используется как разделитель пар —
+        # она встречается внутри значений («полиэстер 67%, акрил 20%»).
+        chunks = re.split(r"[;•·|\n\r]+", snippet)
+        out: list[dict] = []
+        seen: set[str] = set()
+        for chunk in chunks:
+            if ":" not in chunk:
+                continue
+            name_part, _, value_part = chunk.partition(":")
+            name = re.sub(r"\s+", " ", name_part).strip(" \t-–—.")
+            value = re.sub(r"\s+", " ", value_part).strip(" \t-–—.")
+            if not name or not value:
+                continue
+            # name характеристики — короткое словосочетание, не предложение.
+            if len(name) > 40 or len(name.split()) > 5:
+                continue
+            # value слишком длинное → вероятно обрезанный маркетинг-текст, не спек.
+            if len(value) > 120:
+                continue
+            name_low = name.lower()
+            if name_low in seen:
+                continue
+            seen.add(name_low)
+            out.append({"name": name, "value": value, "value_ids": []})
+        return out
+
+    async def _serper_snippet_fallback(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+    ) -> list[AttributeValue]:
+        """БЕСПЛАТНАЯ подстраховка: достать ключевые характеристики из
+        Serper-сниппета Ozon-страницы, когда Scrappey мёртв/пуст.
+
+        Поток:
+          1. Serper-запрос «<product_name> ozon» → из organic вытащить ссылку
+             ozon.ru/product/...-<pid>/ и pid.
+          2. Серия generic name→value пар уже может прийти прямо в snippet того
+             же organic-результата; дополнительно — второй запрос
+             «ozon product <pid> состав материал» за сниппетом /features/.
+          3. Распарсить пары → прогнать через ТУ ЖЕ мапилку _map_characteristics
+             с пониженным confidence (_CONF_SNIPPET).
+
+        Никогда не падает: любые сетевые/quota ошибки → []. Не дёргается, если
+        SERPER_API_KEY не задан или web_search не serper.
+        """
+        try:
+            from app.services.providers.factory import get_web_search_client
+            client = get_web_search_client()
+        except Exception as exc:
+            logger.info("[OzonCard] snippet-fallback: web_search client unavailable: %s", exc)
+            return []
+        if client is None:
+            logger.info("[OzonCard] snippet-fallback: PROVIDER_WEB_SEARCH != serper → skip")
+            return []
+
+        product_name = context.product_name.strip()
+
+        # ---- Запрос 1: найти Ozon-товар + pid ----
+        snippets: list[str] = []
+        pid: Optional[str] = None
+        try:
+            res = await client.search(
+                f"{product_name} ozon",
+                num_results=_SERPER_NUM_RESULTS,
+                timeout=_SERPER_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.info("[OzonCard] snippet-fallback: Serper search #1 failed: %s", exc)
+            return []
+
+        for org in res.organic_results:
+            link = org.link or ""
+            if "ozon.ru/product/" not in link.lower():
+                continue
+            if pid is None:
+                m = _SERPER_PID_RE.search(link)
+                if m:
+                    pid = m.group(1)
+            if org.snippet:
+                snippets.append(org.snippet)
+            # Артикул в сниппете — тоже источник pid.
+            if pid is None and org.snippet:
+                ma = _SERPER_ARTICUL_RE.search(org.snippet)
+                if ma:
+                    pid = ma.group(1)
+
+        # ---- Запрос 2 (опц.): сниппет /features/ страницы по pid ----
+        # Делаем только если pid найден — точечный запрос к features-странице,
+        # где сниппет содержит «Имя: значение;» пары.
+        if pid:
+            try:
+                res2 = await client.search(
+                    f"ozon product {pid} состав материал характеристики",
+                    num_results=_SERPER_NUM_RESULTS,
+                    timeout=_SERPER_TIMEOUT,
+                )
+                for org in res2.organic_results:
+                    link = (org.link or "").lower()
+                    if "ozon" in link and org.snippet:
+                        snippets.append(org.snippet)
+            except Exception as exc:
+                logger.info("[OzonCard] snippet-fallback: Serper search #2 failed: %s", exc)
+
+        if not snippets:
+            logger.info("[OzonCard] snippet-fallback: no Ozon snippets found")
+            return []
+
+        # ---- Парсинг пар из всех собранных сниппетов ----
+        chars: list[dict] = []
+        seen_names: set[str] = set()
+        for snip in snippets:
+            for pair in self._parse_snippet_pairs(snip):
+                nm = pair["name"].lower()
+                if nm in seen_names:
+                    continue
+                seen_names.add(nm)
+                chars.append(pair)
+
+        if not chars:
+            logger.info("[OzonCard] snippet-fallback: 0 name:value pairs parsed")
+            return []
+
+        logger.info(
+            "[OzonCard] snippet-fallback: pid=%s, %d пар распарсилось из %d сниппетов",
+            pid, len(chars), len(snippets),
+        )
+
+        # ---- Маппинг через ту же логику (exact mode → без brand_line фильтров) ----
+        evidence = f"ozon-snippet:pid={pid or '?'} | serper-fallback"
+        return self._map_characteristics(
+            chars, targets, context,
+            mode="exact",          # без brand_line BLACKLIST/numeric-skip: сниппет = тот же товар
+            title=product_name[:50],
+            score=0.0,
+            conf_override=_CONF_SNIPPET,
+            evidence_override=evidence,
+        )
+
     # ------------------------------------------------------------------
     # Match scoring
     # ------------------------------------------------------------------
@@ -1229,8 +1410,16 @@ class OzonCardSource(AttributeSource):
         mode: str,
         title: str,
         score: float,
+        conf_override: Optional[float] = None,
+        evidence_override: Optional[str] = None,
     ) -> list[AttributeValue]:
-        """Сопоставить Ozon-char names с target.name через Ozon dictionary."""
+        """Сопоставить Ozon-char names с target.name через Ozon dictionary.
+
+        conf_override / evidence_override — для snippet-fallback пути: там данные
+        приходят не из полной карточки, а из Serper-сниппета (частичные), поэтому
+        confidence ниже и evidence другой. Логика name→attribute_id→value_id
+        полностью переиспользуется.
+        """
         ozon_chars: list[dict] = []
         cat_id: Optional[int] = None
         type_id: Optional[int] = None
@@ -1277,8 +1466,10 @@ class OzonCardSource(AttributeSource):
 
         target_by_id: dict[int, TargetAttribute] = {t.id: t for t in targets}
 
-        evidence_short = f"ozon:{title[:50]} | match={score:.1f}"
-        conf = _CONF_EXACT if mode == "exact" else _CONF_BRAND_LINE
+        evidence_short = evidence_override or f"ozon:{title[:50]} | match={score:.1f}"
+        conf = conf_override if conf_override is not None else (
+            _CONF_EXACT if mode == "exact" else _CONF_BRAND_LINE
+        )
 
         results: list[AttributeValue] = []
         used_ids: set[int] = set()
