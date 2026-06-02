@@ -5,8 +5,8 @@ targets_block with type hints (kind=enum, kind=numeric, etc.) and to
 append a meta-guidance block to system_prompt.
 
 Classification rules (in priority order):
-  1. model_name  -- name contains article/model keywords
-  2. enum        -- non-empty allowed_values present
+  1. enum        -- non-empty allowed_values present (wins over model_name)
+  2. model_name  -- name has article/model keywords AND no allowed_values
   3. dimensions  -- numeric type + dimension keywords in name
   4. numeric     -- numeric type or unit in name
   5. text        -- everything else
@@ -65,8 +65,10 @@ def classify_target(target: TargetAttribute) -> str:
       model_name | enum | url | boolean | dimensions | numeric | text
 
     Rules by descending specificity:
-    1. model_name — keywords (артикул/модель) win over typed enums
-    2. enum       — non-empty allowed_values present
+    1. enum       — non-empty allowed_values present (wins over model_name:
+                    словарные значения = enforcement allowed-списка)
+    2. model_name — keywords (артикул/модель) для свободно-текстовых полей
+                    БЕЗ allowed_values
     3. url        — type=URL (модель не должна фабриковать ссылки)
     4. boolean    — type=Boolean (Да/Нет — особая семантика)
     5. dimensions — numeric type + dimension keyword
@@ -75,13 +77,20 @@ def classify_target(target: TargetAttribute) -> str:
     """
     name_lower = target.name.lower()
 
-    # 1. model_name checked first -- takes priority over enum
-    if _MODEL_NAME_PATTERN.search(name_lower):
-        return "model_name"
-
-    # 2. enum -- dictionary values exist
+    # enum wins over model_name WHEN dictionary values exist.
+    # Настоящие model-name/артикул поля — свободный текст БЕЗ allowed_values.
+    # Одёжные enum'ы вроде «Размер на модели»/«Тип модели» матчат
+    # _MODEL_NAME_PATTERN по слову «модел…», но у них есть allowed_values —
+    # их нужно вести по enum-ветке (enforcement allowed-списка), а не
+    # выдавать инструкцию «извлеки артикул, убери бренд».
+    # Поэтому: непустой allowed_values → enum, минуя model_name.
     if target.allowed_values:
         return "enum"
+
+    # model_name -- свободно-текстовые поля БЕЗ allowed_values
+    # (название модели / артикул / партномер).
+    if _MODEL_NAME_PATTERN.search(name_lower):
+        return "model_name"
 
     # 3. url — отдельный kind чтобы инструктировать «не фабрикуй URL»
     if target.type in _URL_TYPES:

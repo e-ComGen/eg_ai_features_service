@@ -69,10 +69,16 @@ def test_classify_text_brand_no_allowed():
     assert classify_target(t) == "text"
 
 
-def test_classify_model_name_wins_over_enum():
-    """Если имя содержит 'артикул' И есть allowed_values — model_name должен выиграть."""
-    t = _make_target("Артикул производителя", allowed_values=["A1", "B2"])
-    assert classify_target(t) == "model_name"
+def test_classify_enum_wins_over_model_name():
+    """Если имя матчит model_name-паттерн НО есть allowed_values — enum выигрывает.
+
+    Настоящие model-name/артикул поля — свободный текст без allowed_values.
+    Одёжные enum'ы («Размер на модели», «Тип модели») матчат слово «модел…»,
+    но у них словарные значения → должны идти по enum-ветке с enforcement
+    allowed-списка, иначе теряют корректное заполнение.
+    """
+    t = _make_target("Размер на модели", allowed_values=["XS", "S", "M"])
+    assert classify_target(t) == "enum"
 
 
 def test_classify_dimensions_height():
