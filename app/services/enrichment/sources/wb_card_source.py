@@ -217,7 +217,7 @@ _SERPER_BACKOFF_BASE = 1.0      # сек: задержки 1с, 2с (экспо�
 # Сколько card.json реально скачать прежде чем выбирать лучший. Многие nm_id
 # архивные/несуществующие → 404 по всем basket. Перебираем кандидатов по порядку,
 # но останавливаемся, набрав _MAX_FETCHED_CARDS успешно скачанных карточек.
-_MAX_FETCHED_CARDS = 4
+_MAX_FETCHED_CARDS = 8
 
 # Карточка считается «богатой» если у неё ≥ _RICH_OPTIONS_THRESHOLD полезных
 # options. При сопоставимом матч-скоре богатую предпочитаем бедной.
@@ -588,10 +588,13 @@ class WbCardSource(AttributeSource):
     async def _search_once(self, query: str) -> list[int]:
         """Одна Serper-попытка → список уникальных nm_id (top-N).
 
-        Запрос ``inurl:catalog detail.aspx <query>`` даёт ~100% прямых ссылок
-        на карточки WB. Предпочитаем домен wildberries.ru, зеркала — fallback.
+        Запрос ``site:wildberries.ru <query> detail.aspx`` даёт ~100% прямых
+        ссылок на карточки WB. Раньше использовался ``inurl:catalog
+        detail.aspx`` — Google игнорит ``inurl:`` НЕДЕТЕРМИНИРОВАННО (~40-50%
+        запросов возвращали общую выдачу без WB-ссылок → 0 nm_id). ``site:``
+        стабилен. Предпочитаем домен wildberries.ru, зеркала — fallback.
         """
-        serper_query = f"inurl:catalog detail.aspx {query}".strip()
+        serper_query = f"site:wildberries.ru {query} detail.aspx".strip()
         try:
             results = await self._search_client.search(
                 serper_query, num_results=_SERPER_NUM_RESULTS
@@ -805,9 +808,13 @@ class WbCardSource(AttributeSource):
              число полезных options (_extract_options).
           2. Отсекаем нерелевантные (score < _BRAND_LINE_THRESHOLD) — это
              type/brand-mismatch, такие карточки не нужны даже если богатые.
-          3. Среди релевантных выбираем «лучшую»: при сопоставимом скоре
-             (разрыв ≤ _SCORE_TIE_BAND) предпочитаем карточку с бОльшим числом
-             options. Иначе — карточку с максимальным скором.
+          3. Среди релевантных тип уже гарантирован гейтом, бренд/модель —
+             порогом матча, поэтому БОГАТСТВО (n_opts) становится основным
+             ключом выбора: брендовая базовая вещь по fuzzy часто дальше бедной
+             на разрыв >_SCORE_TIE_BAND, но именно она правильная. Гард: при
+             заданных model-токенах запроса model-совпавшие кандидаты
+             приоритетнее (не утащить богатую карточку чужой модели), далее
+             n_opts, далее score.
 
         Возвращает (nm_id, card, title, score) или None.
         """
@@ -839,6 +846,11 @@ class WbCardSource(AttributeSource):
                 return None
             cards = gated
 
+        # Модель-токены запроса (артикулы 501/M/Resolve2) — если заданы, карточка
+        # ОБЯЗАНА их разделять, чтобы считаться model-совпавшей. Это гард против
+        # выбора богатой карточки чужой модели только за число опций.
+        q_models = _extract_model_tokens(query)
+
         scored: list[dict] = []
         for nm_id, card in cards:
             title = self._card_title(card)
@@ -846,12 +858,18 @@ class WbCardSource(AttributeSource):
                 query, [{"title": title}], category_leaf=cat_leaf
             )
             n_opts = len(self._extract_options(card))
+            # model_match: запрос без model-токенов → нечего различать (True для
+            # всех); иначе True только при пересечении model-токенов карточки.
+            model_match = (not q_models) or bool(
+                q_models & _extract_model_tokens(title)
+            )
             scored.append({
                 "nm_id": nm_id,
                 "card": card,
                 "title": title,
                 "score": score,
                 "n_opts": n_opts,
+                "model_match": model_match,
             })
 
         # Отсечь нерелевантные по матчу (type/brand-mismatch).
@@ -864,17 +882,21 @@ class WbCardSource(AttributeSource):
                 return None
             return (top["nm_id"], top["card"], top["title"], top["score"])
 
-        max_score = max(c["score"] for c in relevant)
-
-        # Кандидаты в пределах tie-band от лидера → решает богатство (n_opts),
-        # при равенстве — скор. Так пустой лидер уступает богатому соседу.
-        contenders = [c for c in relevant if c["score"] >= max_score - _SCORE_TIE_BAND]
-        best = max(contenders, key=lambda c: (c["n_opts"], c["score"]))
+        # Тип уже гарантирован тип-гейтом, бренд/модель — порогом матча. Среди
+        # этих релевантных кандидатов БОГАТСТВО (n_opts) — основной ключ выбора:
+        # брендовая базовая вещь («Nike Футболка Nsw Club Tee», 9 опций) часто
+        # по fuzzy дальше бедной («Футболка Sportswear Club», 5 опций) на разрыв
+        # >_SCORE_TIE_BAND, но именно богатая правильная. Раньше tie-band не давал
+        # её выбрать. ГАРД: при заданных model-токенах запроса model-совпавшие
+        # кандидаты приоритетнее (чтобы не утащить богатую карточку чужой модели);
+        # при равной модельности решает n_opts, далее score.
+        best = max(relevant, key=lambda c: (c["model_match"], c["n_opts"], c["score"]))
 
         if logger.isEnabledFor(logging.INFO):
             ranking = ", ".join(
-                f"nm={c['nm_id']}(score={c['score']:.1f},opts={c['n_opts']})"
-                for c in sorted(relevant, key=lambda c: -c["score"])
+                f"nm={c['nm_id']}(score={c['score']:.1f},opts={c['n_opts']}"
+                f",mm={int(c['model_match'])})"
+                for c in sorted(relevant, key=lambda c: (-c["n_opts"], -c["score"]))
             )
             logger.info(
                 "[WbCard] pick: %d релевантных → выбран nm=%s (score=%.1f, opts=%d) | %s",

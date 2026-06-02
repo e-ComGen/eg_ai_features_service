@@ -25,7 +25,7 @@ _SERPER_ENDPOINT = "https://google.serper.dev/search"
 class OrganicResult(BaseModel):
     title: str
     link: str
-    snippet: str
+    snippet: str = ""  # Serper иногда не возвращает snippet → не падать ValidationError
     position: int
 
 
