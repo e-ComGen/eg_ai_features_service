@@ -50,6 +50,7 @@ from app.services.enrichment.sources.competitor_rag_source import CompetitorRagS
 from app.services.enrichment.sources.icecat_source import IceCatSource
 from app.services.enrichment.sources.pdf_datasheet_source import PdfDatasheetSource
 from app.services.enrichment.sources.ozon_card_source import OzonCardSource
+from app.services.enrichment.sources.wb_card_source import WbCardSource
 from app.services.enrichment.sources.tnved_source import TnvedSource
 
 # 40 товаров — каждый в своей категории Ozon (cat_id, type_id, product_name)
@@ -143,6 +144,7 @@ async def main():
     icecat = IceCatSource()
     pdf_datasheet = PdfDatasheetSource()
     ozon_card = OzonCardSource()
+    wb_card = WbCardSource()
     tnved = TnvedSource()
 
     orchestrator = PipelineOrchestrator(
@@ -151,6 +153,7 @@ async def main():
         icecat_source=icecat,
         pdf_datasheet_source=pdf_datasheet,
         ozon_card_source=ozon_card,
+        wb_card_source=wb_card,
         tnved_source=tnved,
     )
 

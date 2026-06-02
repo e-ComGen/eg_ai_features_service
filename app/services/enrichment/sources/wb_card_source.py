@@ -1,45 +1,40 @@
 """WbCardSource — копирует характеристики из живой Wildberries-карточки похожего товара.
 
-Использует ПУБЛИЧНЫЕ JSON-эндпоинты WB через Scrappey.com proxy.
-WB rate-limits бот-трафик (HTTP 429 на batch >5 запросов с одного IP),
-поэтому прямые httpx-вызовы непригодны для production-eval. Scrappey
-ротация IP + browser fingerprint обходит rate limit ценой ~1 credit/запрос.
+Старый путь ходил на ``search.wb.ru`` — WB банит серверный IP (0 заполнений).
+Новый путь полностью минует anti-bot WB:
 
-Алгоритм:
-  1. Skip-guard: если already_filled покрывает ≥80% targets → return [].
-  2. Search step: Scrappey GET https://search.wb.ru/exactmatch/ru/common/v9/search?query=<q>
-     &resultset=catalog&limit=10&dest=-1257786&curr=rub
-     → JSON `data.products[]` → каждый {id (nm), name, brand}.
-  3. Match step: rapidfuzz (partial_ratio + token_sort_ratio) vs product_name:
-     - ≥78 → "exact": full card, copy ALL.
-     - 60-77 → "brand_line": full card, только safe attrs.
-     - <60 → skip.
-  4. Detail step: Scrappey GET basket-NN.wbbasket.ru/vol{vol}/part{part}/{nm_id}/info/ru/card.json
-     с retry по basket NN от 1 до 30 (vol→basket sharding известен,
-     но WB периодически перешивает диапазоны → fallback brute force).
-  5. JSON содержит:
-       imt_name, description, options[{name,value}], grouped_options[],
-       media.photos[] → image_urls для downstream VisionSource.
-  6. Mapping по русским именам через get_ozon_characteristics_for_type
-     (lowercase + substring + fuzzy WRatio≥88) — финальная цель Ozon API.
-  7. resolve_value_id для (attr_id, value) → словарный value_id Ozon.
-  8. Confidence: 0.93 (exact), 0.85 (brand_line). Source: WB_CARD.
-  9. Evidence: f"wb:{title[:50]} | match={score}".
-  10. In-process LRU cache по (brand, normalized_model), max 256.
+  1. **Сжать запрос**: ``_compress_search_query`` (category-aware, из ozon_card_source)
+     чистит «грязный» product_name (срез категорийного префикса, стоп-слов, спеков).
+  2. **Найти nm_id через Serper** (НЕ search.wb.ru). Запрос вида
+     ``inurl:catalog detail.aspx <query>`` → ~100% прямых ссылок на карточки WB.
+     Из organic-результатов nm_id вытаскивается регэкспом, предпочитая домен
+     ``wildberries.ru`` (зеркала .ge/.am/.by дают тот же nm_id — fallback).
+     Берём топ-10 уникальных nm_id (многие архивные → 404).
+  3. **Скачать card.json с CDN** простым httpx GET (Chrome User-Agent, БЕЗ Scrappey —
+     CDN не банится). URL:
+     ``https://basket-{NN}.wbbasket.ru/vol{vol}/part{part}/{nm_id}/info/ru/card.json``,
+     где ``vol = nm_id // 100000``, ``part = nm_id // 1000``. NN по диапазону vol
+     из таблицы ниже; на 404 перебираются остальные NN (01..21).
+  4. **Распарсить характеристики**: ``options[]``, ``grouped_options[].options``,
+     ``compositions[]`` (Состав) → пары name→value.
+  5. **Выбрать лучший кандидат** среди скачанных card.json: ``_pick_best_card``
+     сначала отсекает нерелевантные по матч-скору (``_pick_best_match``: model-token
+     бонус, type-mismatch penalty по ``imt_name``/``subj_name``), затем среди
+     релевантных при сопоставимом скоре предпочитает карточку с бОльшим числом
+     полезных options (богатую, не пустую). card.json качаем по кандидатам по
+     порядку, останавливаясь на _MAX_FETCHED_CARDS успешно скачанных (404 не
+     прекращает перебор).
+  6. **Маппинг WB→Ozon**: ``_map_characteristics`` мапит русские имена характеристик на
+     Ozon-словарь (lowercase + substring + fuzzy WRatio≥88) — финальное API публикации
+     у нас Ozon, WB лишь источник данных.
 
-Scrappey cost: 1 credit/запрос. Бюджет на товар:
-  - search: 1 credit
-  - card.json: 1-N credits (basket retry — обычно 1, иногда 2-3 при brute force)
-Latency: 3-10s end-to-end (Scrappey JSON быстрее browser bypass ~3-5s/call).
-
-Anti-block: WB не имеет DataDome, но имеет per-IP rate-limit. Scrappey ротация
-IP решает rate-limit без full browser cookie challenge.
+Стоимость: 1 Serper-запрос (~$0.001) + N бесплатных CDN GET'ов. Latency: ~1-3s.
+Все сетевые вызовы — с таймаутами и graceful-fallback (возврат [] вместо падения).
 """
 from __future__ import annotations
 
-import json
+import asyncio
 import logging
-import os
 import re
 from collections import OrderedDict
 from typing import Any, Optional
@@ -56,10 +51,16 @@ from app.services.enrichment.base import (
 )
 from app.services.enrichment.judges.wb_card_judge import WbCardJudge
 from app.services.enrichment.prompt_router import filter_already_filled_targets
+from app.services.enrichment.sources.ozon_card_source import (
+    _compress_search_query,
+    _extract_model_tokens,
+    _normalize_model,
+)
 from app.services.enrichment.strategies.dictionaries.ozon_loader import (
     get_ozon_characteristics_for_type,
     resolve_value_id,
 )
+from app.services.providers.factory import get_web_search_client
 
 logger = logging.getLogger(__name__)
 
@@ -67,52 +68,74 @@ logger = logging.getLogger(__name__)
 # Конфигурация
 # ---------------------------------------------------------------------------
 
-# WB search API v9. dest=-1257786 — Москва (стабильный fallback).
-# curr=rub. resultset=catalog → отдаёт products[] с id/name/brand.
-_WB_SEARCH_URL = (
-    "https://search.wb.ru/exactmatch/ru/common/v9/search"
-    "?query={query}&resultset=catalog&limit=10&dest=-1257786&curr=rub"
+# Известный sharding table «vol → basket-NN». На 404 перебираем все NN (01..21).
+# Формат: (верхняя_граница_vol_включительно, NN).
+_BASKET_THRESHOLDS: list[tuple[int, str]] = [
+    (143,  "01"),
+    (287,  "02"),
+    (431,  "03"),
+    (719,  "04"),
+    (1007, "05"),
+    (1061, "06"),
+    (1115, "07"),
+    (1169, "08"),
+    (1313, "09"),
+    (1601, "10"),
+    (1655, "11"),
+    (1919, "12"),
+    (2045, "13"),
+    (2189, "14"),
+    (2405, "15"),
+    (2621, "16"),
+    (2837, "17"),
+    (3053, "18"),
+    (3473, "19"),
+    (3793, "20"),
+]
+# vol >= 3794 → basket-21. Полный список NN для brute-force перебора на 404.
+_BASKET_DEFAULT = "21"
+_ALL_BASKET_NN: list[str] = [f"{n:02d}" for n in range(1, 22)]  # 01..21
+
+# Regex для извлечения nm_id из ссылки на карточку WB.
+# Покрывает .ru/.ge/.am/.by зеркала и относительные ссылки.
+_NM_ID_RE = re.compile(
+    r"(?:wildberries\.\w+/catalog/|/catalog/)(\d{6,12})/detail\.aspx",
+    re.IGNORECASE,
 )
 
-# Scrappey endpoint — единая точка для всех WB запросов.
-_SCRAPPEY_ENDPOINT = "https://publisher.scrappey.com/api/v1"
+# Chrome User-Agent для CDN GET (CDN не банит, но без UA иногда 403).
+_CHROME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
-# Известный sharding table «vol → basket-NN». См. scripts/build_wb_dictionary_lib/
-# card_parser.py — используется в bulk-загрузчике словаря.
-# ПРЕДПОЛОЖЕНИЕ: WB иногда расширяет диапазоны (новые товары попадают на
-# basket-18+). Для unknown vol fallback пытается basket-18..30. Если найдёте
-# обновлённую таблицу — добавьте сюда.
-_BASKET_THRESHOLDS: list[tuple[int, str]] = [
-    (143,  "basket-01"),
-    (287,  "basket-02"),
-    (431,  "basket-03"),
-    (719,  "basket-04"),
-    (1007, "basket-05"),
-    (1061, "basket-06"),
-    (1115, "basket-07"),
-    (1169, "basket-08"),
-    (1313, "basket-09"),
-    (1601, "basket-10"),
-    (1655, "basket-11"),
-    (1919, "basket-12"),
-    (2045, "basket-13"),
-    (2189, "basket-14"),
-    (2405, "basket-15"),
-    (2621, "basket-16"),
-    (2837, "basket-17"),
-]
-_BASKET_FALLBACK_RANGE = range(18, 31)  # basket-18 .. basket-30
+_HTTP_TIMEOUT = 15.0
+_SERPER_NUM_RESULTS = 10
+_MAX_CANDIDATES = 10  # топ-N уникальных nm_id из Serper (многие дадут 404)
 
-_CONTENT_FALLBACK_URL = "https://wbx-content-v2.wbstatic.net/ru/{nm_id}.json"
+# Ретрай Serper-поиска. Serper флакает при concurrency (троттлинг, пустые
+# ответы): один и тот же запрос то даёт 10 nm_id, то 0. Если поиск вернул 0
+# organic ИЛИ из них извлеклось 0 nm_id — повторяем с экспоненциальным бэкоффом.
+# Покрывает временные пустышки, не залипая на флаке. Бэкофф короткий, попыток
+# мало — время растёт максимум в _SERPER_MAX_ATTEMPTS раз только в худшем случае
+# (стабильно пустой товар), на успехе ретраев нет.
+_SERPER_MAX_ATTEMPTS = 3        # всего попыток (1 основная + 2 ретрая)
+_SERPER_BACKOFF_BASE = 1.0      # сек: задержки 1с, 2с (экспонента 2^n)
 
-# Scrappey browser bypass обычно 3-10s; редкие spike до 30s.
-_HTTP_TIMEOUT = 180.0
-_MAX_SEARCH_TILES = 5
-_MAX_RETRIES = 0  # retry отключён: search.wb.ru через Scrappey стабильно возвращает
-                  # envelope без statusCode (Scrappey не справляется с этим endpoint)
-                  # — 4 credits per product экономия. Если retry понадобится — поднять до 1.
+# Сколько card.json реально скачать прежде чем выбирать лучший. Многие nm_id
+# архивные/несуществующие → 404 по всем basket. Перебираем кандидатов по порядку,
+# но останавливаемся, набрав _MAX_FETCHED_CARDS успешно скачанных карточек.
+_MAX_FETCHED_CARDS = 4
 
-# Confidence — параллельно с OzonCardSource (одна логика match → conf).
+# Карточка считается «богатой» если у неё ≥ _RICH_OPTIONS_THRESHOLD полезных
+# options. При сопоставимом матч-скоре богатую предпочитаем бедной.
+_RICH_OPTIONS_THRESHOLD = 6
+# Разрешённый разрыв в матч-скоре, при котором богатство решает исход. Если
+# кандидат с большим числом options отстаёт по скору не более чем на эту
+# величину — берём его (богатую карточку), а не пустого лидера по fuzzy.
+_SCORE_TIE_BAND = 12.0
+
+# Confidence — параллельно с OzonCardSource.
 _CONF_EXACT = 0.93
 _CONF_BRAND_LINE = 0.85
 
@@ -125,8 +148,7 @@ _SKIP_FILL_RATIO = 0.80
 # LRU
 _CACHE_MAX = 256
 
-# Brand-line BLACKLIST — model-specific атрибуты, которые точно отличаются
-# между моделями одной линейки.
+# Brand-line BLACKLIST — model-specific атрибуты.
 _BRAND_LINE_BLACKLIST: frozenset[str] = frozenset(name.lower() for name in {
     "Артикул",
     "Артикул WB",
@@ -146,60 +168,23 @@ _BRAND_LINE_BLACKLIST: frozenset[str] = frozenset(name.lower() for name in {
     "ID карточки",
 })
 
-# Generic-префиксы которые срезаются при нормализации для cache key.
-_GENERIC_PREFIXES = (
-    "блок питания", "блок", "питания",
-    "power supply", "power", "supply", "unit",
-)
 
-
-def _compress_search_query(product_name: str, brand: Optional[str], max_tokens: int = 5) -> str:
-    """Сжимает product_name для WB search (brand + model + 1-2 спеки)."""
-    result = product_name.strip()
-    low = result.lower()
-    for prefix in _GENERIC_PREFIXES:
-        if low.startswith(prefix):
-            result = result[len(prefix):].strip()
-            low = result.lower()
-            break
-    tokens = result.split()[:max_tokens]
-    compact = " ".join(tokens).strip()
-    if brand and brand.strip():
-        b = brand.strip()
-        if b.lower() not in compact.lower():
-            compact = f"{b} {compact}".strip()
-    return compact or product_name.strip()
-
-
-def _normalize_model(product_name: str, brand: Optional[str]) -> str:
-    """Убирает generic-префиксы и бренд, lowercase, для cache key."""
-    result = product_name.strip()
-    low = result.lower()
-    for prefix in _GENERIC_PREFIXES:
-        if low.startswith(prefix):
-            result = result[len(prefix):].strip()
-            low = result.lower()
-            break
-    if brand:
-        b = brand.strip().lower()
-        if low.startswith(b):
-            result = result[len(brand):].strip()
-    return re.sub(r"\s+", " ", result).strip().lower()
-
-
-def _basket_host_from_table(nm_id: int) -> Optional[str]:
-    """Возвращает basket-host из известной таблицы (vol < 2837) или None."""
+def _basket_nn_from_table(nm_id: int) -> str:
+    """Возвращает basket-NN из known таблицы по vol (fallback basket-21)."""
     vol = nm_id // 100_000
-    for threshold, name in _BASKET_THRESHOLDS:
+    for threshold, nn in _BASKET_THRESHOLDS:
         if vol <= threshold:
-            return f"{name}.wbbasket.ru"
-    return None  # требует brute-force fallback
+            return nn
+    return _BASKET_DEFAULT
 
 
-def _card_url(host: str, nm_id: int) -> str:
+def _card_url(nn: str, nm_id: int) -> str:
     vol = nm_id // 100_000
     part = nm_id // 1000
-    return f"https://{host}/vol{vol}/part{part}/{nm_id}/info/ru/card.json"
+    return (
+        f"https://basket-{nn}.wbbasket.ru"
+        f"/vol{vol}/part{part}/{nm_id}/info/ru/card.json"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -208,24 +193,36 @@ def _card_url(host: str, nm_id: int) -> str:
 
 
 class WbCardSource(AttributeSource):
-    """Копия характеристик с live WB-карточки похожего товара через Scrappey.
+    """Копия характеристик с live WB-карточки похожего товара.
 
-    Cost: 2-5 credits/product (search + card.json, иногда + basket retry).
-    Latency: 3-10s end-to-end.
+    Путь: Serper (поиск nm_id) → CDN card.json (httpx, бесплатно).
+    Cost: 1 Serper-запрос/товар. Latency: ~1-3s.
     """
 
     def __init__(
         self,
-        scrappey_key: Optional[str] = None,
+        web_search_client: Any = None,
         **kwargs: Any,
     ):
-        _ = kwargs  # backward-compat
+        _ = kwargs  # backward-compat (старые коды передавали scrappey_key и т.п.)
 
-        self._scrappey_key = scrappey_key or os.environ.get("SCRAPPEY_KEY")
-        if not self._scrappey_key:
+        # Serper-клиент для поиска nm_id. Лениво создаём через factory, если не
+        # передан явно. Если SERPER_API_KEY не задан — factory кинет/вернёт None,
+        # extract() тогда всегда вернёт [].
+        self._search_client = web_search_client
+        if self._search_client is None:
+            try:
+                self._search_client = get_web_search_client()
+            except Exception as exc:  # SERPER_API_KEY не задан и т.п.
+                logger.warning(
+                    "[WbCard] web search client недоступен (%s) — extract() вернёт [].",
+                    exc,
+                )
+                self._search_client = None
+        if self._search_client is None:
             logger.warning(
-                "[WbCard] SCRAPPEY_KEY не задан (ни параметром, ни в env) — "
-                "extract() всегда вернёт []."
+                "[WbCard] SERPER не сконфигурирован (PROVIDER_WEB_SEARCH != 'serper' "
+                "или нет ключа) — extract() всегда вернёт []."
             )
 
         self._judge = WbCardJudge()
@@ -237,9 +234,9 @@ class WbCardSource(AttributeSource):
         return Source.WB_CARD
 
     def is_applicable(self, context: ExtractionContext, target: TargetAttribute) -> bool:
-        """Применим если product_name есть и не пустой, и SCRAPPEY_KEY доступен."""
+        """Применим если product_name достаточный и search-клиент доступен."""
         return bool(
-            self._scrappey_key
+            self._search_client
             and context.product_name
             and len(context.product_name.strip()) >= 5
         )
@@ -250,7 +247,7 @@ class WbCardSource(AttributeSource):
         targets: list[TargetAttribute],
         already_filled: Optional[list[AttributeValue]] = None,
     ) -> list[AttributeValue]:
-        if not targets or not context.product_name or not self._scrappey_key:
+        if not targets or not context.product_name or not self._search_client:
             return []
 
         already_filled = already_filled or []
@@ -283,209 +280,115 @@ class WbCardSource(AttributeSource):
                 "[WbCard] unexpected error для '%s': %s",
                 context.product_name[:60], exc,
             )
-            self._cache_put(cache_key, [])
+            # НЕ кэшируем пустышку: ошибка часто транзиентная (Serper-флак,
+            # сетевой сбой). Кэширование [] «залипает» и блокирует ретрай в
+            # следующем прогоне. Возвращаем пусто, кэш не трогаем.
             return []
 
-        self._cache_put(cache_key, all_values)
+        # Кэшируем только непустой результат. Пустой список — обычно следствие
+        # флака Serper (троттлинг/пустой ответ), уже отретраенного в _search;
+        # если всё равно пусто, кэшировать [] нельзя — иначе флак-пустышка
+        # залипнет в LRU и следующий прогон не сделает повторный поиск. Непустой
+        # результат кэшируем как раньше, чтобы не бить Serper повторно.
+        if all_values:
+            self._cache_put(cache_key, all_values)
         return self._filter_for_targets(all_values, effective)
 
     def get_judge(self) -> LlmJudge:
         return self._judge
 
     # ------------------------------------------------------------------
-    # Network transport via Scrappey
+    # Core flow
     # ------------------------------------------------------------------
-
-    async def _scrappey_fetch_json(
-        self,
-        client: httpx.AsyncClient,
-        target_url: str,
-    ) -> Optional[dict]:
-        """POST к Scrappey с retry, возвращает parsed JSON ответа upstream.
-
-        Retry если HTTP 429 / 500 от WB (через Scrappey envelope.solution.statusCode).
-        Network errors / Scrappey HTTP 4xx также реtraется.
-        """
-        logger.info("[WbCard] via Scrappey: %s", target_url[:120])
-        for attempt in range(_MAX_RETRIES + 1):
-            result = await self._scrappey_fetch_once(client, target_url)
-            if result is None:
-                # Hard fail (network, Scrappey 4xx) — имеет смысл retry
-                if attempt < _MAX_RETRIES:
-                    logger.info(
-                        "[WbCard] retry #%d (hard fail) %s",
-                        attempt + 1, target_url[:80],
-                    )
-                    continue
-                return None
-            status_code, data = result
-            if status_code in (429, 500, 502, 503, 504):
-                # Upstream rate-limit / server err — retry
-                if attempt < _MAX_RETRIES:
-                    logger.info(
-                        "[WbCard] retry #%d (upstream HTTP %s) %s",
-                        attempt + 1, status_code, target_url[:80],
-                    )
-                    continue
-                logger.info(
-                    "[WbCard] final upstream HTTP %s for %s — give up",
-                    status_code, target_url[:80],
-                )
-                return None
-            if status_code != 200:
-                logger.info(
-                    "[WbCard] upstream HTTP %s for %s — skip",
-                    status_code, target_url[:80],
-                )
-                return None
-            return data
-        return None
-
-    async def _scrappey_fetch_once(
-        self,
-        client: httpx.AsyncClient,
-        target_url: str,
-    ) -> Optional[tuple[int, Optional[dict]]]:
-        """Один POST к Scrappey. Возвращает (upstream_status, parsed_json) или None.
-
-        None — Scrappey-уровневая ошибка (network, HTTP 4xx, пустой envelope).
-        (status, None) — upstream вернул не-JSON (но это не должно случаться для WB API).
-        (status, dict) — upstream JSON распарсен.
-        """
-        payload = {"cmd": "request.get", "url": target_url}
-        try:
-            r = await client.post(
-                _SCRAPPEY_ENDPOINT,
-                params={"key": self._scrappey_key},
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-        except (httpx.TimeoutException, httpx.HTTPError) as exc:
-            logger.info("[WbCard] Scrappey network err: %s", exc)
-            return None
-
-        if r.status_code >= 400:
-            logger.warning(
-                "[WbCard] Scrappey HTTP %s for %s — skip (body[:200]=%s)",
-                r.status_code, target_url[:80], r.text[:200],
-            )
-            return None
-
-        try:
-            envelope = r.json()
-        except (ValueError, json.JSONDecodeError):
-            logger.info("[WbCard] Scrappey returned non-json envelope")
-            return None
-
-        # Credit usage logging (Scrappey возвращает в envelope creditsUsed/credits/cost)
-        for credits_key in ("creditsUsed", "credits", "cost"):
-            if credits_key in envelope:
-                logger.info(
-                    "[WbCard] credits used: %s (%s)",
-                    envelope.get(credits_key), credits_key,
-                )
-                break
-
-        solution = envelope.get("solution") or {}
-        upstream_status = solution.get("statusCode")
-        content = solution.get("response") or ""
-
-        if not isinstance(upstream_status, int):
-            logger.info(
-                "[WbCard] Scrappey envelope без statusCode для %s",
-                target_url[:80],
-            )
-            return None
-
-        if not content:
-            logger.info(
-                "[WbCard] Scrappey empty content (upstream=%s) for %s",
-                upstream_status, target_url[:80],
-            )
-            return (upstream_status, None)
-
-        try:
-            data = json.loads(content)
-        except (ValueError, json.JSONDecodeError):
-            logger.info(
-                "[WbCard] Scrappey response не JSON (upstream=%s) for %s",
-                upstream_status, target_url[:80],
-            )
-            return (upstream_status, None)
-
-        return (upstream_status, data if isinstance(data, dict) else None)
 
     async def _do_extract(
         self,
         context: ExtractionContext,
         targets: list[TargetAttribute],
     ) -> list[AttributeValue]:
-        """Полный flow: search → match → card.json → map → AVs."""
+        """Полный flow: compress → Serper(nm_id) → CDN card.json → pick → map → AVs."""
+        full_name = context.product_name.strip()
+        cat_leaf = context.category_path[-1] if context.category_path else None
+        primary_query = _compress_search_query(
+            full_name, context.brand, max_tokens=5, category_name=cat_leaf
+        )
+        fallback_query = _compress_search_query(
+            full_name, context.brand, max_tokens=3, category_name=cat_leaf
+        )
+
+        queries_to_try: list[str] = [primary_query]
+        if fallback_query and fallback_query != primary_query:
+            queries_to_try.append(fallback_query)
+
+        # ---- SEARCH (Serper → nm_id) ----
+        nm_ids: list[int] = []
+        used_query: Optional[str] = None
+        for q in queries_to_try:
+            logger.info("[WbCard] search query: '%s' (was: '%s')", q, full_name[:80])
+            candidates = await self._search(q)
+            if candidates:
+                nm_ids, used_query = candidates, q
+                break
+            logger.info("[WbCard] no nm_id на query='%s' — пробую fallback", q[:60])
+
+        if not nm_ids or used_query is None:
+            logger.info("[WbCard] no nm_id ни для primary ни для fallback")
+            return []
+
         async with httpx.AsyncClient(
             timeout=_HTTP_TIMEOUT,
             follow_redirects=True,
+            headers={"User-Agent": _CHROME_UA},
         ) as client:
-            # ---- SEARCH ----
-            full_name = context.product_name.strip()
-            primary_query = _compress_search_query(full_name, context.brand, max_tokens=5)
-            fallback_query = _compress_search_query(full_name, context.brand, max_tokens=3)
+            # ---- CARD JSON (CDN) для кандидатов ----
+            # Перебираем nm_id по порядку. 404 на одном не прекращает перебор —
+            # идём к следующему. Останавливаемся, набрав _MAX_FETCHED_CARDS
+            # успешно скачанных карточек (чтобы было из чего выбирать богатую,
+            # но не качать все 10 кандидатов).
+            cards: list[tuple[int, dict]] = []
+            attempted = 0
+            for nm_id in nm_ids:
+                attempted += 1
+                card = await self._fetch_card(client, nm_id)
+                if card:
+                    cards.append((nm_id, card))
+                    if len(cards) >= _MAX_FETCHED_CARDS:
+                        break
 
-            queries_to_try: list[str] = [primary_query]
-            if fallback_query and fallback_query != primary_query:
-                queries_to_try.append(fallback_query)
-
-            tiles: list[dict] = []
-            query: Optional[str] = None
-            for q in queries_to_try:
+            if not cards:
                 logger.info(
-                    "[WbCard] search query: '%s' (was: '%s')",
-                    q, full_name[:80],
+                    "[WbCard] ни один card.json не скачался (%d из %d кандидатов перебрано)",
+                    attempted, len(nm_ids),
                 )
-                parsed = await self._search(client, q)
-                if parsed:
-                    tiles, query = parsed, q
-                    break
-                logger.info("[WbCard] no tiles на query='%s' — пробую fallback", q[:60])
-
-            if not tiles or query is None:
-                logger.info("[WbCard] no search tiles ни для primary ни для fallback")
                 return []
 
-            top_tile, top_score = self._pick_best_match(query, tiles[:_MAX_SEARCH_TILES])
-            if top_tile is None:
+            logger.info(
+                "[WbCard] скачано %d card.json из %d перебранных кандидатов (всего %d)",
+                len(cards), attempted, len(nm_ids),
+            )
+
+            # ---- PICK BEST (match-фильтр → среди релевантных богатую) ----
+            best = self._pick_best_card(used_query, cat_leaf, cards)
+            if best is None:
                 return []
-            mode = self._classify_match(top_score)
+            nm_id, card, title, score = best
+            mode = self._classify_match(score)
             if mode == "skip":
-                logger.info(
-                    "[WbCard] best score=%.1f < %.0f — skip",
-                    top_score, _BRAND_LINE_THRESHOLD,
-                )
-                return []
-
-            title = (top_tile.get("title") or "").strip()
-            nm_id = top_tile.get("nm_id")
-            if not nm_id:
-                logger.info("[WbCard] no nm_id in top tile")
+                logger.info("[WbCard] best score=%.1f < %.0f — skip", score, _BRAND_LINE_THRESHOLD)
                 return []
 
             logger.info(
                 "[WbCard] match=%s score=%.1f title='%s' nm=%s",
-                mode, top_score, title[:80], nm_id,
+                mode, score, title[:80], nm_id,
             )
 
-            # ---- CARD JSON ----
-            card_data = await self._fetch_card(client, int(nm_id))
-            if not card_data:
-                logger.info("[WbCard] card.json failed for nm=%s", nm_id)
-                return []
-
-            chars = self._extract_options(card_data)
+            chars = self._extract_options(card)
             if not chars:
                 logger.info("[WbCard] no options/characteristics в card.json nm=%s", nm_id)
                 return []
 
             # ---- IMAGES (для downstream VisionSource) ----
-            new_image_urls = self._extract_image_urls(card_data, int(nm_id))
+            new_image_urls = self._extract_image_urls(card, nm_id)
             if new_image_urls:
                 existing = set(context.image_urls or [])
                 added = [u for u in new_image_urls if u not in existing]
@@ -498,81 +401,123 @@ class WbCardSource(AttributeSource):
 
             # ---- MAP & EMIT ----
             return self._map_characteristics(
-                chars, targets, context, mode, title, top_score,
+                chars, targets, context, mode, title, score,
             )
 
-    async def _search(self, client: httpx.AsyncClient, query: str) -> list[dict]:
-        """Scrappey → WB search API → нормализованные tiles [{title, nm_id, brand}]."""
-        url = _WB_SEARCH_URL.format(query=query)
-        data = await self._scrappey_fetch_json(client, url)
-        if not data:
+    async def _search(self, query: str) -> list[int]:
+        """Serper → nm_id с ретраем при пустом результате (троттлинг/флак).
+
+        Serper при concurrency нестабилен: тот же запрос то возвращает 10 nm_id,
+        то 0 organic / 0 извлечённых nm_id. Если попытка дала 0 — повторяем с
+        экспоненциальным бэкоффом (1с, 2с) до _SERPER_MAX_ATTEMPTS. На успехе
+        (≥1 nm_id) выходим сразу. После всех ретраев пусто → graceful [] (выше
+        по стеку это fallback, не падение).
+        """
+        for attempt in range(1, _SERPER_MAX_ATTEMPTS + 1):
+            nm_ids = await self._search_once(query)
+            if nm_ids:
+                if attempt > 1:
+                    logger.info(
+                        "[WbCard] Serper непустой результат с попытки %d/%d",
+                        attempt, _SERPER_MAX_ATTEMPTS,
+                    )
+                return nm_ids
+            if attempt < _SERPER_MAX_ATTEMPTS:
+                delay = _SERPER_BACKOFF_BASE * (2 ** (attempt - 1))
+                logger.info(
+                    "[WbCard] Serper → 0 nm_id (попытка %d/%d), ретрай через %.1fс",
+                    attempt, _SERPER_MAX_ATTEMPTS, delay,
+                )
+                await asyncio.sleep(delay)
+        logger.info(
+            "[WbCard] Serper → 0 nm_id после %d попыток (флак/нет результатов)",
+            _SERPER_MAX_ATTEMPTS,
+        )
+        return []
+
+    async def _search_once(self, query: str) -> list[int]:
+        """Одна Serper-попытка → список уникальных nm_id (top-N).
+
+        Запрос ``inurl:catalog detail.aspx <query>`` даёт ~100% прямых ссылок
+        на карточки WB. Предпочитаем домен wildberries.ru, зеркала — fallback.
+        """
+        serper_query = f"inurl:catalog detail.aspx {query}".strip()
+        try:
+            results = await self._search_client.search(
+                serper_query, num_results=_SERPER_NUM_RESULTS
+            )
+        except Exception as exc:
+            logger.info("[WbCard] Serper search err: %s", exc)
             return []
 
-        products = (((data or {}).get("data") or {}).get("products")) or []
-        tiles: list[dict] = []
-        for p in products:
-            if not isinstance(p, dict):
+        organic = getattr(results, "organic_results", None) or []
+
+        # Собираем (nm_id, prefer_ru) в порядке появления, дедуп.
+        ordered_main: list[int] = []   # с wildberries.ru
+        ordered_mirror: list[int] = []  # зеркала / относительные
+        seen: set[int] = set()
+        for item in organic:
+            link = getattr(item, "link", "") or ""
+            m = _NM_ID_RE.search(link)
+            if not m:
                 continue
-            nm_id = p.get("id")
-            name = (p.get("name") or "").strip()
-            brand = (p.get("brand") or "").strip()
-            if not nm_id or not name:
+            try:
+                nm_id = int(m.group(1))
+            except (ValueError, TypeError):
                 continue
-            title = f"{brand} {name}".strip() if brand and brand.lower() not in name.lower() else name
-            tiles.append({"title": title[:200], "nm_id": int(nm_id), "brand": brand})
-        return tiles
+            if nm_id in seen:
+                continue
+            seen.add(nm_id)
+            if "wildberries.ru" in link.lower():
+                ordered_main.append(nm_id)
+            else:
+                ordered_mirror.append(nm_id)
+
+        nm_ids = (ordered_main + ordered_mirror)[:_MAX_CANDIDATES]
+        logger.info("[WbCard] Serper → %d уникальных nm_id: %s", len(nm_ids), nm_ids)
+        return nm_ids
 
     async def _fetch_card(
         self,
         client: httpx.AsyncClient,
         nm_id: int,
     ) -> Optional[dict]:
-        """Скачать card.json через Scrappey с retry по basket-NN.
-
-        Стратегия:
-          1. Сначала пробуем basket из known таблицы (если nm_id в покрытом диапазоне).
-          2. Если 404 / нет таблицы → brute force basket-NN от 18 до 30.
-          3. Если всё мимо → fallback на wbx-content-v2.wbstatic.net.
-        """
-        # 1. Known basket
-        primary_host = _basket_host_from_table(nm_id)
-        if primary_host:
-            data = await self._try_basket(client, primary_host, nm_id)
-            if data:
+        """Скачать card.json с CDN. Простой GET; на 404 перебор NN (01..21)."""
+        primary_nn = _basket_nn_from_table(nm_id)
+        # Сначала known NN, затем остальные (без повтора primary).
+        order = [primary_nn] + [nn for nn in _ALL_BASKET_NN if nn != primary_nn]
+        for nn in order:
+            data = await self._try_basket(client, nn, nm_id)
+            if data is not None:
+                if nn != primary_nn:
+                    logger.info("[WbCard] nm=%s найден на basket-%s (fallback)", nm_id, nn)
                 return data
-
-        # 2. Brute force fallback range (basket-18..30) — для свежих nm_id
-        for n in _BASKET_FALLBACK_RANGE:
-            host = f"basket-{n:02d}.wbbasket.ru"
-            if host == primary_host:
-                continue
-            data = await self._try_basket(client, host, nm_id)
-            if data:
-                logger.info("[WbCard] nm=%s found in fallback %s", nm_id, host)
-                return data
-
-        # 3. Static content fallback
-        url = _CONTENT_FALLBACK_URL.format(nm_id=nm_id)
-        return await self._scrappey_fetch_json(client, url)
+        logger.info("[WbCard] card.json не найден ни на одном basket для nm=%s", nm_id)
+        return None
 
     async def _try_basket(
         self,
         client: httpx.AsyncClient,
-        host: str,
+        nn: str,
         nm_id: int,
     ) -> Optional[dict]:
-        """Один basket-attempt через Scrappey. None если 404/non-200."""
-        url = _card_url(host, nm_id)
-        # NB: используем _scrappey_fetch_once напрямую (без retry) — basket-brute-force
-        # сам по себе цикл retry'ов по разным хостам, плюс 404 ожидаем и
-        # ретраить его смысла нет (на этом хосте товара просто нет).
-        result = await self._scrappey_fetch_once(client, url)
-        if result is None:
+        """Один CDN GET. None если non-200 / не JSON / network err."""
+        url = _card_url(nn, nm_id)
+        try:
+            r = await client.get(url)
+        except (httpx.TimeoutException, httpx.HTTPError) as exc:
+            logger.debug("[WbCard] CDN network err %s: %s", url, exc)
             return None
-        status_code, data = result
-        if status_code != 200 or not isinstance(data, dict):
+        if r.status_code != 200:
             return None
-        return data
+        try:
+            data = r.json()
+        except ValueError:  # включает json.JSONDecodeError
+            return None
+        except Exception as exc:  # noqa: BLE001 — на всякий случай не падаем
+            logger.debug("[WbCard] card.json parse err %s: %s", url, exc)
+            return None
+        return data if isinstance(data, dict) else None
 
     # ------------------------------------------------------------------
     # Card JSON parsing
@@ -585,8 +530,8 @@ class WbCardSource(AttributeSource):
         Структуры:
           - options: [{"name": "Цвет", "value": "Белый"}, ...]
           - grouped_options: [{"group_name": "...", "options": [...]}]
-            (иерархия — собираем options[] из каждой группы).
-          - compositions: [{"name", "value"}] — fallback из wbx-content-v2.
+          - compositions: [{"name": "хлопок", "value": "100"}] ИЛИ ["хлопок 100%"]
+            → Состав.
 
         Возвращает [{name, value, value_ids=[]}], deduped по lowercase name.
         """
@@ -602,7 +547,6 @@ class WbCardSource(AttributeSource):
             name_low = name.lower()
             if name_low in seen:
                 return
-            # value может быть string | list | dict
             if isinstance(value, list):
                 texts = [str(v).strip() for v in value if str(v).strip()]
                 if not texts:
@@ -629,28 +573,34 @@ class WbCardSource(AttributeSource):
                     if isinstance(o, dict):
                         _push(o.get("name"), o.get("value"))
 
-        # 3. compositions (wbx-content-v2 fallback)
+        # 3. compositions → Состав. WB отдаёт либо список {name,value} (доля
+        #    материала), либо список строк. Собираем в одну пару «Состав».
+        comp_parts: list[str] = []
         for c in card.get("compositions") or []:
             if isinstance(c, dict):
-                _push(c.get("name"), c.get("value"))
+                cname = str(c.get("name") or "").strip()
+                cval = c.get("value")
+                cval_str = str(cval).strip() if isinstance(cval, (str, int, float)) else ""
+                if cname and cval_str:
+                    comp_parts.append(f"{cname} {cval_str}")
+                elif cname:
+                    comp_parts.append(cname)
+            elif isinstance(c, str) and c.strip():
+                comp_parts.append(c.strip())
+        if comp_parts and "состав" not in seen:
+            seen.add("состав")
+            out.append({"name": "Состав", "value": ", ".join(comp_parts), "value_ids": []})
 
         return out
 
     @staticmethod
     def _extract_image_urls(card: dict, nm_id: int, limit: int = 5) -> list[str]:
-        """Собрать high-res photo URLs.
-
-        WB card.json иногда содержит media.photos[] (полные URL'ы) или просто
-        media.photo_count (число — тогда конструируем URL'ы из basket-host).
-        Возвращает первые `limit` URL'ов в порядке появления.
-        """
+        """Собрать high-res photo URLs из media.photos[] или media.photo_count."""
         out: list[str] = []
         media = card.get("media") or {}
 
-        # 1. Готовые photo URLs
         for p in media.get("photos") or []:
             if isinstance(p, dict):
-                # WB иногда отдаёт {url} / {big}
                 for k in ("url", "big", "src"):
                     url = p.get(k)
                     if isinstance(url, str) and url.startswith("http"):
@@ -663,46 +613,138 @@ class WbCardSource(AttributeSource):
             if len(out) >= limit:
                 return out
 
-        # 2. Конструкция из photo_count + basket-host
         photo_count = media.get("photo_count")
         if isinstance(photo_count, int) and photo_count > 0:
-            host = _basket_host_from_table(nm_id)
-            if host:
-                vol = nm_id // 100_000
-                part = nm_id // 1000
-                base = f"https://{host}/vol{vol}/part{part}/{nm_id}/images/big"
-                for i in range(1, min(photo_count, limit - len(out)) + 1):
-                    url = f"{base}/{i}.webp"
-                    if url not in out:
-                        out.append(url)
-                    if len(out) >= limit:
-                        break
+            nn = _basket_nn_from_table(nm_id)
+            vol = nm_id // 100_000
+            part = nm_id // 1000
+            base = f"https://basket-{nn}.wbbasket.ru/vol{vol}/part{part}/{nm_id}/images/big"
+            for i in range(1, min(photo_count, limit - len(out)) + 1):
+                url = f"{base}/{i}.webp"
+                if url not in out:
+                    out.append(url)
+                if len(out) >= limit:
+                    break
         return out[:limit]
 
     # ------------------------------------------------------------------
     # Match scoring
     # ------------------------------------------------------------------
 
+    def _pick_best_card(
+        self,
+        query: str,
+        cat_leaf: Optional[str],
+        cards: list[tuple[int, dict]],
+    ) -> Optional[tuple[int, dict, str, float]]:
+        """Выбрать карточку среди скачанных: сначала матч, потом богатство.
+
+        Прежняя стратегия брала ОДИН лучший по fuzzy-скору вслепую — если у
+        лидера была бедная карточка (3 options), мы теряли соседнюю богатую с
+        чуть меньшим скором. Новая логика:
+
+          1. Скорим каждый кандидат по заголовку (imt_name/subj_name) через
+             _pick_best_match (model-token бонус, type-mismatch штраф) и считаем
+             число полезных options (_extract_options).
+          2. Отсекаем нерелевантные (score < _BRAND_LINE_THRESHOLD) — это
+             type/brand-mismatch, такие карточки не нужны даже если богатые.
+          3. Среди релевантных выбираем «лучшую»: при сопоставимом скоре
+             (разрыв ≤ _SCORE_TIE_BAND) предпочитаем карточку с бОльшим числом
+             options. Иначе — карточку с максимальным скором.
+
+        Возвращает (nm_id, card, title, score) или None.
+        """
+        scored: list[dict] = []
+        for nm_id, card in cards:
+            title = self._card_title(card)
+            _, score = self._pick_best_match(
+                query, [{"title": title}], category_leaf=cat_leaf
+            )
+            n_opts = len(self._extract_options(card))
+            scored.append({
+                "nm_id": nm_id,
+                "card": card,
+                "title": title,
+                "score": score,
+                "n_opts": n_opts,
+            })
+
+        # Отсечь нерелевантные по матчу (type/brand-mismatch).
+        relevant = [c for c in scored if c["score"] >= _BRAND_LINE_THRESHOLD]
+        if not relevant:
+            # Все кандидаты ниже порога матча — деградируем к старому поведению:
+            # вернуть абсолютного лидера по скору, дальше _classify_match → skip.
+            top = max(scored, key=lambda c: c["score"], default=None)
+            if top is None:
+                return None
+            return (top["nm_id"], top["card"], top["title"], top["score"])
+
+        max_score = max(c["score"] for c in relevant)
+
+        # Кандидаты в пределах tie-band от лидера → решает богатство (n_opts),
+        # при равенстве — скор. Так пустой лидер уступает богатому соседу.
+        contenders = [c for c in relevant if c["score"] >= max_score - _SCORE_TIE_BAND]
+        best = max(contenders, key=lambda c: (c["n_opts"], c["score"]))
+
+        if logger.isEnabledFor(logging.INFO):
+            ranking = ", ".join(
+                f"nm={c['nm_id']}(score={c['score']:.1f},opts={c['n_opts']})"
+                for c in sorted(relevant, key=lambda c: -c["score"])
+            )
+            logger.info(
+                "[WbCard] pick: %d релевантных → выбран nm=%s (score=%.1f, opts=%d) | %s",
+                len(relevant), best["nm_id"], best["score"], best["n_opts"], ranking,
+            )
+
+        return (best["nm_id"], best["card"], best["title"], best["score"])
+
+    @staticmethod
+    def _card_title(card: dict) -> str:
+        """Заголовок карточки для fuzzy-сравнения: brand + imt_name + subj_name."""
+        parts: list[str] = []
+        for key in ("selling", "imt_name", "subj_name", "subj_root_name"):
+            val = card.get(key)
+            if key == "selling" and isinstance(val, dict):
+                val = val.get("brand_name")
+            if isinstance(val, str) and val.strip():
+                if val.strip().lower() not in " ".join(parts).lower():
+                    parts.append(val.strip())
+        return " ".join(parts).strip()
+
     @staticmethod
     def _pick_best_match(
         query: str,
         tiles: list[dict],
+        category_leaf: Optional[str] = None,
     ) -> tuple[Optional[dict], float]:
-        """Top-1 по rapidfuzz (partial_ratio + token_sort_ratio averaged)."""
+        """rapidfuzz match с model-token бонусом и type-mismatch штрафом.
+
+        Логика идентична OzonCardSource._pick_best_match: partial_ratio +
+        token_sort_ratio, +5 за общий артикул, -30 за несовпадение типа товара
+        (только для одежды без артикула).
+        """
         try:
             from rapidfuzz import fuzz
         except ImportError:
             return (tiles[0], 100.0) if tiles else (None, 0.0)
 
+        _MODEL_BONUS = 5.0
+        _TYPE_MISMATCH_PENALTY = 30.0
+        q_models = _extract_model_tokens(query)
         best_tile: Optional[dict] = None
         best_score = 0.0
         q = query.lower()
+        cat_leaf_low = category_leaf.strip().lower() if category_leaf else None
         for tile in tiles:
             title = (tile.get("title") or "").strip()
             if not title:
                 continue
             t = title.lower()
             score = (fuzz.partial_ratio(q, t) + fuzz.token_sort_ratio(q, t)) / 2.0
+            if q_models and q_models & _extract_model_tokens(title):
+                score += _MODEL_BONUS
+            if cat_leaf_low and not q_models and cat_leaf_low not in t:
+                score -= _TYPE_MISMATCH_PENALTY
             if score > best_score:
                 best_score = score
                 best_tile = tile
@@ -731,8 +773,8 @@ class WbCardSource(AttributeSource):
     ) -> list[AttributeValue]:
         """Сопоставить WB-char names с target.name через Ozon dictionary.
 
-        Да, маппим WB-характеристики на наш Ozon словарь — финальное API
-        publish'a у нас Ozon, а WB-карточка лишь источник данных.
+        Маппим WB-характеристики на наш Ozon словарь — финальное API
+        публикации у нас Ozon, а WB-карточка лишь источник данных.
         """
         ozon_chars: list[dict] = []
         cat_id: Optional[int] = None
@@ -746,13 +788,11 @@ class WbCardSource(AttributeSource):
             cat_id = None
             type_id = None
 
-        # attr_id → canonical_name из dict
         attr_id_to_dict_name: dict[int, str] = {}
         for oc in ozon_chars:
             if isinstance(oc, dict) and "id" in oc and "name" in oc:
                 attr_id_to_dict_name[int(oc["id"])] = str(oc["name"])
 
-        # target_id → lowercase set имён
         target_names_low: dict[int, set[str]] = {}
         for t in targets:
             names = {t.name.lower()}
@@ -790,15 +830,12 @@ class WbCardSource(AttributeSource):
             if mode == "brand_line" and char_name_low in _BRAND_LINE_BLACKLIST:
                 continue
 
-            # 1) Exact lowercase
             target_id = name_to_target_id.get(char_name_low)
-            # 2) Substring
             if target_id is None:
                 for tn, tid in name_to_target_id.items():
                     if char_name_low in tn or tn in char_name_low:
                         target_id = tid
                         break
-            # 3) Fuzzy
             if target_id is None and process is not None and all_target_names:
                 best = process.extractOne(
                     char_name_low, all_target_names, scorer=fuzz.WRatio,
