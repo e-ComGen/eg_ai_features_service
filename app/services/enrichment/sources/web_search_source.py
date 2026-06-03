@@ -10,6 +10,7 @@ Steps:
 
 Spec: docs/architecture/pipeline.md, section "Stage 4 / WebSearchSource".
 """
+import os
 from typing import Optional
 from pydantic import BaseModel, Field, AliasChoices, model_validator
 from app.services.enrichment.base import (
@@ -92,11 +93,24 @@ class WebSearchSource(AttributeSource):
         # MPN передаётся первым в search query — точный код производителя имеет
         # наивысший signal-to-noise (Vision может обогатить context.mpn из фото).
         if context.product_id not in self._summary_cache:
+            # Dual-lang search ON by default in the pipeline: ru + en in parallel
+            # (EN manufacturer pages hold authoritative specs, RU pages local
+            # variants; producer concatenates both into ONE extraction call).
+            # context.languages wins if set; else WEBSEARCH_LANGS env (default
+            # "ru,en"). Set WEBSEARCH_LANGS=ru to disable EN cheaply.
+            languages = context.languages
+            if languages is None:
+                languages = [
+                    lang.strip()
+                    for lang in os.environ.get("WEBSEARCH_LANGS", "ru,en").split(",")
+                    if lang.strip()
+                ]
             summary = await self._search.produce_summary(
                 product_name=context.product_name,
                 brand=context.brand,
                 ean=context.ean,
                 mpn=context.mpn,
+                languages=languages,
             )
             self._summary_cache[context.product_id] = summary
             # WebSearchProducer делает 1 LLM call внутри + Serper search

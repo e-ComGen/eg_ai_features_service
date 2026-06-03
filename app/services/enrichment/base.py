@@ -152,6 +152,10 @@ class ExtractionContext(BaseModel):
     source_urls: list[str] = Field(default_factory=list)
     image_urls: list[str] = Field(default_factory=list)
 
+    # Web-search languages (dual-lang). None → source applies its own default
+    # (WEBSEARCH_LANGS env, ["ru","en"] by default — searches RU + EN in parallel).
+    languages: Optional[list[str]] = None
+
     # Marketplace-specific fields
     marketplace: Optional[str] = None          # "ozon" | "wb" | None
     ozon_type_id: Optional[int] = None         # Ozon type_id для точного словарного поиска

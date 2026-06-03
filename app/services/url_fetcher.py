@@ -471,7 +471,12 @@ async def _extract_generic_from_html(url: str, html: str) -> Optional[FetchResul
     # Try trafilatura (best quality)
     try:
         import trafilatura  # type: ignore
-        content = trafilatura.extract(html, include_comments=False, include_tables=True)
+        # favor_recall=True pulls MORE body text (spec tables/lists that the
+        # default precision mode drops). The _looks_like_boilerplate guard
+        # downstream (websearch_producer, commit 325573d) still filters noise.
+        content = trafilatura.extract(
+            html, include_comments=False, include_tables=True, favor_recall=True
+        )
     except ImportError:
         pass
     except Exception as exc:

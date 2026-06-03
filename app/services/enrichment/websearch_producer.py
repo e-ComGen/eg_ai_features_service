@@ -11,11 +11,31 @@ Provider selection is config-driven (PROVIDER_WEB_SEARCH):
 
 import asyncio
 import logging
+import os
 from typing import Optional
 
 from app import config
 
 logger = logging.getLogger(__name__)
+
+# Caps CONCURRENT Serper HTTP calls across the whole run. Eval runs up to 8
+# products concurrently × dual-lang = up to 16 concurrent Serper calls → 429.
+# Created lazily on the RUNNING loop (a module-level Semaphore bound at import
+# time latches onto a dead/foreign loop and raises "bound to a different loop").
+_serper_sem: "asyncio.Semaphore | None" = None
+_serper_sem_loop: "asyncio.AbstractEventLoop | None" = None
+
+
+def _get_serper_sem() -> asyncio.Semaphore:
+    """Return a process-wide Serper concurrency semaphore, created lazily on the
+    currently running event loop and reused for that loop."""
+    global _serper_sem, _serper_sem_loop
+    loop = asyncio.get_running_loop()
+    if _serper_sem is None or _serper_sem_loop is not loop:
+        size = int(os.environ.get("WEBSEARCH_SERPER_CONCURRENCY", "8"))
+        _serper_sem = asyncio.Semaphore(size)
+        _serper_sem_loop = loop
+    return _serper_sem
 
 _WS_USER_TEMPLATE = (
     "Find online the technical specifications and characteristics of the following product.\n\n"
@@ -253,10 +273,12 @@ class WebSearchProducer:
         query = " ".join(parts) + " " + suffix
 
         try:
-            results = await asyncio.wait_for(
-                self._serper.search(query, num_results=5),
-                timeout=timeout,
-            )
+            sem = _get_serper_sem()
+            async with sem:
+                results = await asyncio.wait_for(
+                    self._serper.search(query, num_results=5),
+                    timeout=timeout,
+                )
         except asyncio.TimeoutError:
             logger.warning(
                 "WebSearchProducer (serper): search timed out after %ds for %r.",
