@@ -63,6 +63,9 @@ from app.services.enrichment.sources.ozon_card_source import (
     _compress_search_query,
     _extract_model_tokens,
     _extract_alpha_model_tokens,
+    _extract_gender_signal,
+    _gender_conflict,
+    _is_gender_target_name,
     _is_spec_or_unit_token,
     _normalize_model,
     _LEADING_STOPWORDS,
@@ -231,6 +234,10 @@ _SCORE_TIE_BAND = 12.0
 # Confidence — параллельно с OzonCardSource.
 _CONF_EXACT = 0.93
 _CONF_BRAND_LINE = 0.85
+# Пониженный confidence для поля «Пол», навеянного гендером brand_line-карточки
+# при нейтральном имени товара (гендер-страховка, п.3). Ниже порога, чтобы
+# merger/judge не предпочли его более надёжным источникам (vision/llm).
+_CONF_GENDER_DOWNWEIGHT = 0.40
 
 _EXACT_THRESHOLD = 78.0
 _BRAND_LINE_THRESHOLD = 60.0
@@ -995,8 +1002,12 @@ class WbCardSource(AttributeSource):
         _MODEL_BONUS = 5.0
         _MODEL_BONUS_ALPHA = 3.0  # словесная модель — слабее цифрового артикула
         _TYPE_MISMATCH_PENALTY = 30.0
+        _GENDER_MISMATCH_PENALTY = 30.0  # как type-mismatch: карточка чужого пола проигрывает
         q_models = _extract_model_tokens(query)
         q_alpha = _extract_alpha_model_tokens(query)
+        # Гендер-сигнал имени товара. Нейтральное имя («Ultraboost 22») → None →
+        # штраф не применяется (нельзя утверждать, что карточка неверного пола).
+        q_gender = _extract_gender_signal(query)
         best_tile: Optional[dict] = None
         best_score = 0.0
         q = query.lower()
@@ -1016,6 +1027,11 @@ class WbCardSource(AttributeSource):
                 score += _MODEL_BONUS_ALPHA
             if cat_leaf_low and not q_models and cat_leaf_low not in t:
                 score -= _TYPE_MISMATCH_PENALTY
+            # Гендер-штраф: имя несёт явный пол И заголовок карточки (включает
+            # subj_name/subj_root_name через _card_title) несёт ПРОТИВОРЕЧАЩИЙ пол
+            # → карточка не того гендера проигрывает. Унисекс/нейтрал — без штрафа.
+            if q_gender is not None and _gender_conflict(query, title):
+                score -= _GENDER_MISMATCH_PENALTY
             if score > best_score:
                 best_score = score
                 best_tile = tile
@@ -1090,6 +1106,11 @@ class WbCardSource(AttributeSource):
         evidence_short = f"wb:{title[:50]} | match={score:.1f}"
         conf = _CONF_EXACT if mode == "exact" else _CONF_BRAND_LINE
 
+        # Гендер-страховка (п.3) для поля «Пол», пришедшего из brand_line-карточки
+        # (не exact). Имя товара vs гендер карточки (title включает subj_name).
+        name_gender = _extract_gender_signal(context.product_name or "")
+        card_gender = _extract_gender_signal(title)
+
         results: list[AttributeValue] = []
         used_ids: set[int] = set()
 
@@ -1121,6 +1142,35 @@ class WbCardSource(AttributeSource):
             if target is None:
                 continue
             used_ids.add(target_id)
+
+            # Гендер-страховка (п.3): поле «Пол» из brand_line-карточки (не exact).
+            # value_gender — пол, который карточка хочет записать. Источники
+            # противоречия: (a) имя товара несёт явный пол, конфликтующий со
+            # значением → СКИП (как Adidas-кейс, если имя гендерное); (b) имя
+            # нейтрально, но карточка-донор сама гендерная (card_gender) и
+            # конфликтует со значением → значение навеяно чужим полом донора →
+            # понижаем confidence. Exact-режим и нейтральные совпадения не трогаем.
+            target_conf = conf
+            if mode == "brand_line" and _is_gender_target_name(target.name):
+                value_gender = _extract_gender_signal(char_val)
+                if value_gender is not None and value_gender != "unisex":
+                    if name_gender is not None and value_gender != name_gender \
+                            and name_gender != "unisex":
+                        logger.info(
+                            "[WbCard] гендер-страховка: СКИП '%s'='%s' "
+                            "(имя='%s' пол=%s vs значение=%s)",
+                            target.name, char_val, context.product_name,
+                            name_gender, value_gender,
+                        )
+                        continue
+                    if name_gender is None and card_gender is not None \
+                            and card_gender == value_gender:
+                        target_conf = min(conf, _CONF_GENDER_DOWNWEIGHT)
+                        logger.info(
+                            "[WbCard] гендер-страховка: ПОНИЖЕН conf '%s'='%s'→%.2f "
+                            "(нейтральное имя, brand_line-карточка пол=%s)",
+                            target.name, char_val, target_conf, card_gender,
+                        )
 
             # Коллекционные характеристики WB отдаёт одной строкой с разделителями
             # (";" или ","). Сплитим в список, чтобы значение участвовало в union
@@ -1156,7 +1206,7 @@ class WbCardSource(AttributeSource):
             results.append(AttributeValue(
                 attribute_id=target.id,
                 value=value_out,
-                confidence=conf,
+                confidence=target_conf,
                 source=Source.WB_CARD,
                 evidence=evidence_short,
                 semantic_type=target.semantic_type,

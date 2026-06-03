@@ -107,6 +107,10 @@ _TYPE_MISMATCH_PENALTY = 30.0
 # exact conf=0.93 — точный match того же товара, не переписываем.
 _CONF_EXACT = 0.93
 _CONF_BRAND_LINE = 0.85
+# Пониженный confidence для поля «Пол», навеянного гендером brand_line-карточки
+# при нейтральном имени товара (гендер-страховка). Ниже порога, чтобы
+# merger/judge не предпочли его более надёжным источникам (vision/llm).
+_CONF_GENDER_DOWNWEIGHT = 0.40
 
 _MULTIVALUE_SPLIT_RE = re.compile(r"[;,]")
 
@@ -608,6 +612,88 @@ def _extract_alpha_model_tokens(s: str) -> set:
             continue
         out.add(low)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Гендер-сигнал (генеральный, без хардкода брендов/категорий)
+# ---------------------------------------------------------------------------
+# Стем-паттерны гендера: одна основа покрывает все словоформы без лемматизатора
+# (мужск-ой/ая/ие/ой пол → "male"; женск-ий/ая/ое + женщин → "female";
+# мальчик/парн → male; девочк/девуш → female). Унисекс — нейтральный сигнал,
+# совместим с любым, поэтому в конфликт НЕ вступает.
+_GENDER_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("unisex", re.compile(r"унисекс|unisex", re.IGNORECASE)),
+    ("male", re.compile(
+        r"мужск|мужчин|мальчик|парн(?:ой|ям|и|ь)|\bmale\b|\bmen('?s)?\b|\bman\b|\bboy",
+        re.IGNORECASE,
+    )),
+    ("female", re.compile(
+        r"женск|женщин|девочк|девуш|\bfemale\b|\bwomen('?s)?\b|\bwoman\b|\bgirl",
+        re.IGNORECASE,
+    )),
+)
+
+
+def _extract_gender_signal(text: str) -> Optional[str]:
+    """Извлечь гендер-сигнал из произвольного текста (name / subj_name карточки).
+
+    Возвращает 'male' / 'female' / 'unisex' / None. Генеральный, без хардкода
+    конкретных брендов/категорий — только грамматические стемы пола, покрывающие
+    все словоформы (мужск-* / женск-* / мальчик / девочк / men / women / ...).
+
+    Логика:
+      - если найдено явное «унисекс/unisex» → 'unisex' (нейтрально, ни с чем не
+        конфликтует);
+      - если найден ровно один из male/female → он;
+      - если найдены ОБА (mixed-листинг «мужские и женские») → None (неоднозначно,
+        в конфликт не вступаем — нельзя утверждать гендер);
+      - ничего не найдено → None (нейтральное имя, напр. «Ultraboost 22»).
+    """
+    if not text:
+        return None
+    found: set[str] = set()
+    for label, pat in _GENDER_PATTERNS:
+        if pat.search(text):
+            found.add(label)
+    if "unisex" in found:
+        return "unisex"
+    if found == {"male"}:
+        return "male"
+    if found == {"female"}:
+        return "female"
+    # ноль сигналов ИЛИ оба пола сразу (mixed) → не утверждаем гендер
+    return None
+
+
+def _gender_conflict(name_text: str, card_text: str) -> bool:
+    """True если ОБА текста несут гендер-сигнал и они ПРОТИВОРЕЧАТ.
+
+    Конфликт = {male vs female}. Если у одного из текстов сигнала нет (None) или
+    он 'unisex' — конфликта НЕТ (нельзя утверждать, что карточка неверного пола).
+    Используется как страховочный сигнал в матче карточки и при даунвейте поля
+    «Пол» (gender-target), пришедшего из brand_line-карточки.
+    """
+    g_name = _extract_gender_signal(name_text)
+    g_card = _extract_gender_signal(card_text)
+    if g_name is None or g_card is None:
+        return False
+    if g_name == "unisex" or g_card == "unisex":
+        return False
+    return g_name != g_card
+
+
+def _is_gender_target_name(name: str) -> bool:
+    """True если имя таргета — поле «Пол» (gender). Без хардкода attribute_id.
+
+    Определяем по имени: содержит «пол» как отдельное слово / «gender» / «род».
+    Гард: «пол» матчим как целое слово (через границы), чтобы не задеть
+    «полнота», «наполнитель», «потолок» и пр., где «пол» — лишь подстрока.
+    """
+    low = name.lower()
+    if "gender" in low:
+        return True
+    # «пол» / «род» как самостоятельное слово (а не часть «наПОЛнитель», «ПОЛнота»)
+    return bool(re.search(r"(?<![а-яёa-z])(пол|род)(?![а-яёa-z])", low))
 
 
 def _normalize_model(product_name: str, brand: Optional[str]) -> str:
@@ -1427,8 +1513,13 @@ class OzonCardSource(AttributeSource):
 
         _MODEL_BONUS = 5.0
         _MODEL_BONUS_ALPHA = 3.0  # словесная модель — слабее цифрового артикула
+        _GENDER_MISMATCH_PENALTY = 30.0  # как type-mismatch: карточка чужого пола проигрывает
         q_models = _extract_model_tokens(query)
         q_alpha = _extract_alpha_model_tokens(query)
+        # Гендер-сигнал ЗАПРОСА (имени товара). Если у имени пол нейтрален
+        # («Ultraboost 22») → q_gender=None → штраф не применяется (нельзя
+        # утверждать, что карточка неверного пола).
+        q_gender = _extract_gender_signal(query)
         best_tile: Optional[dict] = None
         best_score = 0.0
         q = _normalize_for_fuzzy(query)
@@ -1454,6 +1545,11 @@ class OzonCardSource(AttributeSource):
             # Для электроники с артикулом (q_models непустое) штраф не срабатывает.
             if cat_leaf_low and not q_models and cat_leaf_low not in title.lower():
                 score -= _TYPE_MISMATCH_PENALTY
+            # Гендер-штраф: имя товара несёт явный пол И заголовок карточки несёт
+            # ПРОТИВОРЕЧАЩИЙ пол (мужской vs женский) → карточка не того гендера
+            # проигрывает. Унисекс/нейтральное имя/неоднозначность — без штрафа.
+            if q_gender is not None and _gender_conflict(query, title):
+                score -= _GENDER_MISMATCH_PENALTY
             if score > best_score:
                 best_score = score
                 best_tile = tile
@@ -1540,6 +1636,10 @@ class OzonCardSource(AttributeSource):
             _CONF_EXACT if mode == "exact" else _CONF_BRAND_LINE
         )
 
+        # Гендер-страховка для поля «Пол»: имя товара vs гендер карточки (title).
+        name_gender = _extract_gender_signal(context.product_name or "")
+        card_gender = _extract_gender_signal(title)
+
         results: list[AttributeValue] = []
         used_ids: set[int] = set()
 
@@ -1610,6 +1710,32 @@ class OzonCardSource(AttributeSource):
 
             used_ids.add(target_id)
 
+            # Гендер-страховка для поля «Пол» из brand_line-карточки (не exact).
+            # (a) имя несёт явный пол, конфликтующий со значением → СКИП;
+            # (b) имя нейтрально, но карточка-донор сама гендерная и значение
+            #     повторяет её пол → понижаем confidence (значение навеяно донором).
+            target_conf = conf
+            if mode == "brand_line" and _is_gender_target_name(target.name):
+                value_gender = _extract_gender_signal(char_val)
+                if value_gender is not None and value_gender != "unisex":
+                    if name_gender is not None and value_gender != name_gender \
+                            and name_gender != "unisex":
+                        logger.info(
+                            "[OzonCard] гендер-страховка: СКИП '%s'='%s' "
+                            "(имя='%s' пол=%s vs значение=%s)",
+                            target.name, char_val, context.product_name,
+                            name_gender, value_gender,
+                        )
+                        continue
+                    if name_gender is None and card_gender is not None \
+                            and card_gender == value_gender:
+                        target_conf = min(conf, _CONF_GENDER_DOWNWEIGHT)
+                        logger.info(
+                            "[OzonCard] гендер-страховка: ПОНИЖЕН conf '%s'='%s'→%.2f "
+                            "(нейтральное имя, brand_line-карточка пол=%s)",
+                            target.name, char_val, target_conf, card_gender,
+                        )
+
             # Коллекционные характеристики Ozon отдаёт одной строкой (", ".join).
             # Сплитим в список, чтобы значение участвовало в union merge поэлементно
             # и не проигрывало vision/llm целиком. value_id(s) дорезолвит
@@ -1629,7 +1755,7 @@ class OzonCardSource(AttributeSource):
             results.append(AttributeValue(
                 attribute_id=target.id,
                 value=value_out,
-                confidence=conf,
+                confidence=target_conf,
                 source=Source.OZON_CARD,
                 evidence=evidence_short,
                 semantic_type=target.semantic_type,
