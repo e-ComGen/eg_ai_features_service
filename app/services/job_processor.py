@@ -278,6 +278,8 @@ class JobProcessor:
         total_tokens_used = 0
         is_fully_cached = True
 
+        opts = options or BatchOptions()
+
         # --- Web-fetch enrichment (Stage 2) ---
         # Fetch supplier/competitor URLs in parallel and inject into description.
         # Failures are non-fatal: pipeline continues with whatever was fetched.
@@ -292,6 +294,31 @@ class JobProcessor:
         if fetched_content:
             description = f"{description}\n\n=== Sourced from URLs ===\n{fetched_content}"
 
+        # --- Web-search inject (text augmentation, NOT a separate branch) ---
+        # The old _websearch_branch tried to extract attributes via the new-pipeline
+        # AttributeValue schema (int attribute_id) which mismatches the legacy
+        # feature-name keys, so it silently returned []. Now we just append the
+        # search summary to the description so the per-feature extractor reads
+        # both original text and web context through the same prompt. No
+        # multi-source merger needed — regression-free on text-heavy fixtures.
+        web_search_url_count = 0
+        if opts.enable_web_search and self.websearch_producer:
+            try:
+                ws_text = await self.websearch_producer.produce_summary(
+                    product.name,
+                    brand=None,   # TODO: expose brand field on ProductData if needed
+                    ean=None,     # TODO: expose ean field on ProductData if needed
+                )
+                if ws_text:
+                    description = f"{description}\n\n=== Web search ===\n{ws_text}"
+                    web_search_url_count = ws_text.count("https://")
+                    logger.info(
+                        "web_search inject for product_id=%s: +%d chars (~%d sources)",
+                        product.id, len(ws_text), web_search_url_count,
+                    )
+            except Exception as exc:
+                logger.warning("web_search produce_summary failed (non-fatal): %s", exc)
+
         info = f"Title: {product.name}\nDescription: {description[:50000]}"
         context_hash = f"{product.name} {product.description}"
 
@@ -301,7 +328,6 @@ class JobProcessor:
         # Results are merged per-attribute by highest confidence / source
         # priority before the main per-feature description branch runs.
         # ==============================================================
-        opts = options or BatchOptions()
         enrichment_branch_tasks = []
 
         if opts.enable_vision and self.vision_producer and getattr(product, "image_urls", None):
@@ -313,18 +339,6 @@ class JobProcessor:
                     return []
                 return await self._extract_attrs_from_text(vision_text, prod, sc, Source.VISION)
             enrichment_branch_tasks.append(_vision_branch())
-
-        if opts.enable_web_search and self.websearch_producer:
-            async def _websearch_branch(prod=product, sc=schema):
-                ws_text = await self.websearch_producer.produce_summary(
-                    prod.name,
-                    brand=None,   # TODO: expose brand field on ProductData if needed
-                    ean=None,     # TODO: expose ean field on ProductData if needed
-                )
-                if not ws_text:
-                    return []
-                return await self._extract_attrs_from_text(ws_text, prod, sc, Source.WEB_SEARCH)
-            enrichment_branch_tasks.append(_websearch_branch())
 
         # Collect enrichment attrs — branch failures are warned, not raised.
         enrichment_attrs: list[AttributeValue] = []
