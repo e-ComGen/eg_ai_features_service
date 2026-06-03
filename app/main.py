@@ -75,7 +75,8 @@ async def process_batch(payload: BatchPayload):
             return await processor.process_product(
                 prod, sch, payload.client_id,
                 use_cache=payload.use_cache,
-                research_mode=payload.research_mode
+                research_mode=payload.research_mode,
+                options=payload.options,
             )
         except Exception as e:
             print(f"🔥 ERROR Product {prod.id}: {e}")
