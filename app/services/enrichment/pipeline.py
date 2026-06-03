@@ -41,6 +41,45 @@ from app.services.enrichment.finishing import FinishingExtractor
 
 logger = logging.getLogger(__name__)
 
+# Card-protection в финальном _merge: карточные источники (копия из live-карточки
+# того же товара) не должны перетираться инференсом (LLM-знания / web-поиск), если
+# их confidence лишь незначительно ниже. Band = допустимый зазор.
+_CARD_SOURCES = {Source.WB_CARD, Source.OZON_CARD}
+_INFERENCE_SOURCES = {Source.LLM_KNOWLEDGE, Source.WEB_SEARCH}
+_CARD_PROTECTION_BAND = 0.10
+
+
+def _merge_winner(
+    challenger: AttributeValue, incumbent: AttributeValue
+) -> AttributeValue:
+    """Выбирает победителя для одного attribute_id между двумя кандидатами.
+
+    Спец-правило ТОЛЬКО для пары карточка-vs-инференс: карточный источник
+    удерживает атрибут, если card_conf >= other_conf - _CARD_PROTECTION_BAND.
+    Для всех прочих пар — обычное правило: highest-conf, tie-break по SOURCE_PRIORITY.
+    Поведение симметрично (order-independent).
+    """
+    # Card-protection band: только карточка-vs-инференс
+    card, inference = None, None
+    if challenger.source in _CARD_SOURCES and incumbent.source in _INFERENCE_SOURCES:
+        card, inference = challenger, incumbent
+    elif incumbent.source in _CARD_SOURCES and challenger.source in _INFERENCE_SOURCES:
+        card, inference = incumbent, challenger
+    if card is not None:
+        if card.confidence >= inference.confidence - _CARD_PROTECTION_BAND:
+            return card
+        return inference
+
+    # Обычное правило для всех прочих пар (без изменений).
+    if challenger.confidence > incumbent.confidence:
+        return challenger
+    if (
+        challenger.confidence == incumbent.confidence
+        and SOURCE_PRIORITY[challenger.source] > SOURCE_PRIORITY[incumbent.source]
+    ):
+        return challenger
+    return incumbent
+
 
 class PipelineOrchestrator:
     """Sequential cost-aware pipeline.
@@ -821,18 +860,14 @@ class PipelineOrchestrator:
             else:
                 boosted.append(v)
 
-        # Step 3: highest-conf wins per attribute_id (original logic)
+        # Step 3: highest-conf wins per attribute_id, с card-protection band
+        # (_merge_winner). Карточный источник не перетирается инференсом при
+        # незначительном отставании по confidence; прочие пары — без изменений.
         by_id: dict[int, AttributeValue] = {}
         for v in boosted:
             existing = by_id.get(v.attribute_id)
             if existing is None:
                 by_id[v.attribute_id] = v
                 continue
-            if v.confidence > existing.confidence:
-                by_id[v.attribute_id] = v
-            elif (
-                v.confidence == existing.confidence
-                and SOURCE_PRIORITY[v.source] > SOURCE_PRIORITY[existing.source]
-            ):
-                by_id[v.attribute_id] = v
+            by_id[v.attribute_id] = _merge_winner(v, existing)
         return list(by_id.values())
