@@ -98,6 +98,10 @@ class LlmClassifier:
             system_prompt=system_prompt,
             user_text=user_text,
             response_model=_ClassifierResponse,
+            # temperature=0 makes routing deterministic — eliminates the source-lottery
+            # (different source counts between identical runs). Routing is rule selection,
+            # not generation, so greedy decoding is safe and only improves reproducibility.
+            temperature=0.0,
         )
         if parsed is None:
             # Fallback: try description+knowledge for everything

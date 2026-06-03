@@ -46,6 +46,7 @@ class StructuredLlmManager:
         system_prompt: str,
         user_text: str,
         response_model: Type[T],
+        temperature: float = 0.2,
     ) -> Tuple[Optional[T], int]:
         """Send a chat completion and parse the response into *response_model*.
 
@@ -94,7 +95,7 @@ class StructuredLlmManager:
             llm_resp = await self._provider.complete(
                 messages=messages,
                 model=self._model,
-                temperature=0.2,
+                temperature=temperature,
                 max_tokens=6000,
                 response_format={"type": "json_object"},
             )
