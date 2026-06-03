@@ -251,10 +251,17 @@ class PipelineOrchestrator:
         # Stage 1: Classifier — 1 LLM call for routing decisions
         routing = await self._classifier.classify(context, remaining)
 
-        # Stage 2: LlmKnowledgeSource — attrs where first suggested source = LLM_KNOWLEDGE
+        # Stage 2: LlmKnowledgeSource — детерминированный добор на ОСТАТОЧНЫХ таргетах.
+        # Запускаем LK, если LLM_KNOWLEDGE присутствует в routing ВООБЩЕ (не только [0]).
+        # Раньше условие было routing[t.id][0] == LLM_KNOWLEDGE — недетерминированный
+        # классификатор то ставил LK первым, то нет → apparel-поля (Стиль/Назначение/
+        # Особенности/Рисунок) непостоянно доходили до LK между товарами.
+        # Безопасность: knowledge_targets берётся из remaining (незаполненные), и сам
+        # source ещё раз фильтрует already_filled. Карточные значения (WB/Ozon, conf≥0.90)
+        # уже исключены из remaining → LK только ДОБИРАЕТ пустые, не перетирает.
         knowledge_targets = [
             t for t in remaining
-            if routing.get(t.id) and routing[t.id][0] == Source.LLM_KNOWLEDGE
+            if Source.LLM_KNOWLEDGE in routing.get(t.id, [])
             and self._sources[Source.LLM_KNOWLEDGE].is_applicable(context, t)
         ]
         if knowledge_targets:
