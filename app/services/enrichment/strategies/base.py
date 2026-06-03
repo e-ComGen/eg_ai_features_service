@@ -95,6 +95,15 @@ class MarketplaceStrategy(ABC):
         """Привязать словарные value_id(s). Default: no-op (pass-through)."""
         return attribute_value
 
+    async def llm_resolve_tail(
+        self,
+        values: list[AttributeValue],
+        targets: list[TargetAttribute],
+        context: "ExtractionContext",
+    ) -> list[AttributeValue]:
+        """LLM-резолвер хвоста нерезолвнутых value_id. Default: no-op (pass-through)."""
+        return values
+
     def force_websearch_targets(
         self,
         targets: list[TargetAttribute],

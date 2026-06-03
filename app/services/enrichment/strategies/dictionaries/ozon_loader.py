@@ -304,6 +304,25 @@ def resolve_value_id(
     return None
 
 
+def get_attr_value_options(
+    cat_id: int,
+    type_id: int,
+    attribute_id: int,
+) -> list[str]:
+    """Вернуть список строковых allowed-значений (value-строк) для характеристики.
+
+    Используется LLM-резолвером хвоста: ему нужен полный список разрешённых
+    значений из словаря (не truncated target.allowed_values), чтобы выбрать
+    ровно одно. Возвращает [] если характеристика/значения не найдены.
+    """
+    chars = get_ozon_characteristics_for_type(cat_id, type_id)
+    char = next((c for c in chars if c.get("id") == attribute_id), None)
+    if not char:
+        return []
+    values_list = char.get("values") or []
+    return [str(e.get("value", "")) for e in values_list if e.get("value")]
+
+
 def is_truncated(cat_id: int, type_id: int, attribute_id: int) -> bool:
     """Return True if the cached values for this attribute were truncated at 5000.
 

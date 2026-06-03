@@ -4,6 +4,7 @@
 для авторитетной схемы характеристик: normalize_target подмешивает метаданные
 из словаря, validate_value проверяет банлист и (будущее) enum-значения.
 """
+import logging
 from typing import Any, Optional, Type
 from .base import MarketplaceStrategy, ValidationResult
 from app.services.enrichment.base import (
@@ -13,6 +14,7 @@ from app.services.enrichment.strategies.dictionaries.ozon_loader import (
     get_ozon_characteristics_for_type,
     get_ozon_characteristics_for_category,
     get_ozon_category_name,
+    get_attr_value_options,
     resolve_value_id,
     is_truncated,
 )
@@ -23,8 +25,16 @@ from app.services.enrichment.strategies.dictionaries.category_defaults import (
     CATEGORY_DEFAULTS,
     CATEGORY_CONDITIONAL_DEFAULTS,
 )
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 from app.services.enrichment.prompt_router import classify_target
+
+logger = logging.getLogger(__name__)
+
+# Кэш LLM-резолвера хвоста value_id: переживает в рамках процесса.
+# Ключ: (value_lower, hash(tuple(options))). Значение: выбранная allowed-строка
+# ДОСЛОВНО или None (NONE). Один и тот же (value, options) повторяется десятки
+# раз (Fully-Modular ×77) → уникальных пар мало, почти бесплатно.
+_LLM_RESOLVE_CACHE: dict[tuple[str, int], Optional[str]] = {}
 
 
 # Cross-fill rules: пары (id_a, id_b) — одно и то же значение под двумя именами.
@@ -603,3 +613,171 @@ class OzonStrategy(MarketplaceStrategy):
                 attribute_value.value_id = vid
 
         return attribute_value
+
+    async def llm_resolve_tail(
+        self,
+        values: list[AttributeValue],
+        targets: list[TargetAttribute],
+        context: ExtractionContext,
+    ) -> list[AttributeValue]:
+        """LLM-резолвер ХВОСТА нерезолвнутых value_id (семантика/перевод).
+
+        Запускается ПОСЛЕ детерминированного resolve_value_ids (он остаётся первым
+        и не меняется). Закрывает то, что не добил exact→fuzzy→vector→лемма:
+        Fully-Modular→Модульный, EVA→ЭВА, Круглогодичный→На любой сезон.
+
+        Алгоритм (один батч-вызов на товар, НЕ per-value):
+        1. Собираем enum-значения, у которых value_id/value_ids ещё None, вместе
+           с их allowed-списком из словаря (полным, не truncated target.allowed_values).
+        2. Кэш по (value_lower, hash(options)) — повторы бесплатны, второго вызова нет.
+        3. Один LLM-вызов: для каждого (value, allowed) вернуть индекс выбранного
+           allowed ДОСЛОВНО либо -1 (NONE). temperature 0, дешёвая модель.
+        4. Замапить выбранную строку обратно в value_id через resolve_value_id
+           (exact-путь словаря). NONE/ошибка/таймаут → оставляем None как сейчас.
+
+        Только ДОБАВЛЯЕТ резолв — хуже не делает (value-строка уже есть).
+        """
+        cat_id = context.category_id
+        type_id = context.ozon_type_id
+        if type_id is None:
+            return values
+
+        # enum-targets с непустым словарём allowed
+        enum_target_ids = {
+            t.id for t in targets if classify_target(t) == "enum"
+        }
+
+        # Собираем задачи: (av, raw_value, options, list_index_or_None, cache_key)
+        # list_index_or_None: индекс элемента в массиве (is_collection) или None для скаляра.
+        tasks: list[tuple] = []
+        # Уникальные (value, options) для батча — дедуп через кэш + within-batch.
+        to_ask: list[tuple[str, list[str]]] = []
+        seen_keys: set[tuple[str, int]] = set()
+
+        for av in values:
+            if av.attribute_id not in enum_target_ids:
+                continue
+            options = get_attr_value_options(cat_id, type_id, av.attribute_id)
+            if not options:
+                continue
+            opt_hash = hash(tuple(options))
+
+            def _collect(raw_value: str, list_idx: Optional[int]):
+                key = (raw_value.lower(), opt_hash)
+                tasks.append((av, raw_value, options, list_idx, key))
+                if key not in _LLM_RESOLVE_CACHE and key not in seen_keys:
+                    seen_keys.add(key)
+                    to_ask.append((raw_value, options))
+
+            if av.is_collection and isinstance(av.value, list):
+                # резолвим только хвост: элементы без покрытия в value_ids
+                resolved_count = len(av.value_ids or [])
+                if resolved_count >= len([v for v in av.value if v]):
+                    continue
+                for i, v in enumerate(av.value):
+                    if v is None or str(v) == "":
+                        continue
+                    _collect(str(v), i)
+            else:
+                if av.value_id is not None:
+                    continue
+                if av.value is None or str(av.value) == "":
+                    continue
+                _collect(str(av.value), None)
+
+        if not tasks:
+            return values
+
+        # Один батч-LLM-вызов на уникальные (value, options), которых нет в кэше.
+        if to_ask:
+            await self._llm_batch_choose(to_ask)
+
+        # Маппинг результатов обратно в value_id / value_ids.
+        for av, raw_value, options, list_idx, key in tasks:
+            chosen = _LLM_RESOLVE_CACHE.get(key)
+            if not chosen:
+                continue
+            vid = resolve_value_id(cat_id, type_id, av.attribute_id, chosen)
+            if vid is None:
+                continue
+            if list_idx is None:
+                av.value_id = vid
+            else:
+                existing = list(av.value_ids or [])
+                if vid not in existing:
+                    existing.append(vid)
+                av.value_ids = existing
+
+        return values
+
+    async def _llm_batch_choose(
+        self,
+        to_ask: list[tuple[str, list[str]]],
+    ) -> None:
+        """Один батч-LLM-вызов: для каждого (value, allowed) выбрать индекс или -1.
+
+        Записывает результат в _LLM_RESOLVE_CACHE по ключу (value_lower, hash(opts)).
+        Graceful: любая ошибка/таймаут/None → оставляем None в кэше (как [MATCHING FAILED]).
+        """
+        from app.services.providers.factory import get_main_manager
+
+        # Строим компактный нумерованный список заданий для промпта.
+        lines: list[str] = []
+        for i, (value, options) in enumerate(to_ask):
+            opts_block = "; ".join(f"{j}={o}" for j, o in enumerate(options))
+            lines.append(f"#{i} value={value!r} | allowed: {opts_block}")
+        tasks_text = "\n".join(lines)
+
+        class _Choice(BaseModel):
+            task: int = Field(..., description="Номер задания (#N)")
+            index: int = Field(
+                ...,
+                description="Индекс выбранного allowed-значения, или -1 если ни одно не подходит",
+            )
+
+        class _BatchResponse(BaseModel):
+            choices: list[_Choice] = Field(default_factory=list)
+
+        system_prompt = (
+            "Ты сопоставляешь значение характеристики товара со словарём допустимых "
+            "значений маркетплейса. Для КАЖДОГО задания верни индекс РОВНО одного "
+            "значения из его списка allowed, которое по смыслу соответствует value "
+            "(учитывай переводы и синонимы: Fully-Modular=Модульный, EVA=ЭВА, "
+            "Круглогодичный=На любой сезон). Если НИ ОДНО значение не подходит — "
+            "верни index=-1. При любом сомнении возвращай -1: лучше -1, чем неверный "
+            "выбор. Не придумывай значений вне списка allowed."
+        )
+        user_text = (
+            "Задания (для каждого выбери index из его allowed ИЛИ -1):\n"
+            f"{tasks_text}\n\n"
+            "Верни choices: по одному объекту {task, index} на каждое задание."
+        )
+
+        # Предзаполняем кэш None — graceful default, если LLM ничего не вернёт.
+        for value, options in to_ask:
+            _LLM_RESOLVE_CACHE.setdefault((value.lower(), hash(tuple(options))), None)
+
+        try:
+            llm = get_main_manager()
+            parsed, _ = await llm.structured_request(
+                system_prompt=system_prompt,
+                user_text=user_text,
+                response_model=_BatchResponse,
+            )
+        except Exception as e:
+            logger.warning("[Ozon] LLM tail value_id resolver failed: %s", e)
+            return
+
+        if parsed is None:
+            return
+
+        for ch in parsed.choices:
+            if ch.task < 0 or ch.task >= len(to_ask):
+                continue
+            value, options = to_ask[ch.task]
+            key = (value.lower(), hash(tuple(options)))
+            if 0 <= ch.index < len(options):
+                # Записываем ДОСЛОВНУЮ allowed-строку (гард: индекс валиден).
+                _LLM_RESOLVE_CACHE[key] = options[ch.index]
+            else:
+                _LLM_RESOLVE_CACHE[key] = None

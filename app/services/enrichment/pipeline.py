@@ -267,7 +267,7 @@ class PipelineOrchestrator:
         if not remaining:
             all_values += await self._run_finishing(context, targets, all_values)
             all_values += await self._generate_annotation(context, targets, all_values)
-            return self._finalize(all_values, targets, context)
+            return await self._finalize_async(all_values, targets, context)
 
         # Stage 0.45: WbCardSource — копия характеристик с похожего WB-товара
         # через бесплатный basket-API (БЕЗ Scrappey credits). Запускаем ПЕРВЫМ
@@ -283,7 +283,7 @@ class PipelineOrchestrator:
             if not remaining:
                 all_values += await self._run_finishing(context, targets, all_values)
                 all_values += await self._generate_annotation(context, targets, all_values)
-                return self._finalize(all_values, targets, context)
+                return await self._finalize_async(all_values, targets, context)
 
         # Stage 0.5: OzonCardSource — копия характеристик с похожего Ozon-товара.
         # Запускаем ПЕРВЫМ (до IceCat, PDF, LLM) — на eval-аудите парсер достаёт
@@ -302,7 +302,7 @@ class PipelineOrchestrator:
             if not remaining:
                 all_values += await self._run_finishing(context, targets, all_values)
                 all_values += await self._generate_annotation(context, targets, all_values)
-                return self._finalize(all_values, targets, context)
+                return await self._finalize_async(all_values, targets, context)
 
         # Stage 0.55: IceCatSource — brand-verified спеки без LLM (IceCat Open API).
         # Дополняет attrs которые OzonCard не закрыл (brand_line skip, outlier товары).
@@ -320,7 +320,7 @@ class PipelineOrchestrator:
             if not remaining:
                 all_values += await self._run_finishing(context, targets, all_values)
                 all_values += await self._generate_annotation(context, targets, all_values)
-                return self._finalize(all_values, targets, context)
+                return await self._finalize_async(all_values, targets, context)
 
         # Stage 0.6: PdfDatasheetSource — official manufacturer datasheet PDF (Gemini native).
         # Запускается ПОСЛЕ IceCat: дополняет / перекрывает atрибуты не найденные через IceCat.
@@ -335,7 +335,7 @@ class PipelineOrchestrator:
             if not remaining:
                 all_values += await self._run_finishing(context, targets, all_values)
                 all_values += await self._generate_annotation(context, targets, all_values)
-                return self._finalize(all_values, targets, context)
+                return await self._finalize_async(all_values, targets, context)
 
         # Stage 0.7: CompetitorRagSource — дешёвый RAG без LLM (0 API calls)
         # Запускается всегда когда source задан — Qdrant query ~100ms на товар.
@@ -349,7 +349,7 @@ class PipelineOrchestrator:
             if not remaining:
                 all_values += await self._run_finishing(context, targets, all_values)
                 all_values += await self._generate_annotation(context, targets, all_values)
-                return self._finalize(all_values, targets, context)
+                return await self._finalize_async(all_values, targets, context)
 
         # Stage 1: Classifier — 1 LLM call for routing decisions
         routing = await self._classifier.classify(context, remaining)
@@ -378,7 +378,7 @@ class PipelineOrchestrator:
             if not remaining:
                 all_values += await self._run_finishing(context, targets, all_values)
                 all_values += await self._generate_annotation(context, targets, all_values)
-                return self._finalize(all_values, targets, context)
+                return await self._finalize_async(all_values, targets, context)
 
         # Stage 3: VisionSource — attrs with VISION in suggested AND image_urls present
         vision_targets = [
@@ -397,7 +397,7 @@ class PipelineOrchestrator:
             if not remaining:
                 all_values += await self._run_finishing(context, targets, all_values)
                 all_values += await self._generate_annotation(context, targets, all_values)
-                return self._finalize(all_values, targets, context)
+                return await self._finalize_async(all_values, targets, context)
 
         # Stage 4 gate: CostPredictor — check if web search is worth running
         #
@@ -449,7 +449,7 @@ class PipelineOrchestrator:
         if not websearch_targets:
             all_values += await self._run_finishing(context, targets, all_values)
             all_values += await self._generate_annotation(context, targets, all_values)
-            return self._finalize(all_values, targets, context)
+            return await self._finalize_async(all_values, targets, context)
 
         if force_ws:
             logger.debug(
@@ -488,7 +488,9 @@ class PipelineOrchestrator:
         # Runs AFTER all sources and finishing so it can use the full set of filled attrs.
         all_values += await self._generate_annotation(context, targets, all_values)
 
-        return self._finalize(all_values, targets, context)
+        # Stage 6: детерминированный resolve_value_ids (в _finalize) + LLM-резолвер
+        # ХВОСТА — батч-вызов на нерезолвнутые enum-value_id (семантика/перевод).
+        return await self._finalize_async(all_values, targets, context)
 
     async def _generate_annotation(
         self,
@@ -573,6 +575,22 @@ class PipelineOrchestrator:
                 is_collection=False,
             )
         ]
+
+    async def _finalize_async(
+        self,
+        all_values: list[AttributeValue],
+        targets: list[TargetAttribute],
+        context: ExtractionContext,
+    ) -> list[AttributeValue]:
+        """Async финализация: детерминированный _finalize + LLM-резолвер ХВОСТА value_id.
+
+        _finalize остаётся синхронным и неизменным (merge + post-process +
+        детерминированный resolve_value_ids + validation). Затем один батч-LLM-вызов
+        добивает нерезолвнутые enum-value_id (семантика/перевод). Для не-Ozon
+        стратегий llm_resolve_tail — no-op. Используется во ВСЕХ точках выхода enrich.
+        """
+        finalized = self._finalize(all_values, targets, context)
+        return await self._strategy.llm_resolve_tail(finalized, targets, context)
 
     def _finalize(
         self,
