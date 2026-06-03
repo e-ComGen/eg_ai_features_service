@@ -101,6 +101,17 @@ class WebSearchProducer:
             self._serper = None
             self._extractor = None
 
+    # Language-specific query suffixes — anchor Serper towards spec-like pages
+    # in each language. For unknown languages we fall back to English (which
+    # Google's mixed-language ranking handles best).
+    _LANG_QUERY_SUFFIXES = {
+        "ru": "характеристики технические",
+        "en": "specifications datasheet",
+        "de": "technische daten datenblatt",
+        "fr": "caractéristiques techniques fiche",
+        "es": "especificaciones técnicas ficha",
+    }
+
     async def produce_summary(
         self,
         product_name: str,
@@ -108,8 +119,15 @@ class WebSearchProducer:
         ean: Optional[str] = None,
         mpn: Optional[str] = None,
         timeout: int = 60,
+        languages: Optional[list[str]] = None,
     ) -> Optional[str]:
         """Search the web for product info and return a plain-text summary.
+
+        When ``languages`` has more than one entry, runs an independent Serper
+        search per language in parallel and concatenates the resulting summaries.
+        This typically lifts coverage for international brands (e.g. Dyson,
+        Samsung) where the EN manufacturer site holds authoritative specs while
+        the RU retail listings reveal local availability/variants.
 
         Returns:
             A plain-text summary string, or None on failure.
@@ -118,10 +136,39 @@ class WebSearchProducer:
             logger.debug("WebSearchProducer: no product_name provided, skipping.")
             return None
 
-        if self._use_serper:
-            return await self._produce_via_serper(product_name, brand, ean, mpn, timeout)
-        else:
+        if not self._use_serper:
+            # Legacy OpenAI path doesn't support multilang yet — single call.
             return await self._produce_via_openai(product_name, brand, ean, mpn, timeout)
+
+        langs = [(lang or "ru").lower() for lang in (languages or ["ru"])]
+        # Dedup while preserving order
+        langs = list(dict.fromkeys(langs))
+
+        if len(langs) == 1:
+            return await self._produce_via_serper(
+                product_name, brand, ean, mpn, timeout, lang=langs[0]
+            )
+
+        # Multi-lang: run each in parallel, concatenate non-empty.
+        results = await asyncio.gather(*[
+            self._produce_via_serper(product_name, brand, ean, mpn, timeout, lang=lang)
+            for lang in langs
+        ], return_exceptions=True)
+
+        chunks = []
+        for lang, res in zip(langs, results):
+            if isinstance(res, Exception):
+                logger.warning("WebSearchProducer: lang=%s failed: %s", lang, res)
+                continue
+            if res:
+                chunks.append(f"--- {lang.upper()} ---\n{res}")
+
+        if not chunks:
+            return None
+        if len(chunks) == 1:
+            # Strip the "--- LANG ---" header when only one succeeded.
+            return chunks[0].split("\n", 1)[1]
+        return "\n\n".join(chunks)
 
     # ------------------------------------------------------------------
     # Boilerplate guard (generic, no domain hardcode)
@@ -160,7 +207,11 @@ class WebSearchProducer:
         )
         # Each token ~ several "junk" chars; weight them.
         junk_score = markup_chars + markup_tokens * 8
-        if n > 0 and (junk_score / n) > 0.04:
+        # Threshold tuned for modern Shopify/Wix sites that ship some inline JS
+        # alongside real product specs. 0.04 was too strict — flagged genuine
+        # spec pages with embedded analytics widgets. 0.06 keeps obvious
+        # antibot-JS responses out but lets normal mixed pages through.
+        if n > 0 and (junk_score / n) > 0.06:
             return True
 
         # --- 2. Spec-signal density ---
@@ -186,6 +237,7 @@ class WebSearchProducer:
         ean: Optional[str],
         mpn: Optional[str],
         timeout: int,
+        lang: str = "ru",
     ) -> Optional[str]:
         # Build search query — MPN first (highest signal: точный код производителя),
         # then product_name + brand + ean (любые secondary identifiers).
@@ -197,7 +249,8 @@ class WebSearchProducer:
             parts.append(brand)
         if ean:
             parts.append(ean)
-        query = " ".join(parts) + " характеристики технические"
+        suffix = self._LANG_QUERY_SUFFIXES.get(lang, self._LANG_QUERY_SUFFIXES["en"])
+        query = " ".join(parts) + " " + suffix
 
         try:
             results = await asyncio.wait_for(

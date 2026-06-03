@@ -304,10 +304,15 @@ class JobProcessor:
         web_search_url_count = 0
         if opts.enable_web_search and self.websearch_producer:
             try:
+                # Pass through the product's declared languages so the search
+                # provider runs one Serper query per language and concatenates
+                # results — typically the biggest accuracy lift for international
+                # brands (EN datasheet + RU retail). Fallback: ['ru'].
                 ws_text = await self.websearch_producer.produce_summary(
                     product.name,
-                    brand=None,   # TODO: expose brand field on ProductData if needed
-                    ean=None,     # TODO: expose ean field on ProductData if needed
+                    brand=getattr(product, "brand", None),
+                    ean=getattr(product, "ean", None),
+                    languages=getattr(product, "languages", None) or ["ru"],
                 )
                 if ws_text:
                     description = f"{description}\n\n=== Web search ===\n{ws_text}"
