@@ -548,6 +548,44 @@ def _extract_model_tokens(s: str) -> set:
     return {t.lower() for t in tokens if len(t) >= 3}
 
 
+# Чисто-алфавитный токен (латиница ИЛИ кириллица), без цифр, длиной ≥ 4.
+# Словесные модели не имеют цифр: Resolve, Ultraboost, Sauvage, Triclimate.
+_ALPHA_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яёЁ]{4,}")
+
+
+def _extract_alpha_model_tokens(s: str) -> set:
+    """Извлечь АЛФАВИТНЫЕ модель-токены (словесные модели без цифр) из строки.
+
+    Дополняет _extract_model_tokens (тот ловит только токены с цифрой). Здесь —
+    содержательные словесные модели: «Resolve», «Ultraboost», «Sauvage»,
+    «Triclimate». Цель — дать бонус при совпадении такого слова между запросом
+    и заголовком карточки, когда у модели нет цифрового артикула.
+
+    Консервативная фильтрация (переиспользует существующие стоп-листы), чтобы
+    НЕ ловить бренд/тип товара/служебные слова:
+      - длина ≥ 4 символа (короткие шумные слова отсекаются);
+      - не ведущий стоп-слово/гендер/предлог (_LEADING_STOPWORDS);
+      - не классификатор-имя характеристики (_CHAR_NAME_STOPWORDS);
+      - не спек/единица (_is_spec_or_unit_token — на всякий случай).
+
+    Бренд НЕ отсеиваем явным списком (его тут нет), но это безопасно: бонус
+    применяется только к ПЕРЕСЕЧЕНИЮ токенов запроса и заголовка, и он меньше
+    цифрового (см. _MODEL_BONUS_ALPHA < _MODEL_BONUS), поэтому надёжный
+    цифровой артикул всегда перевешивает.
+    """
+    out: set = set()
+    for tok in _ALPHA_TOKEN_RE.findall(s):
+        low = tok.lower()
+        if low in _LEADING_STOPWORDS:
+            continue
+        if low in _CHAR_NAME_STOPWORDS:
+            continue
+        if _is_spec_or_unit_token(low):
+            continue
+        out.add(low)
+    return out
+
+
 def _normalize_model(product_name: str, brand: Optional[str]) -> str:
     """Убирает generic-префиксы и бренд, lowercase, для cache key."""
     result = product_name.strip()
@@ -1364,7 +1402,9 @@ class OzonCardSource(AttributeSource):
             return (tiles[0], 100.0) if tiles else (None, 0.0)
 
         _MODEL_BONUS = 5.0
+        _MODEL_BONUS_ALPHA = 3.0  # словесная модель — слабее цифрового артикула
         q_models = _extract_model_tokens(query)
+        q_alpha = _extract_alpha_model_tokens(query)
         best_tile: Optional[dict] = None
         best_score = 0.0
         q = _normalize_for_fuzzy(query)
@@ -1378,6 +1418,11 @@ class OzonCardSource(AttributeSource):
             # Бонус: есть хотя бы один общий артикул-токен → точное совпадение модели
             if q_models and q_models & _extract_model_tokens(title):
                 score += _MODEL_BONUS
+            # Алфавитный (словесный) модель-бонус: меньше цифрового, отдельно от
+            # q_models — чтобы НЕ отключить type-mismatch штраф ниже (он гейтится
+            # по отсутствию ЦИФРОВЫХ артикулов, q_models, а не словесных моделей).
+            elif q_alpha and q_alpha & _extract_alpha_model_tokens(title):
+                score += _MODEL_BONUS_ALPHA
             # Штраф за тип товара: только для товаров без артикула (одежда)
             # и когда тип (category_leaf) отсутствует в заголовке тайла.
             # Пример: query «Куртка The North Face» + tile «Шорты The North Face» →

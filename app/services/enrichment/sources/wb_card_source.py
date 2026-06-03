@@ -62,6 +62,7 @@ from app.services.enrichment.prompt_router import filter_already_filled_targets
 from app.services.enrichment.sources.ozon_card_source import (
     _compress_search_query,
     _extract_model_tokens,
+    _extract_alpha_model_tokens,
     _is_spec_or_unit_token,
     _normalize_model,
     _LEADING_STOPWORDS,
@@ -967,8 +968,10 @@ class WbCardSource(AttributeSource):
             return (tiles[0], 100.0) if tiles else (None, 0.0)
 
         _MODEL_BONUS = 5.0
+        _MODEL_BONUS_ALPHA = 3.0  # словесная модель — слабее цифрового артикула
         _TYPE_MISMATCH_PENALTY = 30.0
         q_models = _extract_model_tokens(query)
+        q_alpha = _extract_alpha_model_tokens(query)
         best_tile: Optional[dict] = None
         best_score = 0.0
         q = query.lower()
@@ -981,6 +984,11 @@ class WbCardSource(AttributeSource):
             score = (fuzz.partial_ratio(q, t) + fuzz.token_sort_ratio(q, t)) / 2.0
             if q_models and q_models & _extract_model_tokens(title):
                 score += _MODEL_BONUS
+            # Алфавитный (словесный) модель-бонус: для словесных моделей без цифр
+            # (Resolve, Ultraboost). Меньше цифрового, отдельно от q_models —
+            # чтобы НЕ отключить type-mismatch штраф (он гейтится по q_models).
+            elif q_alpha and q_alpha & _extract_alpha_model_tokens(title):
+                score += _MODEL_BONUS_ALPHA
             if cat_leaf_low and not q_models and cat_leaf_low not in t:
                 score -= _TYPE_MISMATCH_PENALTY
             if score > best_score:
