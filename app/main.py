@@ -14,6 +14,7 @@ from .services.job_processor import JobProcessor
 from .services.ai_pipeline import AiFeaturePipeline
 from .services.matcher import MatcherService
 from .services.enrichment import VisionProducer, WebSearchProducer
+from .services.enrichment.sources.icecat_source import IceCatSource
 from .services.providers.factory import get_main_manager, get_vision_provider, get_web_search_client
 from .config import OPENAI_API_KEY, WEB_SEARCH_MODEL, WEB_SEARCH_MAX_CONCURRENT, PROVIDER_MAIN
 from .services.excel.wb_excel import WbExcelReader, WbExcelWriter
@@ -50,6 +51,12 @@ pipeline = AiFeaturePipeline(
 vision_producer = VisionProducer()        # auto-detects PROVIDER_VISION from config
 websearch_producer = WebSearchProducer()  # auto-detects PROVIDER_WEB_SEARCH from config
 
+# IceCat brand-verified source: free Open tier covers ~200 major brands
+# (ASUS, Lenovo, Samsung, Sony, Bosch, Philips, Apple, HP, MSI, Dell, ...).
+# Niche brands return 403 → graceful skip, no exception. Construction never
+# fails; missing ICECAT_EMAIL/TOKEN just means every request returns [].
+icecat_source = IceCatSource()
+
 matcher = MatcherService(None)
 processor = JobProcessor(
     pipeline,
@@ -58,6 +65,7 @@ processor = JobProcessor(
     global_semaphore,
     vision_producer=vision_producer,
     websearch_producer=websearch_producer,
+    icecat_source=icecat_source,
 )
 
 

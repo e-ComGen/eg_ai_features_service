@@ -8,6 +8,8 @@ from .db_cache import DatabaseCacheManager
 from .matcher import MatcherService
 from .url_fetcher import fetch_all
 from .enrichment import VisionProducer, WebSearchProducer, AttributeMerger, AttributeValue, Source
+from .enrichment.base import ExtractionContext, TargetAttribute
+from .enrichment.sources.icecat_source import IceCatSource
 from ..models import ProductData, FeatureOption, ResearchMode, BatchOptions
 from ..database import AsyncSessionLocal
 from ..config import VAGUE_FEATURE_PATTERNS
@@ -77,6 +79,7 @@ class JobProcessor:
         global_semaphore: asyncio.Semaphore,
         vision_producer: Optional[VisionProducer] = None,
         websearch_producer: Optional[WebSearchProducer] = None,
+        icecat_source: Optional["IceCatSource"] = None,
     ):
         self.pipeline = pipeline
         self.db_cache = db_cache
@@ -84,6 +87,7 @@ class JobProcessor:
         self.semaphore = global_semaphore
         self.vision_producer = vision_producer
         self.websearch_producer = websearch_producer
+        self.icecat_source = icecat_source
         self.merger = AttributeMerger()
         # New pipeline adapter — only instantiated when the feature flag is on
         # and the import succeeded, to avoid import-time cost when unused.
@@ -294,20 +298,66 @@ class JobProcessor:
         if fetched_content:
             description = f"{description}\n\n=== Sourced from URLs ===\n{fetched_content}"
 
-        # --- Web-search inject (text augmentation, NOT a separate branch) ---
-        # The old _websearch_branch tried to extract attributes via the new-pipeline
-        # AttributeValue schema (int attribute_id) which mismatches the legacy
-        # feature-name keys, so it silently returned []. Now we just append the
-        # search summary to the description so the per-feature extractor reads
-        # both original text and web context through the same prompt. No
-        # multi-source merger needed — regression-free on text-heavy fixtures.
-        web_search_url_count = 0
-        if opts.enable_web_search and self.websearch_producer:
+        # --- Parallel enrichment inject: IceCat + web_search → description ---
+        # Both are text-augmentation steps (NOT separate AttributeValue branches —
+        # see the broken bridge story above). They run in parallel via
+        # asyncio.gather, so total wall-clock = max(icecat, web_search), not sum.
+        #
+        # Ordering inside the final description: IceCat comes FIRST because
+        # brand-verified manufacturer specs are the highest-quality signal —
+        # the per-feature extractor below will see them ahead of fuzzier web
+        # snippets. Web search comes second as fallback / cross-check.
+        async def _icecat_text() -> Optional[str]:
+            if not self.icecat_source:
+                return None
+            # IceCat needs a brand. Cheapest non-LLM detection: first whitespace
+            # token of the product name (works for ~95% of titles that start
+            # with the brand: "Dyson V15 Detect", "Samsung Galaxy S24", ...).
+            # When the heuristic misses (e.g. "Apple iPhone 15 Pro" — first token
+            # IS "Apple", correct), IceCat returns [] cleanly.
+            brand_token = (product.name or "").split()[:1]
+            if not brand_token:
+                return None
             try:
-                # Pass through the product's declared languages so the search
-                # provider runs one Serper query per language and concatenates
-                # results — typically the biggest accuracy lift for international
-                # brands (EN datasheet + RU retail). Fallback: ['ru'].
+                ctx = ExtractionContext(
+                    product_id=product.id,
+                    product_name=product.name,
+                    product_description=product.description or "",
+                    category_id=product.category_id,
+                    brand=brand_token[0],
+                )
+                # Build minimal TargetAttributes from schema (positional ids).
+                # Names matter for IceCat's name→target fuzzy mapping; ids are
+                # just for downstream tracking.
+                targets = [
+                    TargetAttribute(id=idx, name=fname, type="text")
+                    for idx, fname in enumerate(schema.keys())
+                ]
+                avs = await self.icecat_source.extract(ctx, targets)
+                if not avs:
+                    return None
+                # Format mapped (target_name, value) pairs as plain text.
+                name_by_id = {t.id: t.name for t in targets}
+                lines = [
+                    f"{name_by_id[av.attribute_id]}: {av.value}"
+                    for av in avs
+                    if av.attribute_id in name_by_id
+                ]
+                if not lines:
+                    return None
+                logger.info(
+                    "icecat inject for product_id=%s: %d features matched (brand=%s)",
+                    product.id, len(lines), brand_token[0],
+                )
+                return "\n".join(lines)
+            except Exception as exc:
+                logger.warning("icecat extract failed (non-fatal): %s", exc)
+                return None
+
+        async def _websearch_text() -> Optional[str]:
+            if not (opts.enable_web_search and self.websearch_producer):
+                return None
+            try:
                 ws_text = await self.websearch_producer.produce_summary(
                     product.name,
                     brand=getattr(product, "brand", None),
@@ -315,14 +365,22 @@ class JobProcessor:
                     languages=getattr(product, "languages", None) or ["ru"],
                 )
                 if ws_text:
-                    description = f"{description}\n\n=== Web search ===\n{ws_text}"
-                    web_search_url_count = ws_text.count("https://")
                     logger.info(
                         "web_search inject for product_id=%s: +%d chars (~%d sources)",
-                        product.id, len(ws_text), web_search_url_count,
+                        product.id, len(ws_text), ws_text.count("https://"),
                     )
+                return ws_text
             except Exception as exc:
                 logger.warning("web_search produce_summary failed (non-fatal): %s", exc)
+                return None
+
+        icecat_chunk, web_chunk = await asyncio.gather(
+            _icecat_text(), _websearch_text(),
+        )
+        if icecat_chunk:
+            description = f"{description}\n\n=== IceCat brand-verified ===\n{icecat_chunk}"
+        if web_chunk:
+            description = f"{description}\n\n=== Web search ===\n{web_chunk}"
 
         info = f"Title: {product.name}\nDescription: {description[:50000]}"
         context_hash = f"{product.name} {product.description}"
