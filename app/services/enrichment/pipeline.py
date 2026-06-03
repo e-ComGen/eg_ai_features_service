@@ -103,16 +103,56 @@ def _norm_elements(value) -> list[str]:
     return [s] if s else []
 
 
+def _collection_card_protected(
+    a: AttributeValue, b: AttributeValue
+) -> Optional[AttributeValue]:
+    """Card-protection для коллекций (аналог _merge_winner band, но для union).
+
+    Если на attribute_id один кандидат — КАРТОЧНЫЙ источник (WB_CARD/OZON_CARD),
+    а другой — ИНФЕРЕНС (web_search/llm_knowledge) с confidence НИЖЕ карточной более
+    чем на _CARD_PROTECTION_BAND, то инференс-мусор НЕ подмешиваем в union: возвращаем
+    карточный кандидат как есть.
+
+    Возвращает:
+      - карточный AttributeValue, если инференс отсекается по band;
+      - None, если защита неприменима (нет карточно-vs-инференс пары, либо инференс
+        в пределах band) → обычный union выполняется выше по стеку.
+
+    Сохраняет пользу union: card+card, card+уверенный-инференс (в пределах band),
+    чистый инференс (карточки нет) — None → нормальный union.
+    """
+    card, inference = None, None
+    if a.source in _CARD_SOURCES and b.source in _INFERENCE_SOURCES:
+        card, inference = a, b
+    elif b.source in _CARD_SOURCES and a.source in _INFERENCE_SOURCES:
+        card, inference = b, a
+    if card is None:
+        return None
+    # Инференс отсекается ТОЛЬКО если его conf заметно ниже карточной.
+    if card.confidence >= inference.confidence + _CARD_PROTECTION_BAND:
+        return card
+    return None
+
+
 def _merge_collection(
     a: AttributeValue, b: AttributeValue
 ) -> AttributeValue:
     """Объединяет два коллекционных кандидата на один attribute_id.
+
+    Card-protection: если один источник карточный (WB/Ozon), а другой —
+    низко-confidence инференс (web_search/llm_knowledge, conf ниже карточной более
+    чем на band), инференс НЕ подмешивается (защита от enum-галлюцинаций вроде
+    Материал=Бязь от web_search поверх карточного значения). Иначе — обычный UNION.
 
     UNION дедуплицированных (регистронезависимо) элементов обоих источников.
     Порядок: первое вхождение сохраняется. value_ids объединяются параллельно
     значениям (best-effort: если оба источника несут ids — мерджим, иначе сбрасываем,
     чтобы их корректно дорезолвил resolve_value_ids в _finalize). confidence = max.
     """
+    protected = _collection_card_protected(a, b)
+    if protected is not None:
+        return protected
+
     base = a if a.confidence >= b.confidence else b
 
     merged_values: list = []

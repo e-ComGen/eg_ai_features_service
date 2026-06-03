@@ -65,14 +65,33 @@ def test_default_strategy_returns_base_model():
 # 2. OzonStrategy rejects out-of-dict value (case-sensitive)
 # ---------------------------------------------------------------------------
 
-def test_ozon_rejects_wrong_case():
-    """'Чёрный' must fail when allowed list contains 'черный' (exact case match)."""
+def test_ozon_drops_genuine_nonmember_value():
+    """Значение, реально НЕ принадлежащее списку, ОТБРАСЫВАЕТСЯ (skip), не форсится.
+
+    Анти-галлюцинационный гард: «зелёный» против [черный, белый] имеет низкую
+    fuzzy-схожесть → item целиком убирается из extracted (не маппится в ближайший).
+    """
     strategy = OzonStrategy()
     targets = [_target_enum(10096, ["черный", "белый"])]
     model = strategy.build_response_model(_Response, targets)
 
-    with pytest.raises(Exception):  # pydantic ValidationError
-        _parse(model, 10096, "Чёрный")
+    obj = _parse(model, 10096, "зелёный")
+    # item отброшен (не форсится в черный/белый)
+    assert obj.extracted == []
+
+
+def test_ozon_normalizes_fuzzy_member_case_and_yo():
+    """'Чёрный' (регистр+ё) — подлинный член списка → нормализуется к 'черный'.
+
+    Раньше отвергался как case-mismatch; теперь fuzzy-гард распознаёт подлинного
+    члена и приводит к канонической форме словаря.
+    """
+    strategy = OzonStrategy()
+    targets = [_target_enum(10096, ["черный", "белый"])]
+    model = strategy.build_response_model(_Response, targets)
+
+    obj = _parse(model, 10096, "Чёрный")
+    assert obj.extracted[0].value == "черный"
 
 
 # ---------------------------------------------------------------------------
@@ -102,16 +121,31 @@ def test_ozon_accepts_valid_collection():
 
 
 # ---------------------------------------------------------------------------
-# 5. OzonStrategy rejects collection with at least one invalid element
+# 5. OzonStrategy drops invalid collection element (keeps valid ones)
 # ---------------------------------------------------------------------------
 
-def test_ozon_rejects_collection_with_bad_element():
+def test_ozon_drops_bad_collection_element_keeps_valid():
+    """Невалидный элемент коллекции ОТБРАСЫВАЕТСЯ, валидные сохраняются.
+
+    «оранжевый» не из списка → skip элемента; «черный» остаётся. Это анти-
+    галлюцинационный гард: мусорный элемент не форсится в ближайший enum.
+    """
     strategy = OzonStrategy()
     targets = [_target_enum(10096, ["черный", "белый"])]
     model = strategy.build_response_model(_Response, targets)
 
-    with pytest.raises(Exception):
-        _parse(model, 10096, ["черный", "Красный"])
+    obj = _parse(model, 10096, ["черный", "оранжевый"])
+    assert obj.extracted[0].value == ["черный"]
+
+
+def test_ozon_drops_collection_item_when_all_elements_bad():
+    """Если ВСЕ элементы коллекции невалидны — item убирается целиком."""
+    strategy = OzonStrategy()
+    targets = [_target_enum(10096, ["черный", "белый"])]
+    model = strategy.build_response_model(_Response, targets)
+
+    obj = _parse(model, 10096, ["оранжевый", "фиолетовый"])
+    assert obj.extracted == []
 
 
 # ---------------------------------------------------------------------------
@@ -154,9 +188,12 @@ def test_ozon_constraint_scoped_to_attr_id():
     obj = model(extracted=[{"attribute_id": 888, "value": "free text here"}])
     assert obj.extracted[0].value == "free text here"
 
-    # enum attr (10096) still enforced even when mixed with text attr
-    with pytest.raises(Exception):
-        model(extracted=[
-            {"attribute_id": 888, "value": "ok"},
-            {"attribute_id": 10096, "value": "Неверный"},
-        ])
+    # enum attr (10096) still guarded even when mixed with text attr:
+    # невалидное enum-значение отбрасывается, text-атрибут сохраняется.
+    obj = model(extracted=[
+        {"attribute_id": 888, "value": "ok"},
+        {"attribute_id": 10096, "value": "оранжевый"},
+    ])
+    kept_ids = {a.attribute_id for a in obj.extracted}
+    assert 888 in kept_ids       # text сохранён
+    assert 10096 not in kept_ids  # невалидный enum отброшен

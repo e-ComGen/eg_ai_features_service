@@ -148,6 +148,63 @@ def _derive_card_group_value(
     return result or product_name.strip()
 
 
+# Порог fuzzy-схожести для анти-галлюцинационного гарда enum-маппинга.
+# Та же логика, что в resolve_value_id (rapidfuzz WRatio ≥ 85): значение реально
+# принадлежит списку только если лучший кандидат набирает >= порога. Ниже —
+# значение НЕ из списка (напр. «хлопок» против [Акрил, Бязь]) → skip, не форс.
+_ENUM_GUARD_FUZZY_THRESHOLD = 85
+
+
+def _map_enum_value(
+    raw_value: Any,
+    canon_map: dict[str, str],
+    allowed_list: list[str],
+) -> Optional[str]:
+    """Сопоставить извлечённое значение с каноническим allowed-значением.
+
+    Возвращает каноническую строку из словаря ИЛИ None, если значение реально
+    НЕ принадлежит списку (анти-галлюцинационный гард — не форсим ближайший enum).
+
+    Стратегии (по убыванию строгости), та же логика что в resolve_value_id:
+      1. Exact case-insensitive (через canon_map).
+      2. Rapidfuzz WRatio на НОРМАЛИЗОВАННЫХ токенах (ё→е, латиница→кириллица,
+         tech-aliases — как _normalize_token словаря). Принимаем лучший кандидат
+         ТОЛЬКО при score >= порога.
+           «Чёрный» vs «черный»            → norm-match 100 → маппится;
+           «хлопковый» vs «Хлопок»          → высокий score → маппится;
+           «хлопок» vs [Акрил, Бязь, ...]   → низкий score  → None (skip).
+    """
+    from app.services.enrichment.strategies.dictionaries.ozon_loader import _normalize_token
+
+    if raw_value is None:
+        return None
+    key = str(raw_value).strip().lower()
+    if not key:
+        return None
+    # Strategy 1: exact case-insensitive
+    if key in canon_map:
+        return canon_map[key]
+    # Strategy 2: fuzzy на нормализованных токенах — только подлинного члена списка
+    try:
+        from rapidfuzz import fuzz, process
+        norm_key = _normalize_token(key)
+        # норм-индекс {normalized_allowed: canonical_allowed}
+        norm_options = [(_normalize_token(a), a) for a in allowed_list]
+        # exact-match после нормализации (ё→е и т.п.) — высшая уверенность
+        for n, canon in norm_options:
+            if n and n == norm_key:
+                return canon
+        best = process.extractOne(
+            norm_key, [n for n, _ in norm_options], scorer=fuzz.WRatio
+        )
+        if best and best[1] >= _ENUM_GUARD_FUZZY_THRESHOLD:
+            return norm_options[best[2]][1]
+    except Exception as exc:
+        logger.warning("enum-guard rapidfuzz failed: %s", exc)
+    # Ниже порога → значение не из списка, не форсим ближайший → skip
+    return None
+
+
 def _build_char_index(characteristics: list[dict]) -> dict[int, dict]:
     """Построить индекс {char_id: char_dict} из списка характеристик."""
     return {c["id"]: c for c in characteristics if "id" in c}
@@ -189,9 +246,14 @@ class OzonStrategy(MarketplaceStrategy):
     ) -> Type[BaseModel]:
         """Строим constrained response model с model_validator для enum-targets.
 
-        Для каждого enum-target с непустым allowed_values добавляем проверку:
-        если извлечённый value не входит в allowed list (case-sensitive) — ValueError,
-        structured_adapter повторит запрос.
+        Для каждого enum-target с непустым allowed_values нормализуем извлечённое
+        значение к канонической форме словаря. Анти-галлюцинационный гард: значение,
+        которое реально НЕ принадлежит списку (низкая fuzzy-схожесть с лучшим
+        кандидатом — напр. «хлопок» против [Акрил, Бязь, Полиэстер]) — НЕ форсится
+        в ближайший enum, а ОТБРАСЫВАЕТСЯ (skip элемента / всего item). Это убирает
+        retry-driven и token-level (strict) форс мусорного ближайшего значения.
+        Гард общий для ВСЕХ источников (web_search/llm_knowledge/vision/description),
+        т.к. они все строят модель через этот метод.
         """
         # Собираем словарь {attribute_id: frozenset(allowed_values)} для enum-targets
         enum_constraints: dict[int, frozenset[str]] = {
@@ -210,47 +272,61 @@ class OzonStrategy(MarketplaceStrategy):
             attr_id: {v.strip().lower(): v for v in allowed}
             for attr_id, allowed in _constraints.items()
         }
+        # Список allowed-строк на attr_id для fuzzy-гарда (порядок не важен).
+        _allowed_list: dict[int, list[str]] = {
+            attr_id: list(allowed) for attr_id, allowed in _constraints.items()
+        }
 
         class _ConstrainedModel(base_model):  # type: ignore[valid-type]
             @model_validator(mode="after")
             def _enforce_allowed_values(self):
                 # Извлекаем список _ExtractedAttr из поля (поддерживаем разные имена полей)
-                items = (
-                    getattr(self, "extracted", None)
-                    or getattr(self, "known_attributes", None)
-                    or []
+                field_name = (
+                    "extracted" if getattr(self, "extracted", None) is not None
+                    else "known_attributes" if getattr(self, "known_attributes", None) is not None
+                    else None
                 )
+                if field_name is None:
+                    return self
+                items = getattr(self, field_name) or []
+
+                kept_items = []
                 for item in items:
                     attr_id = getattr(item, "attribute_id", None)
                     if attr_id not in _constraints:
+                        kept_items.append(item)
                         continue
                     canon_map = _canonical_index[attr_id]
+                    allowed_list = _allowed_list[attr_id]
                     raw_value = getattr(item, "value", None)
                     # Проверяем скаляр или список (is_collection)
                     if isinstance(raw_value, list):
                         normalized: list[str] = []
-                        bad: list[str] = []
                         for v in raw_value:
-                            key = str(v).strip().lower()
-                            if key in canon_map:
-                                normalized.append(canon_map[key])
-                            else:
-                                bad.append(str(v))
-                        if bad:
-                            raise ValueError(
-                                f"attr_id={attr_id}: values {bad} not in allowed list"
-                            )
-                        # Нормализуем к каноническим значениям из словаря
+                            canon = _map_enum_value(v, canon_map, allowed_list)
+                            if canon is not None:
+                                normalized.append(canon)
+                            # else: значение не принадлежит списку — skip элемента
+                            #       (не форсим ближайший enum = анти-галлюцинация)
+                        if not normalized:
+                            # все элементы отброшены → item целиком убираем
+                            continue
                         item.value = normalized
+                        kept_items.append(item)
                     else:
-                        if raw_value is not None:
-                            key = str(raw_value).strip().lower()
-                            if key not in canon_map:
-                                raise ValueError(
-                                    f"attr_id={attr_id}: value {raw_value!r} not in allowed list"
-                                )
-                            # Нормализуем к канонической форме из словаря
-                            item.value = canon_map[key]
+                        if raw_value is None:
+                            kept_items.append(item)
+                            continue
+                        canon = _map_enum_value(raw_value, canon_map, allowed_list)
+                        if canon is None:
+                            # скаляр не принадлежит списку → отбрасываем весь item
+                            # (не форсим ближайший enum = анти-галлюцинация)
+                            continue
+                        item.value = canon
+                        kept_items.append(item)
+
+                if len(kept_items) != len(items):
+                    setattr(self, field_name, kept_items)
                 return self
 
         _ConstrainedModel.__name__ = f"Constrained_{base_model.__name__}"
