@@ -44,6 +44,24 @@ High-precision name-based signals (_PLATFORM_NAME_RE):
                           and already guarded by is_required → False)
   уеи                 — «Количество товара в УЕИ» (unit-of-item logistics)
   нескольких упаковк  — «Планирую доставлять товар в нескольких упаковках»
+
+High-precision name-based signals — fashion service/seller/photo fields
+(_PLATFORM_NAME_RE, added for honest optional-denominator on apparel; each
+phrase cannot appear in a real extractable spec characteristic):
+  название файла       — «Название файла PDF» (document attachment name)
+  pdf                  — «Файл PDF / PDF-инструкция» (document attachment)
+  документ             — «Документ к товару» (uploaded document field)
+  код/артикул продавца — SELLER-internal code/SKU («Код продавца»,
+                          «Артикул продавца»), NOT the extractable
+                          «Артикул»/model code of the product itself
+  рост модели          — model height (per-photo-shoot, not a product spec)
+  параметры модели     — model's body parameters on the photo
+  размер на модели     — which size the photo model wears
+  модель на фото       — «Модель на фото» (per-shoot reference)
+  18+ / признак 18     — adult-content flag (18+ age restriction)
+  тип ростовки/ростовк — seller size-run type (per-SKU, not fillable)
+  размер производителя — manufacturer's own size grid value (per-SKU on tag)
+  размер на бирке      — size printed on the product tag (per-SKU)
 """
 from __future__ import annotations
 import re
@@ -70,6 +88,23 @@ _PLATFORM_NAME_RE = re.compile(
     r"|объединить в похожие"
     r"|\bуеи\b"
     r"|нескольких упаковк"
+    # --- fashion service / seller / photo fields (honest optional denom) ---
+    r"|название файла"
+    r"|\bpdf\b"
+    r"|\bдокумент"               # «Документ …» (uploaded doc field)
+    r"|код продавца"
+    r"|артикул продавца"
+    r"|рост модели"
+    r"|параметры модели"
+    r"|размер на модели"
+    r"|модел\w*\s+на фото"       # «Модель на фото»
+    r"|на фото\s+модел"          # «… на фото модель»
+    r"|18\+"
+    r"|признак\s+18"
+    r"|тип ростовки"
+    r"|ростовк"                  # «Ростовка», «тип ростовки»
+    r"|размер производителя"
+    r"|размер на бирке"
     r")",
     re.IGNORECASE,
 )
