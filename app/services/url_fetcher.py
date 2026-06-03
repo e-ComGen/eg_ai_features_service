@@ -61,6 +61,39 @@ _RETRY_BACKOFF = [1.0, 2.0, 4.0]      # seconds between retries
 _TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 # Errors that indicate a hard block / missing page — do NOT retry
 _HARD_FAIL_STATUSES = {403, 404}
+# Statuses that mean "domain banned us" (WAF / anti-bot) — eligible for the
+# paid Scrappey browser-bypass fallback. 404 is excluded (genuinely missing),
+# 5xx is excluded (transient, handled by retry).
+_BAN_STATUSES = {401, 403}
+
+# ---------------------------------------------------------------------------
+# Scrappey paid fallback (browser-bypass on banned domains)
+# ---------------------------------------------------------------------------
+# OFF by default so production cost does not change unless explicitly enabled.
+
+
+def _scrappey_fallback_enabled() -> bool:
+    return os.environ.get("URL_FETCHER_SCRAPPEY_FALLBACK", "0") == "1"
+
+
+def _scrappey_domains() -> set:
+    """Configurable set of domains for which the paid fallback may fire."""
+    raw = os.environ.get(
+        "URL_FETCHER_SCRAPPEY_DOMAINS",
+        "dns-shop.ru,ozon.ru,wildberries.ru,citilink.ru",
+    )
+    return {d.strip().lower() for d in raw.split(",") if d.strip()}
+
+
+def _domain_is_banned(url: str) -> bool:
+    """True if the URL's host matches (or is a subdomain of) a configured domain."""
+    host = url.lower()
+    # strip scheme + path → host
+    host = re.sub(r"^https?://", "", host).split("/", 1)[0].split(":", 1)[0]
+    for dom in _scrappey_domains():
+        if host == dom or host.endswith("." + dom):
+            return True
+    return False
 
 # ---------------------------------------------------------------------------
 # Disk cache
@@ -146,6 +179,11 @@ async def _get_with_retry(
             ) as client:
                 resp = await client.get(url)
 
+            if resp.status_code in _BAN_STATUSES:
+                fb = await _try_scrappey_fallback(url, resp.status_code, timeout)
+                if fb is not None:
+                    return fb
+
             if resp.status_code in _HARD_FAIL_STATUSES:
                 logger.warning(
                     "fetch hard-fail HTTP %s for %r — not retrying",
@@ -188,6 +226,44 @@ async def _get_with_retry(
 
     logger.warning("fetch gave up after %d attempts for %r: %s", _RETRY_ATTEMPTS, url, last_exc)
     return None
+
+
+async def _try_scrappey_fallback(
+    url: str, status_code: int, timeout: int
+) -> Optional[httpx.Response]:
+    """Retry a banned (401/403) page through the paid Scrappey browser-bypass.
+
+    Returns a synthetic httpx.Response wrapping the bypassed HTML, or None when
+    the fallback is disabled, the domain is not in the configured set, or
+    Scrappey itself fails. Guarded by the URL_FETCHER_SCRAPPEY_FALLBACK flag so
+    production cost is unchanged unless explicitly enabled.
+    """
+    if not _scrappey_fallback_enabled():
+        return None
+    if not _domain_is_banned(url):
+        return None
+
+    logger.info(
+        "fetch HTTP %s for %r on banned domain — trying Scrappey fallback",
+        status_code, url,
+    )
+    try:
+        from app.services.providers.scrappey_client import scrappey_fetch
+        html = await scrappey_fetch(url, timeout=max(timeout, 120))
+    except Exception as exc:
+        logger.warning("Scrappey fallback error for %r: %s", url, exc)
+        return None
+
+    if not html:
+        logger.info("Scrappey fallback returned nothing for %r", url)
+        return None
+
+    logger.info("Scrappey fallback succeeded for %r (%d chars)", url, len(html))
+    return httpx.Response(
+        status_code=200,
+        text=html,
+        request=httpx.Request("GET", url),
+    )
 
 
 def _retry_wait(resp: httpx.Response, attempt: int) -> float:
