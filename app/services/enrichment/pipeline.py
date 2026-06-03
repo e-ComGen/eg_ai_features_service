@@ -32,6 +32,10 @@ from app.services.enrichment.sources import (
     UgcSource,
     TnvedSource,
 )
+from app.services.enrichment.sources.ozon_card_source import (
+    _extract_gender_signal,
+    _is_gender_target_name,
+)
 from app.services.enrichment.intelligence import LlmClassifier, CostPredictor
 from app.services.providers.factory import get_main_manager
 from app.services.enrichment.confidence_aware_judge import ConfidenceAwareJudgeWrapper
@@ -47,6 +51,108 @@ logger = logging.getLogger(__name__)
 _CARD_SOURCES = {Source.WB_CARD, Source.OZON_CARD}
 _INFERENCE_SOURCES = {Source.LLM_KNOWLEDGE, Source.WEB_SEARCH}
 _CARD_PROTECTION_BAND = 0.10
+
+# Гендер-гард на merge-слое (генеральный, для ВСЕХ источников — не только карточных).
+# «External guess» источники: они НЕ видят конкретный товар, а домысливают пол по
+# названию/категории/похожим листингам. Гендерное значение «Пол» от ТОЛЬКО таких
+# источников при нейтральном имени товара («Кроссовки Ultraboost 22») — спекуляция,
+# и его надо отбросить. Товар-специфичные источники (ozon_card/wb_card/vision/
+# description) видят реальную карточку/фото/текст этого товара — их пол доверяем.
+_GENDER_EXTERNAL_SOURCES = {
+    Source.WEB_SEARCH,
+    Source.LLM_KNOWLEDGE,
+    Source.COMPETITOR_RAG,
+}
+
+
+def _apply_gender_guard(
+    all_values: list[AttributeValue],
+    targets: list[TargetAttribute],
+    context: ExtractionContext,
+) -> list[AttributeValue]:
+    """Генеральный гендер-гард на merge-слое для поля «Пол» (gender-target).
+
+    Применяется к кандидатам ВСЕХ источников ДО merge (а не только к карточным,
+    как card-level страховки). Каждый AttributeValue несёт один .source, поэтому
+    «поддерживающие источники» для значения — это множество source'ов всех
+    кандидатов на тот же attribute_id, несущих этот же (нормализованный) элемент.
+
+    Правила (только для gender-target атрибутов, детект по имени таргета):
+      1. Берём гендер ИМЕНИ товара (_extract_gender_signal по product_name).
+      2. ЯВНЫЙ гендер имени (male/female): дропаем элемент, чей пол КОНФЛИКТУЕТ
+         с именем (male vs female). unisex/нейтрал — не конфликт, не трогаем.
+      3. НЕЙТРАЛЬНОЕ имя (None): дропаем гендерный элемент, если ВСЕ источники,
+         его подтверждающие, — external-guess (_GENDER_EXTERNAL_SOURCES). Если
+         хоть один товар-специфичный источник несёт его — оставляем.
+      4. Если после дропа значение опустело — кандидат выбрасывается целиком
+         (поле остаётся незаполненным, дефолт НЕ навязываем).
+
+    Не-gender targets и кандидаты на них проходят сквозь без изменений.
+    """
+    # attribute_id → True если это gender-target (по имени таргета).
+    gender_attr_ids: set[int] = set()
+    for t in targets:
+        if _is_gender_target_name(t.name):
+            gender_attr_ids.add(t.id)
+    if not gender_attr_ids:
+        return all_values
+
+    name_gender = _extract_gender_signal(context.product_name or "")
+
+    # Для правила 3: какие источники подтверждают каждый (attribute_id, элемент).
+    support: dict[tuple[int, str], set] = {}
+    for v in all_values:
+        if v.attribute_id not in gender_attr_ids:
+            continue
+        for el in _norm_elements(v.value):
+            support.setdefault((v.attribute_id, el), set()).add(v.source)
+
+    def _drop_element(attr_id: int, norm_el: str) -> bool:
+        """True если этот элемент-значение «Пол» надо выбросить."""
+        el_gender = _extract_gender_signal(norm_el)
+        if el_gender is None or el_gender == "unisex":
+            return False  # нейтральное/унисекс значение — не спекуляция, не трогаем
+        # Правило 2: явный пол имени, конфликт male vs female.
+        if name_gender is not None and name_gender != "unisex":
+            return el_gender != name_gender
+        # Правило 3: нейтральное имя — дропаем только если все источники external.
+        srcs = support.get((attr_id, norm_el), set())
+        return bool(srcs) and srcs.issubset(_GENDER_EXTERNAL_SOURCES)
+
+    out: list[AttributeValue] = []
+    for v in all_values:
+        if v.attribute_id not in gender_attr_ids:
+            out.append(v)
+            continue
+        if isinstance(v.value, list):
+            kept_idx = [
+                i for i, el in enumerate(v.value)
+                if not _drop_element(v.attribute_id, str(el).strip().lower())
+            ]
+            if not kept_idx:
+                logger.info(
+                    "[Pipeline] gender-guard: дроп кандидата '%s' (source=%s, "
+                    "имя-пол=%s) — все элементы отсеяны",
+                    v.value, v.source.value, name_gender,
+                )
+                continue  # поле опустело → кандидат выбрасывается
+            if len(kept_idx) != len(v.value):
+                new_value = [v.value[i] for i in kept_idx]
+                new_ids = None
+                if isinstance(v.value_ids, list) and len(v.value_ids) == len(v.value):
+                    new_ids = [v.value_ids[i] for i in kept_idx]
+                out.append(v.model_copy(update={"value": new_value, "value_ids": new_ids}))
+            else:
+                out.append(v)
+        else:
+            if _drop_element(v.attribute_id, str(v.value).strip().lower()):
+                logger.info(
+                    "[Pipeline] gender-guard: дроп '%s'='%s' (source=%s, имя-пол=%s)",
+                    v.attribute_id, v.value, v.source.value, name_gender,
+                )
+                continue
+            out.append(v)
+    return out
 
 
 def _merge_winner(
@@ -639,6 +745,10 @@ class PipelineOrchestrator:
         context: ExtractionContext,
     ) -> list[AttributeValue]:
         """Merge + strategy post-process + strategy validation. Used at every early-exit point."""
+        # Гендер-гард ДО merge: генеральный, для всех источников (web_search/llm/
+        # vision/cards). Отсекает гендерные «Пол»-значения, конфликтующие с именем
+        # или навеянные только external-guess источниками при нейтральном имени.
+        all_values = _apply_gender_guard(all_values, targets, context)
         merged = self._merge(all_values)
 
         # Strategy post-processing FIRST (добавляет CategoryDefaults + cross-fills с source=DESCRIPTION).
