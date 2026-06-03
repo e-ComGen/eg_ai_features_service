@@ -41,7 +41,7 @@ import re
 import ssl
 import uuid
 from collections import OrderedDict
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import httpx
 
@@ -107,6 +107,30 @@ _TYPE_MISMATCH_PENALTY = 30.0
 # exact conf=0.93 — точный match того же товара, не переписываем.
 _CONF_EXACT = 0.93
 _CONF_BRAND_LINE = 0.85
+
+_MULTIVALUE_SPLIT_RE = re.compile(r"[;,]")
+
+
+def _split_multivalue(raw: str) -> list[str]:
+    """Сплит карточной multi-value строки в дедуплицированный список.
+
+    Разделители ";" и ",". Чистит пробелы, регистронезависимый дедуп. WB/Ozon
+    отдают коллекционные характеристики одной строкой (", ".join(...)) — сплит
+    нужен чтобы значение участвовало в union merge поэлементно.
+    """
+    parts = _MULTIVALUE_SPLIT_RE.split(raw)
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        low = p.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(p)
+    return out or [raw.strip()]
 
 # Serper-snippet fallback confidence.
 # Срабатывает ТОЛЬКО когда Scrappey-путь вернул 0 характеристик (Scrappey мёртв
@@ -1586,17 +1610,25 @@ class OzonCardSource(AttributeSource):
 
             used_ids.add(target_id)
 
-            # value_id через ozon_loader
+            # Коллекционные характеристики Ozon отдаёт одной строкой (", ".join).
+            # Сплитим в список, чтобы значение участвовало в union merge поэлементно
+            # и не проигрывало vision/llm целиком. value_id(s) дорезолвит
+            # resolve_value_ids в _finalize (он умеет per-element для списков).
             value_id: Optional[int] = None
-            if cat_id and type_id:
-                try:
-                    value_id = resolve_value_id(cat_id, type_id, target.id, char_val)
-                except Exception as exc:
-                    logger.debug("[OzonCard] resolve_value_id failed: %s", exc)
+            value_out: Union[str, list[str]]
+            if target.is_collection:
+                value_out = _split_multivalue(char_val)
+            else:
+                value_out = char_val
+                if cat_id and type_id:
+                    try:
+                        value_id = resolve_value_id(cat_id, type_id, target.id, char_val)
+                    except Exception as exc:
+                        logger.debug("[OzonCard] resolve_value_id failed: %s", exc)
 
             results.append(AttributeValue(
                 attribute_id=target.id,
-                value=char_val,
+                value=value_out,
                 confidence=conf,
                 source=Source.OZON_CARD,
                 evidence=evidence_short,

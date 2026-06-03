@@ -45,7 +45,7 @@ import asyncio
 import logging
 import re
 from collections import OrderedDict
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import httpx
 
@@ -260,6 +260,31 @@ _BRAND_LINE_BLACKLIST: frozenset[str] = frozenset(name.lower() for name in {
     "ID товара",
     "ID карточки",
 })
+
+
+_MULTIVALUE_SPLIT_RE = re.compile(r"[;,]")
+
+
+def _split_multivalue(raw: str) -> list[str]:
+    """Сплит карточной multi-value строки в дедуплицированный список.
+
+    Разделители ";" и ",". Чистит пробелы, регистронезависимый дедуп
+    (сохраняя первое вхождение). Если разделителей нет — возвращает [raw]
+    (один элемент), чтобы is_collection-атрибут всё равно был списком.
+    """
+    parts = _MULTIVALUE_SPLIT_RE.split(raw)
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        low = p.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        out.append(p)
+    return out or [raw.strip()]
 
 
 def _basket_nn_from_table(nm_id: int) -> str:
@@ -1097,22 +1122,47 @@ class WbCardSource(AttributeSource):
                 continue
             used_ids.add(target_id)
 
-            value_id: Optional[int] = None
-            if cat_id and type_id:
-                try:
-                    value_id = resolve_value_id(cat_id, type_id, target.id, char_val)
-                except Exception as exc:
-                    logger.debug("[WbCard] resolve_value_id failed: %s", exc)
+            # Коллекционные характеристики WB отдаёт одной строкой с разделителями
+            # (";" или ","). Сплитим в список, чтобы значение участвовало в union
+            # merge поэлементно и не проигрывало vision/llm целиком.
+            if target.is_collection:
+                parts = _split_multivalue(char_val)
+            else:
+                parts = None
+
+            if parts is not None:
+                value_out: Union[str, list[str]] = parts
+                value_id = None
+                value_ids: Optional[list[int]] = None
+                if cat_id and type_id:
+                    try:
+                        resolved = [
+                            resolve_value_id(cat_id, type_id, target.id, p) for p in parts
+                        ]
+                        if any(r is not None for r in resolved):
+                            value_ids = resolved
+                    except Exception as exc:
+                        logger.debug("[WbCard] resolve_value_id (list) failed: %s", exc)
+            else:
+                value_out = char_val
+                value_ids = None
+                value_id = None
+                if cat_id and type_id:
+                    try:
+                        value_id = resolve_value_id(cat_id, type_id, target.id, char_val)
+                    except Exception as exc:
+                        logger.debug("[WbCard] resolve_value_id failed: %s", exc)
 
             results.append(AttributeValue(
                 attribute_id=target.id,
-                value=char_val,
+                value=value_out,
                 confidence=conf,
                 source=Source.WB_CARD,
                 evidence=evidence_short,
                 semantic_type=target.semantic_type,
                 is_collection=target.is_collection,
                 value_id=value_id,
+                value_ids=value_ids,
             ))
 
         logger.info(

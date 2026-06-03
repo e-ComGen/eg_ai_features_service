@@ -81,6 +81,70 @@ def _merge_winner(
     return incumbent
 
 
+def _is_collection_value(v: AttributeValue) -> bool:
+    """True если значение надо мерджить как коллекцию (union), а не winner-takes-all."""
+    return bool(v.is_collection) or isinstance(v.value, list)
+
+
+def _norm_elements(value) -> list[str]:
+    """Нормализованные (strip+lower) элементы значения.
+
+    Скаляр → один элемент; список → поэлементно. Используется для consensus-подсчёта
+    и поэлементного дедупа коллекций (вместо str(list) по всей строке).
+    """
+    if isinstance(value, list):
+        out: list[str] = []
+        for el in value:
+            s = str(el).strip().lower()
+            if s:
+                out.append(s)
+        return out
+    s = str(value).strip().lower()
+    return [s] if s else []
+
+
+def _merge_collection(
+    a: AttributeValue, b: AttributeValue
+) -> AttributeValue:
+    """Объединяет два коллекционных кандидата на один attribute_id.
+
+    UNION дедуплицированных (регистронезависимо) элементов обоих источников.
+    Порядок: первое вхождение сохраняется. value_ids объединяются параллельно
+    значениям (best-effort: если оба источника несут ids — мерджим, иначе сбрасываем,
+    чтобы их корректно дорезолвил resolve_value_ids в _finalize). confidence = max.
+    """
+    base = a if a.confidence >= b.confidence else b
+
+    merged_values: list = []
+    merged_ids: list = []
+    seen: set[str] = set()
+    have_ids = True  # ids валидны только если ОБА источника дали ids на все элементы
+
+    for src in (a, b):
+        vals = src.value if isinstance(src.value, list) else [src.value]
+        ids = src.value_ids if isinstance(src.value_ids, list) else None
+        if ids is None or len(ids) != len(vals):
+            have_ids = False
+        for i, el in enumerate(vals):
+            norm = str(el).strip().lower()
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            merged_values.append(el)
+            merged_ids.append(ids[i] if (ids is not None and i < len(ids)) else None)
+
+    if not have_ids or any(x is None for x in merged_ids):
+        merged_ids = None  # дорезолвит resolve_value_ids в _finalize
+
+    return base.model_copy(update={
+        "value": merged_values,
+        "value_ids": merged_ids,
+        "value_id": None,
+        "is_collection": True,
+        "confidence": max(a.confidence, b.confidence),
+    })
+
+
 class PipelineOrchestrator:
     """Sequential cost-aware pipeline.
 
@@ -841,33 +905,43 @@ class PipelineOrchestrator:
         +0.10 (cap 0.97). Cross-source agreement = сильный сигнал
         достоверности (LLM сказал, web search подтвердил, etc).
         """
-        # Step 1: count unique sources per (attribute_id, normalized_value)
+        # Step 1: count unique sources per (attribute_id, normalized element).
+        # Для коллекций ключуем ПОЭЛЕМЕНТНО (а не по str(list)), чтобы consensus
+        # и дедуп работали по отдельным элементам, а не по строке всего списка.
         sources_per_value: dict[tuple[int, str], set] = {}
         for v in all_values:
-            norm_value = str(v.value).strip().lower()
-            key = (v.attribute_id, norm_value)
-            sources_per_value.setdefault(key, set()).add(v.source)
+            for norm_value in _norm_elements(v.value):
+                key = (v.attribute_id, norm_value)
+                sources_per_value.setdefault(key, set()).add(v.source)
 
-        # Step 2: apply consensus bonus
+        # Step 2: apply consensus bonus. Для скаляра — по значению; для коллекции
+        # — если ХОТЯ БЫ один элемент подтверждён ≥2 источниками.
         boosted: list[AttributeValue] = []
         for v in all_values:
-            norm_value = str(v.value).strip().lower()
-            key = (v.attribute_id, norm_value)
-            n_sources = len(sources_per_value[key])
+            n_sources = max(
+                (len(sources_per_value[(v.attribute_id, ev)]) for ev in _norm_elements(v.value)),
+                default=0,
+            )
             if n_sources >= 2 and v.confidence < 0.97:
                 new_conf = min(0.97, v.confidence + 0.10)
                 boosted.append(v.model_copy(update={"confidence": new_conf}))
             else:
                 boosted.append(v)
 
-        # Step 3: highest-conf wins per attribute_id, с card-protection band
-        # (_merge_winner). Карточный источник не перетирается инференсом при
-        # незначительном отставании по confidence; прочие пары — без изменений.
+        # Step 3: per attribute_id.
+        #  - Коллекционные (is_collection или value-список): UNION дедуплицированных
+        #    элементов всех судьёй-прошедших/уверенных источников (multi-value
+        #    значения теряться не должны — Особенности/Декор и т.п.).
+        #  - Скалярные: highest-conf wins с card-protection band (_merge_winner),
+        #    поведение БЕЗ изменений.
         by_id: dict[int, AttributeValue] = {}
         for v in boosted:
             existing = by_id.get(v.attribute_id)
             if existing is None:
                 by_id[v.attribute_id] = v
                 continue
-            by_id[v.attribute_id] = _merge_winner(v, existing)
+            if _is_collection_value(v) or _is_collection_value(existing):
+                by_id[v.attribute_id] = _merge_collection(existing, v)
+            else:
+                by_id[v.attribute_id] = _merge_winner(v, existing)
         return list(by_id.values())
