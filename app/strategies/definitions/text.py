@@ -1,5 +1,5 @@
 from typing import Optional, List, Type, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from .root import RootStrategy
 from ...judge.judge_profile import JudgeProfile, JudgeResult
 
@@ -22,6 +22,30 @@ class MultiLangWorkerResult(BaseModel):
     )
     confidence: str
 
+    @field_validator("extracted_values", mode="before")
+    @classmethod
+    def _coerce_translation_items(cls, v: Any) -> Any:
+        # DeepSeek (and occasionally other providers) drop the language tag and
+        # return either a bare list of strings or dicts with alternate keys
+        # (`lang`/`value` instead of `language`/`text`). Normalize both shapes
+        # so we don't lose the extracted value to a Pydantic ValidationError.
+        if not isinstance(v, list):
+            return v
+        normalized = []
+        for item in v:
+            if isinstance(item, str):
+                # Heuristic: Cyrillic glyphs → ru, otherwise en. Single-lang
+                # fallback when the model collapses target_languages to one.
+                lang = "ru" if any("Ѐ" <= ch <= "ӿ" for ch in item) else "en"
+                normalized.append({"language": lang, "text": item})
+            elif isinstance(item, dict):
+                lang = item.get("language") or item.get("lang") or "en"
+                text = item.get("text") or item.get("value") or ""
+                normalized.append({"language": lang, "text": text})
+            else:
+                normalized.append(item)
+        return normalized
+
 
 class OptionWorkerResult(BaseModel):
     analysis: str = Field(
@@ -33,6 +57,15 @@ class OptionWorkerResult(BaseModel):
         description="STEP 2: The EXACT matched string from the allowed English dictionary."
     )
     confidence: str
+
+    @field_validator("extracted_value", mode="before")
+    @classmethod
+    def _coerce_scalar(cls, v: Any) -> Any:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return str(v)
+        return v
 
 
 # --- ПЕРЕГРУЖЕННЫЙ КЛАСС TEXT_BRANCH ---

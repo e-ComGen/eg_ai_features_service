@@ -1,6 +1,6 @@
 from typing import Any, Optional, Type
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .numeric import NumericBranch
 from ...judge.judge_profile import JudgeProfile
@@ -20,6 +20,18 @@ class DimensionalWorkerResult(BaseModel):
         description="STEP 3: Return ONLY the exact number requested by the TARGET FEATURE based on STEP 2."
     )
     confidence: str
+
+    @field_validator("extracted_value", mode="before")
+    @classmethod
+    def _coerce_scalar(cls, v: Any) -> Any:
+        # Same coercion as WorkerResult — dimensional extractions arrive as
+        # raw numbers (60, 2.0, etc.) from providers that ignore the string
+        # type hint.
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return str(v)
+        return v
 
 class LinearLogicMixin:
 

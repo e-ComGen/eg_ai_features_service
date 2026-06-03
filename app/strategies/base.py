@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import List, Type, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
 
 from app.judge.judge_profile import JudgeProfile, JudgeResult
@@ -18,6 +18,19 @@ class WorkerResult(BaseModel):
     )
 
     confidence: str
+
+    @field_validator("extracted_value", mode="before")
+    @classmethod
+    def _coerce_scalar(cls, v: Any) -> Any:
+        # DeepSeek and similar providers commonly return numeric extractions
+        # as raw int/float (e.g. 60, 2.0) instead of the string the schema
+        # asks for. Coerce so a clean numeric answer doesn't get thrown out
+        # by Pydantic's strict string check.
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return str(v)
+        return v
 
 class DeductionResult(BaseModel):
     context_clues: str = Field(
