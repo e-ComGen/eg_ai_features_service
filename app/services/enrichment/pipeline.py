@@ -347,6 +347,74 @@ def _is_collection_value(v: AttributeValue) -> bool:
     return bool(v.is_collection) or isinstance(v.value, list)
 
 
+def _drop_unresolved_optional_enums(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+) -> list[AttributeValue]:
+    """Дроп OPTIONAL enum-значений, не резолвнувшихся в словарный value_id.
+
+    Генеральный conservative finalize-cleanup. Запускается ПОСЛЕ полной резолюции
+    value_id (детерминированный resolve_value_ids + llm_resolve_tail). LLM иногда
+    кладёт в специфичный enum-таргет generic-«Да» или значение чужого атрибута
+    (Монитор «Покрытие экрана»=«1,07 миллиардов цветов», «Крепление VESA»=«Да»).
+    Matcher честно отказывает (value_id=None), но RAW-текст остаётся как «filled» →
+    fake-fill, который Ozon отклонит на загрузке (enum-поле требует value_id).
+    Лучше пусто чем враньё: дропаем такие значения, поднимая качество value_id.
+
+    СТРОГИЙ scope (чтобы не навредить):
+    - ТОЛЬКО таргеты С allowed_values (enum). Free-text — без value_id by design,
+      их НИКОГДА не трогаем.
+    - ТОЛЬКО OPTIONAL (is_required == False). Required-enum вне scope.
+    - Дроп ТОЛЬКО когда value_id None/пуст ПОСЛЕ всей резолюции.
+    - is_collection: дропаем только нерезолвнутые элементы, резолвнутые оставляем.
+      Если ВСЕ элементы нерезолвнуты → дроп всего поля.
+    """
+    targets_by_id = {t.id: t for t in targets}
+    out: list[AttributeValue] = []
+    for v in merged:
+        target = targets_by_id.get(v.attribute_id)
+        # Вне scope → пропускаем как есть: нет таргета, не enum, или required.
+        if target is None or not target.allowed_values or target.is_required:
+            out.append(v)
+            continue
+
+        if _is_collection_value(v) and isinstance(v.value, list):
+            ids = v.value_ids if isinstance(v.value_ids, list) else []
+            n_resolved = len(ids)
+            if n_resolved == 0:
+                logger.info(
+                    "[Pipeline] drop-unresolved-enum: дроп optional enum-коллекции "
+                    "attr=%s value=%r — все элементы без value_id",
+                    v.attribute_id, v.value,
+                )
+                continue  # все элементы нерезолвнуты → дроп поля
+            if n_resolved < len(v.value):
+                # Резолвер (ozon resolve_value_ids) компактит value_ids до списка
+                # ТОЛЬКО резолвнутых id (resolved = [i for i in ids if i is not None]),
+                # сохраняя порядок — но НЕ удаляет нерезолвнутые элементы из value.
+                # Оставляем первые n_resolved элементов value (резолвнутый префикс),
+                # дропаем хвост нерезолвнутых. value_ids уже компактный → как есть.
+                new_value = v.value[:n_resolved]
+                logger.info(
+                    "[Pipeline] drop-unresolved-enum: частичный дроп optional "
+                    "enum-коллекции attr=%s оставлено %d/%d",
+                    v.attribute_id, n_resolved, len(v.value),
+                )
+                out.append(v.model_copy(update={"value": new_value}))
+            else:
+                out.append(v)
+        else:
+            if v.value_id is None:
+                logger.info(
+                    "[Pipeline] drop-unresolved-enum: дроп optional enum attr=%s "
+                    "value=%r — нет словарного value_id после резолюции",
+                    v.attribute_id, v.value,
+                )
+                continue
+            out.append(v)
+    return out
+
+
 def _norm_elements(value) -> list[str]:
     """Нормализованные (strip+lower) элементы значения.
 
@@ -891,7 +959,11 @@ class PipelineOrchestrator:
         стратегий llm_resolve_tail — no-op. Используется во ВСЕХ точках выхода enrich.
         """
         finalized = self._finalize(all_values, targets, context)
-        return await self._strategy.llm_resolve_tail(finalized, targets, context)
+        resolved = await self._strategy.llm_resolve_tail(finalized, targets, context)
+        # ПОСЛЕ полной резолюции value_id (детерминированный + LLM-хвост): дроп
+        # OPTIONAL enum-значений, оставшихся без словарного value_id (fake-fill,
+        # который Ozon отклонит). Required-enum и free-text не трогаем. См. docstring.
+        return _drop_unresolved_optional_enums(resolved, targets)
 
     def _finalize(
         self,
