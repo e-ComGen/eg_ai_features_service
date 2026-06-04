@@ -470,6 +470,7 @@ async def test_pipeline_with_icecat_source():
     strategy.post_process_values = MagicMock(side_effect=lambda vals, t, c: vals)
     strategy.validate_value = MagicMock(return_value=MagicMock(is_valid=True, normalized_value=None))
     strategy.build_response_model = MagicMock(side_effect=lambda m, t: m)
+    strategy.llm_resolve_tail = AsyncMock(side_effect=lambda vals, t, c: vals)
 
     with patch("app.services.enrichment.pipeline.FinishingExtractor") as MockFinishing:
         mock_finisher = MagicMock()

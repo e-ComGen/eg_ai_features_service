@@ -71,16 +71,19 @@ def _mock_source_factory(source_type: Source, extract_return=None):
 # ---------------------------------------------------------------------------
 
 def test_filter_already_filled_targets_removes_high_conf():
-    """Атрибуты с confidence ≥ 0.85 убираются из targets."""
+    """Атрибуты с confidence ≥ per-source threshold (is_confident) убираются из targets.
+
+    Порог теперь per-source (DESCRIPTION = 0.95), а не глобальный 0.85.
+    """
     targets = [_target(1, "Бренд"), _target(2, "Мощность, Вт"), _target(3, "Цвет")]
     already_filled = [
-        _av(1, Source.DESCRIPTION, confidence=0.90),  # выше порога — убираем
-        _av(2, Source.DESCRIPTION, confidence=0.84),  # ниже порога — оставляем
+        _av(1, Source.DESCRIPTION, confidence=0.96),  # ≥ 0.95 → is_confident → убираем
+        _av(2, Source.DESCRIPTION, confidence=0.94),  # < 0.95 → оставляем
     ]
     result = filter_already_filled_targets(targets, already_filled)
     ids = [t.id for t in result]
-    assert 1 not in ids, "attr_id=1 (conf=0.90) должен быть убран"
-    assert 2 in ids, "attr_id=2 (conf=0.84) должен остаться"
+    assert 1 not in ids, "attr_id=1 (conf=0.96 ≥ 0.95) должен быть убран"
+    assert 2 in ids, "attr_id=2 (conf=0.94 < 0.95) должен остаться"
     assert 3 in ids, "attr_id=3 (не в already_filled) должен остаться"
 
 
@@ -181,11 +184,14 @@ async def test_pipeline_second_source_receives_first_source_avs():
     )
     await orch.enrich(_ctx(), targets)
 
-    # know_src.extract должен был быть вызван с already_filled содержащим desc_av
-    know_src.extract.assert_called_once()
-    call_kwargs = know_src.extract.call_args.kwargs
-    already_filled_passed = call_kwargs.get("already_filled") or []
-    filled_ids = [av.attribute_id for av in already_filled_passed]
+    # know_src.extract должен был быть вызван хотя бы раз с already_filled содержащим
+    # desc_av. (Источник может вызываться дважды: основная стадия + finishing-проход,
+    # который зовёт extract напрямую без already_filled — нас интересует основная стадия.)
+    assert know_src.extract.called, "KnowledgeSource.extract должен быть вызван"
+    filled_ids: list[int] = []
+    for call in know_src.extract.call_args_list:
+        for av in (call.kwargs.get("already_filled") or []):
+            filled_ids.append(av.attribute_id)
     assert 1 in filled_ids, "attr_id=1 от DescriptionSource должен быть в already_filled для KnowledgeSource"
 
 

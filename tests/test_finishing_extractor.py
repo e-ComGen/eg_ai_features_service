@@ -75,9 +75,14 @@ async def test_skipped_when_all_required_filled():
 
 
 @pytest.mark.asyncio
-async def test_skipped_when_no_required_targets():
-    """Finishing pass ignores optional (is_required=False) missing targets entirely."""
-    source = _mock_source([])
+async def test_runs_on_optional_missing_targets():
+    """Finishing pass also attempts optional (is_required=False) missing targets.
+
+    By design (see finishing.py docstring) required attrs get priority under the
+    per-pass limit, but optional missing targets are still re-extracted.
+    """
+    recovered = _make_value(attr_id=1)
+    source = _mock_source([recovered])
     extractor = FinishingExtractor(sources=[source])
 
     targets = [_make_target(id=1, is_required=False)]
@@ -85,13 +90,17 @@ async def test_skipped_when_no_required_targets():
 
     result = await extractor.extract_missing(_make_ctx(), targets, already_filled)
 
-    assert result == []
-    source.extract.assert_not_called()
+    assert len(result) == 1
+    assert result[0].attribute_id == 1
+    source.extract.assert_called_once()
+    called_targets = source.extract.call_args[0][1]
+    assert [t.id for t in called_targets] == [1]
 
 
 @pytest.mark.asyncio
-async def test_runs_only_on_missing_required_not_optional():
-    """When both required and optional attributes are missing, only required ones are passed to sources."""
+async def test_runs_on_both_required_and_optional_required_first():
+    """When both required and optional attributes are missing, both are passed to sources,
+    with required ordered first (priority under the per-pass limit)."""
     recovered = _make_value(attr_id=10)
     source = _mock_source([recovered])
     extractor = FinishingExtractor(sources=[source])
@@ -105,10 +114,9 @@ async def test_runs_only_on_missing_required_not_optional():
 
     assert len(result) == 1
     assert result[0].attribute_id == 10
-    # Source was called with only the required target
+    # Source was called with both targets, required first
     called_targets = source.extract.call_args[0][1]
-    assert len(called_targets) == 1
-    assert called_targets[0].id == 10
+    assert [t.id for t in called_targets] == [10, 20]
 
 
 @pytest.mark.asyncio

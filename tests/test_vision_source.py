@@ -87,12 +87,17 @@ def test_is_applicable_no_images():
     assert source.is_applicable(ctx, target) is False
 
 
-def test_is_applicable_non_visual_semantic_type():
-    """Returns False when target semantic_type is not in VISUAL_SEMANTIC_TYPES (e.g. weight)."""
+def test_is_applicable_non_numeric_semantic_type_is_hint_not_whitelist():
+    """semantic_type — это hint, а не whitelist: любой non-numeric attr применим при наличии фото.
+
+    Раньше VISUAL_SEMANTIC_TYPES работал как whitelist; теперь is_applicable пробует
+    все non-numeric таргеты (semantic_type только подсказка), поэтому enum-таргет с
+    semantic_type='weight' остаётся применимым.
+    """
     source, _, _ = _make_vision_source()
     ctx = _make_context(image_urls=["https://example.com/img.jpg"])
-    target = _make_target(semantic_type="weight")
-    assert source.is_applicable(ctx, target) is False
+    target = _make_target(semantic_type="weight")  # type='enum' (non-numeric)
+    assert source.is_applicable(ctx, target) is True
 
 
 # ---------------------------------------------------------------------------

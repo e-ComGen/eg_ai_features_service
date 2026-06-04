@@ -79,9 +79,15 @@ class _VisionExtractionResponse(BaseModel):
     @classmethod
     def _drop_null_values(cls, data):
         if isinstance(data, dict) and isinstance(data.get("extracted"), list):
+            def _value_of(e):
+                if isinstance(e, dict):
+                    return e.get("value")
+                # Also accept already-constructed _VisionExtractedAttr instances
+                return getattr(e, "value", None)
+
             data["extracted"] = [
                 e for e in data["extracted"]
-                if isinstance(e, dict) and e.get("value") is not None
+                if _value_of(e) is not None
             ]
         return data
 

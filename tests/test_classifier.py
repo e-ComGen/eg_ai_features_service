@@ -143,7 +143,7 @@ async def test_classify_increments_llm_calls():
 
 
 def test_classifier_decision_model_validates_min_max_sources():
-    """ClassifierDecision validates min_length=1 and max_length=3 on suggested_sources."""
+    """ClassifierDecision allows 0 sources (give-up signal) and caps at max_length=3."""
     # Valid: 1 source
     d = ClassifierDecision(
         attribute_id=1,
@@ -160,13 +160,14 @@ def test_classifier_decision_model_validates_min_max_sources():
     )
     assert len(d3.suggested_sources) == 3
 
-    # Invalid: 0 sources (min_length=1 violated)
-    with pytest.raises(Exception):
-        ClassifierDecision(
-            attribute_id=3,
-            suggested_sources=[],
-            reasoning="nothing",
-        )
+    # Valid: 0 sources — намеренный give-up сигнал (min_length=0).
+    # Downstream auto-fallback (classifier.py) подменяет пустой список на LLM_KNOWLEDGE.
+    d0 = ClassifierDecision(
+        attribute_id=3,
+        suggested_sources=[],
+        reasoning="nothing",
+    )
+    assert d0.suggested_sources == []
 
     # Invalid: 4 sources (max_length=3 violated)
     with pytest.raises(Exception):

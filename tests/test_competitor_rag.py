@@ -268,6 +268,7 @@ async def test_pipeline_with_competitor_rag():
     strategy.post_process_values = MagicMock(side_effect=lambda vals, t, c: vals)
     strategy.validate_value = MagicMock(return_value=MagicMock(is_valid=True, normalized_value=None))
     strategy.build_response_model = MagicMock(side_effect=lambda m, t: m)
+    strategy.llm_resolve_tail = AsyncMock(side_effect=lambda vals, t, c: vals)
 
     # Мокаем FinishingExtractor
     with patch("app.services.enrichment.pipeline.FinishingExtractor") as MockFinishing:
@@ -399,12 +400,14 @@ async def test_llm_filter_returns_all_10_candidates():
 
 
 # ---------------------------------------------------------------------------
-# Test 11 (NEW): Consensus с 1 релевантным кандидатом → пустой список (нужен ≥2)
+# Test 11 (NEW): Consensus с 1 релевантным категорийно-точным кандидатом → emit AV
+# (поведение изменено намеренно: _MIN_FILTERED_CANDIDATES снижен с 2 → 1,
+#  т.к. category filter в retrieval режет шум — см. competitor_rag_source.py)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_single_relevant_candidate_returns_empty():
-    """Если после LLM-фильтра остался только 1 кандидат → пустой список (нет consensus)."""
+async def test_single_relevant_candidate_emits_av():
+    """Если после LLM-фильтра остался 1 категорийно-точный кандидат → emit AV (min=1)."""
     neighbors = _fake_neighbors([
         {"Мощность": ["650W"]},   # 0 — единственный релевантный
         {"Тип": ["Цепь"]},         # 1 — нерелевантный
@@ -419,7 +422,11 @@ async def test_single_relevant_candidate_returns_empty():
                return_value=[0.1] * 128):
         results = await source.extract(ctx, targets)
 
-    assert results == [], "1 кандидат недостаточен для consensus → пустой список"
+    # _MIN_FILTERED_CANDIDATES=1: одиночный категорийно-точный голос принимается
+    assert len(results) == 1, "1 кандидат теперь достаточен для consensus (min=1)"
+    assert results[0].attribute_id == 20
+    assert results[0].value == "650W"
+    assert "1/1" in results[0].evidence
 
 
 # ---------------------------------------------------------------------------

@@ -133,14 +133,19 @@ async def test_extract_increments_llm_calls():
 
 @pytest.mark.asyncio
 async def test_extract_returns_empty_on_llm_failure():
-    """Returns [] and does NOT increment llm_calls when LLM returns None."""
+    """Returns [] when LLM returns None.
+
+    Вызов к LLM реально сделан (и оплачен) даже если парсинг вернул None, поэтому
+    llm_calls_so_far инкрементируется — счётчик отражает фактические запросы, а не
+    успешные парсы.
+    """
     src = LlmKnowledgeSource(llm_manager=_make_llm_mock(parsed=None))
     ctx = _make_context()
 
     result = await src.extract(ctx, [_make_target()])
 
     assert result == []
-    assert ctx.llm_calls_so_far == 0
+    assert ctx.llm_calls_so_far == 1
 
 
 # ---------------------------------------------------------------------------
