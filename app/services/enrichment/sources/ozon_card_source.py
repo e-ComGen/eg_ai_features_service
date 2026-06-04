@@ -696,6 +696,114 @@ def _is_gender_target_name(name: str) -> bool:
     return bool(re.search(r"(?<![а-яёa-z])(пол|род)(?![а-яёa-z])", low))
 
 
+# ---------------------------------------------------------------------------
+# Бренд-консистентность (генеральный wrong-SKU гард, без хардкода брендов)
+# ---------------------------------------------------------------------------
+# Карточка соседнего товара иногда оказывается ДРУГИМ брендом (Ozon search вернул
+# «Футболка Shilla» на запрос «Футболка Nike» — fuzzy-score высокий по типу+полу,
+# но это не тот товар). Копировать её attrs = перетереть верные значения чужими.
+# Гард зеркалит стиль гендер-гарда: извлекаем бренд запроса и сравниваем с брендом
+# карточки; явный конфликт → штраф (карточка проигрывает / уходит ниже порога).
+
+# Токенайзер бренда (зеркало pipeline._brand_norm_tokens / matcher._TOKEN_RE —
+# не импортируем, чтобы не тянуть лишние модули). ё→е, lower, latin/cyrillic/digits.
+_BRAND_TOKEN_RE = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
+# Минимальная длина склеенного бренд-кандидата (отсекает 1-2-буквенные ложняки).
+_BRAND_MIN_LEN = 3
+# Штраф за конфликт бренда: как type/gender-mismatch, но крупнее — карточка
+# другого бренда должна гарантированно уйти ниже _BRAND_LINE_THRESHOLD (65),
+# чтобы _classify_match вернул "skip" и значения вообще не копировались.
+_BRAND_MISMATCH_PENALTY = 60.0
+# Латинский бренд-кандидат: непрерывная цепочка латиница/цифры/амперсанд длиной ≥3.
+# Бренды одежды/электроники почти всегда латиница (Nike, Shilla, Levi's, ASUS).
+# Кириллические токены НЕ берём в кандидаты бренда: тип товара и описательные
+# слова в RU-заголовках кириллические («Футболка», «мужская») — чтобы не принять
+# тип за бренд. Это делает гард консервативным (срабатывает на латин-vs-латин).
+_LATIN_BRAND_RE = re.compile(r"[a-z][a-z0-9&]{2,}", re.IGNORECASE)
+
+
+def _brand_tokens(text: str) -> list[str]:
+    """Токены строки для brand-матчинга (зеркало pipeline._brand_norm_tokens)."""
+    return _BRAND_TOKEN_RE.findall((text or "").lower().replace("ё", "е"))
+
+
+def _brand_present(brand: str, text_tokens: list[str]) -> bool:
+    """True если бренд присутствует в тексте как непрерывная цепочка токенов.
+
+    Многословные бренды («The North Face», «Calvin Klein») матчатся как
+    contiguous-подпоследовательность. Бренд короче _BRAND_MIN_LEN символов
+    (после склейки токенов) игнорируется. Зеркало pipeline._brand_in_name.
+    """
+    b_tokens = _brand_tokens(brand)
+    if not b_tokens:
+        return False
+    if sum(len(t) for t in b_tokens) < _BRAND_MIN_LEN:
+        return False
+    n = len(b_tokens)
+    for i in range(len(text_tokens) - n + 1):
+        if text_tokens[i:i + n] == b_tokens:
+            return True
+    return False
+
+
+def _latin_brand_candidates(text: str) -> set[str]:
+    """Множество латинских бренд-кандидатов из текста (lower, ≥3 символов).
+
+    Только латиница: в RU-заголовках Ozon бренд почти всегда латиницей
+    («Футболка мужская Nike Sportswear»), а кириллица — тип/описание. Это
+    делает гард консервативным — он сравнивает латин-бренды, не принимая
+    кириллический тип товара за бренд.
+    """
+    return {m.group(0).lower() for m in _LATIN_BRAND_RE.finditer(text or "")}
+
+
+def _brand_conflict(query_brand: Optional[str], query_name: str, card_title: str) -> bool:
+    """True если бренд карточки ЯВНО конфликтует с брендом запроса (wrong-SKU).
+
+    Консервативный гард (минимум ложняков):
+      1. Определяем бренд запроса: explicit `query_brand` (из контекста) если он
+         латинский ≥3 символов; иначе НЕ определяем → конфликта нет (не угадываем
+         бренд из имени, чтобы не словить ложняк на типе/описании).
+      2. Если бренд запроса присутствует в title карточки (как цепочка токенов) →
+         НЕТ конфликта (это тот самый бренд, возможно другая модель — ОК).
+      3. Если бренд запроса в title ОТСУТСТВУЕТ, НО в title есть другой латинский
+         бренд-кандидат (≥3 символов), которого нет в самом имени запроса →
+         КОНФЛИКТ (карточка другого бренда).
+      4. Если у карточки вообще нет латинских бренд-кандидатов → НЕ конфликт
+         (бренд карточки неопределим — не отвергаем, избегаем ложного reject).
+
+    Симметрично безопасно: если бренд запроса неопределим (нет explicit brand или
+    он кириллический/короткий) → всегда False (никогда не reject вслепую).
+    """
+    if not card_title:
+        return False
+    qb = (query_brand or "").strip()
+    # Бренд запроса должен быть латинским и достаточно длинным, иначе не судим.
+    if not qb or not _LATIN_BRAND_RE.fullmatch(qb.replace(" ", "")):
+        return False
+    if sum(len(t) for t in _brand_tokens(qb)) < _BRAND_MIN_LEN:
+        return False
+
+    title_tokens = _brand_tokens(card_title)
+    if _brand_present(qb, title_tokens):
+        return False  # тот же бренд (другая модель) — ОК
+
+    # Бренд запроса в карточке отсутствует. Есть ли в карточке ДРУГОЙ латин-бренд?
+    card_brands = _latin_brand_candidates(card_title)
+    if not card_brands:
+        return False  # бренд карточки неопределим — не отвергаем
+
+    qb_tokens = set(_brand_tokens(qb))
+    name_brands = _latin_brand_candidates(query_name)
+    # Конфликтующие кандидаты = латин-токены карточки, которых нет ни в бренде
+    # запроса, ни (как латин-токен) в самом имени запроса.
+    conflicting = {
+        cb for cb in card_brands
+        if cb not in qb_tokens and cb not in name_brands
+    }
+    return bool(conflicting)
+
+
 def _normalize_model(product_name: str, brand: Optional[str]) -> str:
     """Убирает generic-префиксы и бренд, lowercase, для cache key."""
     result = product_name.strip()
@@ -1003,7 +1111,10 @@ class OzonCardSource(AttributeSource):
                 "stage": "no_tiles",
             }
 
-        top_tile, top_score = self._pick_best_match(query, tiles[:_MAX_SEARCH_TILES], category_leaf=cat_leaf)
+        top_tile, top_score = self._pick_best_match(
+            query, tiles[:_MAX_SEARCH_TILES], category_leaf=cat_leaf,
+            query_brand=context.brand, query_name=full_name,
+        )
         mode = self._classify_match(top_score) if top_tile is not None else "skip"
 
         if top_tile is None or mode == "skip":
@@ -1493,6 +1604,8 @@ class OzonCardSource(AttributeSource):
         query: str,
         tiles: list[dict],
         category_leaf: Optional[str] = None,
+        query_brand: Optional[str] = None,
+        query_name: Optional[str] = None,
     ) -> tuple[Optional[dict], float]:
         """Top-1 по rapidfuzz (partial_ratio + token_sort_ratio averaged).
 
@@ -1505,6 +1618,13 @@ class OzonCardSource(AttributeSource):
         если category_leaf задан И в query нет model-токенов (одежда без
         артикула) И category_leaf отсутствует в tile-title → score -= 30.
         Для электроники с артикулом штраф не применяется.
+
+        Штраф _BRAND_MISMATCH_PENALTY за конфликт бренда (wrong-SKU гард):
+        если бренд запроса (query_brand) латинский и явно ОТСУТСТВУЕТ в title
+        карточки, а в title есть ДРУГОЙ латинский бренд-кандидат → score -= 60
+        (карточка чужого бренда уходит ниже порога → "skip", attrs не копируются).
+        query_name нужен чтобы не считать конфликтом латин-токены, уже стоящие в
+        самом имени запроса (модель-линейка).
         """
         try:
             from rapidfuzz import fuzz
@@ -1550,6 +1670,11 @@ class OzonCardSource(AttributeSource):
             # проигрывает. Унисекс/нейтральное имя/неоднозначность — без штрафа.
             if q_gender is not None and _gender_conflict(query, title):
                 score -= _GENDER_MISMATCH_PENALTY
+            # Бренд-штраф (wrong-SKU гард): бренд запроса латинский, отсутствует
+            # в title карточки, а в title есть другой латин-бренд → карточка
+            # чужого бренда. Крупный штраф (60) гарантирует уход ниже порога.
+            if _brand_conflict(query_brand, query_name or query, title):
+                score -= _BRAND_MISMATCH_PENALTY
             if score > best_score:
                 best_score = score
                 best_tile = tile
