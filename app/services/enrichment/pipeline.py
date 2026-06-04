@@ -8,7 +8,7 @@ Spec: docs/architecture/pipeline.md, section "PipelineOrchestrator".
 """
 import logging
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 from pydantic import BaseModel, Field
 
@@ -220,28 +220,34 @@ def _apply_brand_from_name(
     merged: list[AttributeValue],
     targets: list[TargetAttribute],
     context: ExtractionContext,
+    brand_options_fn: Optional[Callable[[int], list[str]]] = None,
 ) -> list[AttributeValue]:
-    """POST-merge brand-from-name резолвер для enum-полей «Бренд» (генеральный).
+    """POST-merge brand-from-name резолвер для поля «Бренд» (генеральный).
 
-    Для каждого brand-таргета С allowed_values (enum-бренд; free-text бренд — вне
-    области, см. ниже): если в ИМЕНИ товара присутствует РОВНО ОДИН из allowed-
-    брендов (как непрерывная цепочка токенов, бренд ≥3 символов) — это B:
+    Для каждого brand-таргета (детект по id==31 ИЛИ имени «Бренд/Brand/Торговая
+    марка» — allowed_values НЕ требуется): если в ИМЕНИ товара присутствует РОВНО
+    ОДИН из СЛОВАРНЫХ брендов (как непрерывная цепочка токенов, бренд ≥3 символов)
+    — это B:
       • поле НЕ заполнено → заполняем B (source=DESCRIPTION, evidence=brand_from_name);
       • поле заполнено значением != B → ПЕРЕЗАПИСЫВАЕМ на B (заголовок авторитетен).
-    Если в имени НЕТ ни одного allowed-бренда, либо их НЕСКОЛЬКО (двусмысленно) —
-    поле НЕ трогаем (анти-мусор: не угадываем).
+    Если в имени НЕТ ни одного словарного бренда, либо их НЕСКОЛЬКО (двусмысленно)
+    — поле НЕ трогаем (анти-мусор: не угадываем).
 
-    НИКОГДА не пишет бренд, отсутствующий И в имени, И в allowed_values: B всегда
-    выбирается из allowed_values И присутствует в имени. value_id заполняется
-    стратегией позже (resolve_value_ids в _finalize), как для прочих значений.
+    Источник полного списка брендов (по убыванию приоритета):
+      1. target.allowed_values, если не пусто (мелкий enum, список в таргете);
+      2. brand_options_fn(attr_id) — ПОЛНЫЙ словарный список (Бренд — огромный
+         truncated enum, его allowed_values НЕ переносятся в target; список даёт
+         стратегия через словарь). Это закрывает реальный кейс «Бренд» (id 31).
+    Если оба источника пусты — таргет пропускается (нечего матчить).
 
-    Free-text brand-таргеты (без allowed_values) пропускаются — там нет enum, к
-    которому «прилипает» мусор, и нет канонического написания для перезаписи.
+    НИКОГДА не пишет бренд, отсутствующий И в имени, И в списке брендов: B всегда
+    выбирается из списка И присутствует в имени. value_id заполняется стратегией
+    позже (resolve_value_ids в _finalize), как для прочих значений.
     """
-    # brand-таргеты с allowed_values: attr_id → (target, allowed)
+    # brand-таргеты (allowed_values НЕ требуется — для truncated «Бренд» он пуст).
     brand_targets: dict[int, TargetAttribute] = {}
     for t in targets:
-        if (t.id == _BRAND_TARGET_ATTR_ID or _is_brand_target_name(t.name)) and t.allowed_values:
+        if t.id == _BRAND_TARGET_ATTR_ID or _is_brand_target_name(t.name):
             brand_targets[t.id] = t
     if not brand_targets:
         return merged
@@ -253,7 +259,20 @@ def _apply_brand_from_name(
     # Какое каноническое B подобрать для каждого brand-таргета (ровно один матч).
     resolved_brand: dict[int, str] = {}
     for attr_id, t in brand_targets.items():
-        matches = [b for b in t.allowed_values if _brand_in_name(str(b), name_tokens)]
+        # Полный список брендов: target.allowed_values (мелкий enum) ИЛИ словарь.
+        options = list(t.allowed_values or [])
+        if not options and brand_options_fn is not None:
+            try:
+                options = list(brand_options_fn(attr_id) or [])
+            except Exception as exc:  # словарь недоступен — не падаем, пропускаем
+                logger.warning(
+                    "[Pipeline] brand-from-name: словарный список брендов для attr %s "
+                    "недоступен: %s", attr_id, exc,
+                )
+                options = []
+        if not options:
+            continue
+        matches = [b for b in options if _brand_in_name(str(b), name_tokens)]
         # Дедуп по нормализованной форме (один и тот же бренд в разных написаниях).
         uniq = {tuple(_brand_norm_tokens(str(b))): str(b) for b in matches}
         if len(uniq) == 1:
@@ -982,7 +1001,10 @@ class PipelineOrchestrator:
         # пустой «Бренд» / перезаписывает мусорный (чужой allowed-enum) ровно-одним
         # allowed-брендом, присутствующим в имени. Идёт ДО resolve_value_ids, чтобы
         # заполненный/перезаписанный бренд получил словарный value_id.
-        merged = _apply_brand_from_name(merged, targets, context)
+        merged = _apply_brand_from_name(
+            merged, targets, context,
+            brand_options_fn=lambda attr_id: self._strategy.brand_value_options(attr_id, context),
+        )
 
         # Strategy post-processing FIRST (добавляет CategoryDefaults + cross-fills с source=DESCRIPTION).
         # Должно идти ДО resolve_value_ids, иначе свежедобавленные AVs не получат value_id.

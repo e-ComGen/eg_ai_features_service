@@ -166,12 +166,107 @@ def test_never_writes_brand_absent_from_allowed():
     assert _val_for(out) is None
 
 
-def test_free_text_brand_target_skipped():
-    """Brand target WITHOUT allowed_values (free-text) is out of scope."""
+def test_free_text_brand_target_skipped_without_dict():
+    """Brand target with empty allowed_values AND no dict resolver → skipped.
+
+    Without a brand_options_fn there is no list to match against, so the resolver
+    leaves the field untouched (no guess).
+    """
     ctx = _ctx("Джинсы Levi's 501")
     target = TargetAttribute(id=_BRAND_ID, name="Бренд", type="text")
     out = _apply_brand_from_name([], [target], ctx)
-    assert _val_for(out) is None  # free-text not handled
+    assert _val_for(out) is None  # no list → nothing to match
+
+
+# ── REGRESSION: truncated «Бренд» enum (empty allowed_values + full dict) ──────
+
+def test_truncated_brand_resolved_from_full_dict_unfilled():
+    """REGRESSION: «Бренд» is a huge truncated enum → target.allowed_values is [].
+
+    The full brand list is supplied via brand_options_fn (the dict path). With the
+    OLD code (which required t.allowed_values) this was skipped and Бренд stayed
+    empty. Now it MUST resolve 'Champion' from the name against the full dict list.
+    """
+    ctx = _ctx("Толстовка худи Champion Reverse Weave")
+    target = _brand_target([])  # truncated enum: allowed_values NOT carried
+    full_dict = ["Nike", "Champion", "Adidas", "Reebok", "Puma"]
+    out = _apply_brand_from_name(
+        [], [target], ctx, brand_options_fn=lambda attr_id: full_dict
+    )
+    v = _val_for(out)
+    assert v is not None and v.value == "Champion"
+    assert v.source == Source.DESCRIPTION
+    assert v.evidence == "brand_from_name"
+
+
+def test_truncated_brand_overrides_garbage_from_full_dict():
+    """REGRESSION: garbage (LEGO/HUGO) on a truncated «Бренд» enum is overridden.
+
+    allowed_values=[] (truncated); full brand list via dict. Name says Levi's,
+    field wrongly 'HUGO' → overridden to 'Levi's'.
+    """
+    ctx = _ctx("Джинсы мужские Levi's 501")
+    target = _brand_target([])
+    full_dict = ["HUGO", "Levi's", "Wrangler", "Lee", "LEGO"]
+    out = _apply_brand_from_name(
+        [_brand_value("HUGO")], [target], ctx,
+        brand_options_fn=lambda attr_id: full_dict,
+    )
+    v = _val_for(out)
+    assert v is not None and v.value == "Levi's"
+    assert v.evidence == "brand_from_name"
+
+
+def test_truncated_brand_dict_empty_skips():
+    """allowed_values=[] AND dict returns [] → nothing to match, untouched."""
+    ctx = _ctx("Джинсы Levi's 501")
+    target = _brand_target([])
+    out = _apply_brand_from_name(
+        [], [target], ctx, brand_options_fn=lambda attr_id: []
+    )
+    assert _val_for(out) is None
+
+
+def test_truncated_brand_ambiguous_from_dict_untouched():
+    """Two dict brands in name → ambiguous → field left untouched (anti-garbage)."""
+    ctx = _ctx("Кроссовки Nike x Adidas коллаборация")
+    target = _brand_target([])
+    full_dict = ["Nike", "Adidas", "Puma"]
+    out = _apply_brand_from_name(
+        [_brand_value("HUGO")], [target], ctx,
+        brand_options_fn=lambda attr_id: full_dict,
+    )
+    v = _val_for(out)
+    assert v is not None and v.value == "HUGO"  # ambiguous → not overridden
+
+
+def test_truncated_brand_multiword_from_dict():
+    """Multi-word brand resolved from full dict list against truncated enum."""
+    ctx = _ctx("Куртка The North Face Resolve мужская")
+    target = _brand_target([])
+    full_dict = ["Columbia", "The North Face", "Patagonia"]
+    out = _apply_brand_from_name(
+        [], [target], ctx, brand_options_fn=lambda attr_id: full_dict
+    )
+    v = _val_for(out)
+    assert v is not None and v.value == "The North Face"
+
+
+def test_allowed_values_preferred_over_dict_when_present():
+    """When target.allowed_values is non-empty, the dict fn is NOT consulted.
+
+    Guards the priority order: small enum in the target wins; brand_options_fn
+    (which would raise here) must not be called.
+    """
+    ctx = _ctx("Толстовка Champion Reverse Weave")
+    target = _brand_target(["Champion", "Nike"])
+
+    def _boom(_attr_id):
+        raise AssertionError("brand_options_fn must not be called when allowed_values present")
+
+    out = _apply_brand_from_name([], [target], ctx, brand_options_fn=_boom)
+    v = _val_for(out)
+    assert v is not None and v.value == "Champion"
 
 
 def test_detect_by_id_when_name_differs():

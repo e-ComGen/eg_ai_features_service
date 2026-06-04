@@ -103,6 +103,44 @@ def test_brand_conflict_multiword_brand():
     ) is True
 
 
+def test_brand_conflict_champion_card_with_extra_latin_words_kept():
+    """Regression: «Толстовка худи Champion Reverse Weave».
+
+    "Champion" is both a brand AND a common English word, and the legit card
+    title carries other latin tokens ("Reverse", "Weave"). The gate must NOT
+    treat those generic latin words as a conflicting brand: as soon as the
+    query brand "Champion" is present in the title, it returns False (kept).
+    This guards against over-rejecting Champion's own card.
+    """
+    qn = "Толстовка худи Champion Reverse Weave"
+    # Legit Champion card (brand present) + extra latin words → NOT rejected.
+    assert _brand_conflict("Champion", qn, "Толстовка Champion Reverse Weave оверсайз") is False
+    assert _brand_conflict("Champion", qn, "Худи Champion Reverse Weave мужское") is False
+    # Brand absent but no OTHER latin brand present → still NOT rejected.
+    assert _brand_conflict("Champion", qn, "Толстовка Reverse Weave оверсайз") is False
+    # Genuinely different brand (Champion absent, Nike present) → rejected.
+    assert _brand_conflict("Champion", qn, "Толстовка Nike Sportswear мужская") is True
+
+
+def test_pick_best_match_champion_card_not_skipped():
+    """Full path: a genuine Champion card with extra latin words clears the
+    gate (not skipped) — the false-reject the brand gate was suspected of."""
+    tiles = [{
+        "title": "Толстовка худи Champion Reverse Weave оверсайз",
+        "slug": "tolstovka-champion", "pid": "222",
+    }]
+    _tile, score = OzonCardSource._pick_best_match(
+        query="Champion Reverse Weave",
+        tiles=tiles,
+        category_leaf="Толстовка",
+        query_brand="Champion",
+        query_name="Толстовка худи Champion Reverse Weave",
+    )
+    assert _classify_match(score) != "skip", (
+        f"genuine Champion card scored {score:.1f}, must NOT be skipped by brand gate"
+    )
+
+
 # ---------------------------------------------------------------------------
 # _pick_best_match — penalty wired through scoring → "skip"
 # ---------------------------------------------------------------------------

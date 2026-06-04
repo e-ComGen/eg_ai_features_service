@@ -598,6 +598,22 @@ class OzonStrategy(MarketplaceStrategy):
 
         return list(values) + extras
 
+    def brand_value_options(
+        self,
+        attribute_id: int,
+        context: ExtractionContext,
+    ) -> list[str]:
+        """Полный словарный список брендов для (cat_id, type_id, attribute_id).
+
+        Бренд — огромный (часто truncated) enum, его allowed_values НЕ попадают в
+        target.allowed_values. brand-from-name резолверу нужен ПОЛНЫЙ список — его
+        и отдаёт get_attr_value_options (читает char['values'] из словаря).
+        """
+        type_id = context.ozon_type_id
+        if type_id is None:
+            return []
+        return get_attr_value_options(context.category_id, type_id, attribute_id)
+
     def resolve_value_ids(
         self,
         attribute_value: AttributeValue,

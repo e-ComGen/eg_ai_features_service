@@ -95,6 +95,22 @@ class MarketplaceStrategy(ABC):
         """Привязать словарные value_id(s). Default: no-op (pass-through)."""
         return attribute_value
 
+    def brand_value_options(
+        self,
+        attribute_id: int,
+        context: "ExtractionContext",
+    ) -> list[str]:
+        """Полный список allowed-значений бренд-характеристики из словаря.
+
+        Нужен brand-from-name резолверу: «Бренд» — огромный enum (>100 значений,
+        часто values_truncated), его allowed_values НЕ переносятся в target —
+        они резолвятся отдельным словарным путём. Этот метод даёт ПОЛНЫЙ список
+        строк-брендов для (cat_id/type_id из context, attribute_id).
+
+        Default: [] (no-op для не-словарных стратегий). Ozon переопределяет.
+        """
+        return []
+
     async def llm_resolve_tail(
         self,
         values: list[AttributeValue],
