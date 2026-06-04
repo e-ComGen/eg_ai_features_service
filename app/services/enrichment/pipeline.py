@@ -1036,8 +1036,33 @@ class PipelineOrchestrator:
         targets: list[TargetAttribute],
         all_values: list[AttributeValue],
     ) -> list[AttributeValue]:
-        """Stage 5: focused re-extraction for empty required attributes."""
-        return await self._finisher.extract_missing(context, targets, all_values)
+        """Stage 5: focused re-extraction for empty required attributes.
+
+        Финишный проход переиспользует те же sources, но напрямую (минуя _run_stage),
+        поэтому судьи здесь НЕ применяются автоматически. Прогоняем результат через
+        тех же per-source судей, что и обычные стадии (_run_stage) — иначе finishing
+        стал бы backdoor'ом, воскрешающим judge-rejected значения без валидации.
+        """
+        recovered = await self._finisher.extract_missing(context, targets, all_values)
+        if not recovered:
+            return []
+
+        validated: list[AttributeValue] = []
+        for value in recovered:
+            judge_wrapper = self._judges.get(value.source)
+            if judge_wrapper is None:
+                validated.append(value)
+                continue
+            try:
+                judged = await judge_wrapper.maybe_validate(value, context)
+                if judged is not None:
+                    validated.append(judged)
+            except Exception as e:
+                logger.warning(
+                    "[Pipeline] finishing judge failed for attr %s (source=%s): %s",
+                    value.attribute_id, value.source.value, e,
+                )
+        return validated
 
     def _remaining_targets(
         self, all_targets: list[TargetAttribute], collected: list[AttributeValue]

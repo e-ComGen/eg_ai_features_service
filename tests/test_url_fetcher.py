@@ -90,8 +90,12 @@ async def test_fetch_url_timeout_returns_none():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_fetch_wildberries_calls_card_api():
+async def test_fetch_wildberries_calls_card_api(tmp_path, monkeypatch):
     """fetch_wildberries must call card.wb.ru with the extracted nm_id."""
+    # Hermetic: redirect the on-disk fetch cache to a fresh temp dir so a stale
+    # cache entry for this URL cannot short-circuit the HTTP call we assert on.
+    monkeypatch.setattr("app.services.url_fetcher._CACHE_DIR", str(tmp_path))
+
     wb_response = {
         "data": {
             "products": [

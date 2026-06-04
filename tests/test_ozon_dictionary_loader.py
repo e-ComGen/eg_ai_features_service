@@ -470,7 +470,13 @@ class TestResolveValueIdMatcherFallback:
         return m
 
     def test_fuzzy_match_yo_vs_ye(self, tmp_path):
-        """'Чёрный' (ё) resolves to id 1001 when matcher returns 'черный' (е)."""
+        """'Чёрный' (ё) resolves to id 1001 via ё→е normalization, no matcher needed.
+
+        The strong-normalization step (_normalize_token) maps ё→е, so 'Чёрный'
+        normalizes to 'черный' and matches the dict entry directly. This is the
+        correct, cheaper path — the semantic matcher must NOT be invoked for a
+        purely orthographic ё/е difference.
+        """
         import json as _json
         import app.services.enrichment.strategies.dictionaries.ozon_loader as mod
         (tmp_path / "ozon_dictionary.json").write_text(
@@ -487,9 +493,7 @@ class TestResolveValueIdMatcherFallback:
             from app.services.enrichment.strategies.dictionaries.ozon_loader import resolve_value_id
             result = resolve_value_id(500, 100, 4180, "Чёрный")
         assert result == 1001, f"Expected 1001 (черный), got {result}"
-        mock_matcher.find_best_match.assert_called_once_with(
-            "Чёрный", ["черный", "белый", "красный", "синий"]
-        )
+        mock_matcher.find_best_match.assert_not_called()
 
     def test_semantic_match_paraphrase(self, tmp_path):
         """'чёрного цвета' resolves to id 1001 when matcher returns 'черный'."""
