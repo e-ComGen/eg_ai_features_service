@@ -7,6 +7,7 @@ cost gating (CostPredictor перед expensive web search).
 Spec: docs/architecture/pipeline.md, section "PipelineOrchestrator".
 """
 import logging
+import re
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -152,6 +153,160 @@ def _apply_gender_guard(
                 )
                 continue
             out.append(v)
+    return out
+
+
+# Brand-from-name резолвер на POST-merge слое (генеральный, без хардкода брендов).
+# Имя товара часто содержит бренд («Толстовка худи Champion Reverse Weave»,
+# «Джинсы мужские Levi's 501»), но поле «Бренд» либо ПУСТО, либо забито МУСОРОМ —
+# чужим allowed-enum значением, к которому enum-matcher «прилип» (HUGO вместо
+# Levi's, LEGO вместо Adidas). Заголовок авторитетен для бренда: если ровно один
+# из allowed-брендов присутствует в имени как слово(сочетание) — фиксируем его.
+# Граница 3 символа отсекает ложняки на 1-2 буквенных брендах.
+_BRAND_TARGET_ATTR_ID = 31
+_BRAND_MIN_LEN = 3
+# Токенайзер для brand-матчинга (зеркало matcher._TOKEN_RE — не импортируем сам
+# matcher, чтобы не тянуть torch/sentence_transformers в pipeline-модуль).
+_matcher_token_re = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
+# Тег источника для заполненного из имени бренда. DESCRIPTION — товар-специфичный
+# сигнал (имя/заголовок этого товара), наивысший приоритет на merge.
+_BRAND_FROM_NAME_EVIDENCE = "brand_from_name"
+
+
+def _is_brand_target_name(name: str) -> bool:
+    """True если имя таргета — поле «Бренд» (brand). Без хардкода attribute_id.
+
+    Детект по имени: «бренд» / «brand» / «торгов* марк*» (торговая марка) как
+    подстрока (имена коротки и однозначны — «Бренд», «Бренд в одежде»,
+    «Торговая марка»). Сам id==31 матчится отдельно в _apply_brand_from_name.
+    """
+    low = name.lower()
+    if "бренд" in low or "brand" in low:
+        return True
+    return bool(re.search(r"торгов\w*\s+марк", low))
+
+
+def _brand_norm_tokens(text: str) -> list[str]:
+    """Токены строки для brand-матчинга: ё→е, lowercase, latin/cyrillic/digits.
+
+    Переиспользует _TOKEN_RE матчера (`[а-яёa-z0-9]+`): пунктуация и апострофы
+    становятся разделителями, поэтому «Levi's»→['levi','s'], «be quiet!»→
+    ['be','quiet'], «The North Face»→['the','north','face'].
+    """
+    return _matcher_token_re.findall(text.lower().replace("ё", "е"))
+
+
+def _brand_in_name(brand: str, name_tokens: list[str]) -> bool:
+    """True если бренд присутствует в имени как непрерывная цепочка токенов.
+
+    Многословные бренды («The North Face») матчатся как contiguous-подпоследо-
+    вательность токенов имени — без ложняков на разбросанных совпадениях.
+    Бренд короче _BRAND_MIN_LEN символов (после нормализации, склейка токенов)
+    игнорируется.
+    """
+    b_tokens = _brand_norm_tokens(brand)
+    if not b_tokens:
+        return False
+    if sum(len(t) for t in b_tokens) < _BRAND_MIN_LEN:
+        return False
+    n = len(b_tokens)
+    for i in range(len(name_tokens) - n + 1):
+        if name_tokens[i:i + n] == b_tokens:
+            return True
+    return False
+
+
+def _apply_brand_from_name(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+    context: ExtractionContext,
+) -> list[AttributeValue]:
+    """POST-merge brand-from-name резолвер для enum-полей «Бренд» (генеральный).
+
+    Для каждого brand-таргета С allowed_values (enum-бренд; free-text бренд — вне
+    области, см. ниже): если в ИМЕНИ товара присутствует РОВНО ОДИН из allowed-
+    брендов (как непрерывная цепочка токенов, бренд ≥3 символов) — это B:
+      • поле НЕ заполнено → заполняем B (source=DESCRIPTION, evidence=brand_from_name);
+      • поле заполнено значением != B → ПЕРЕЗАПИСЫВАЕМ на B (заголовок авторитетен).
+    Если в имени НЕТ ни одного allowed-бренда, либо их НЕСКОЛЬКО (двусмысленно) —
+    поле НЕ трогаем (анти-мусор: не угадываем).
+
+    НИКОГДА не пишет бренд, отсутствующий И в имени, И в allowed_values: B всегда
+    выбирается из allowed_values И присутствует в имени. value_id заполняется
+    стратегией позже (resolve_value_ids в _finalize), как для прочих значений.
+
+    Free-text brand-таргеты (без allowed_values) пропускаются — там нет enum, к
+    которому «прилипает» мусор, и нет канонического написания для перезаписи.
+    """
+    # brand-таргеты с allowed_values: attr_id → (target, allowed)
+    brand_targets: dict[int, TargetAttribute] = {}
+    for t in targets:
+        if (t.id == _BRAND_TARGET_ATTR_ID or _is_brand_target_name(t.name)) and t.allowed_values:
+            brand_targets[t.id] = t
+    if not brand_targets:
+        return merged
+
+    name_tokens = _brand_norm_tokens(context.product_name or "")
+    if not name_tokens:
+        return merged
+
+    # Какое каноническое B подобрать для каждого brand-таргета (ровно один матч).
+    resolved_brand: dict[int, str] = {}
+    for attr_id, t in brand_targets.items():
+        matches = [b for b in t.allowed_values if _brand_in_name(str(b), name_tokens)]
+        # Дедуп по нормализованной форме (один и тот же бренд в разных написаниях).
+        uniq = {tuple(_brand_norm_tokens(str(b))): str(b) for b in matches}
+        if len(uniq) == 1:
+            resolved_brand[attr_id] = next(iter(uniq.values()))
+        elif len(uniq) > 1:
+            logger.info(
+                "[Pipeline] brand-from-name: %d брендов в имени '%s' для attr %s — "
+                "двусмысленно, не трогаем",
+                len(uniq), context.product_name, attr_id,
+            )
+
+    if not resolved_brand:
+        return merged
+
+    out: list[AttributeValue] = []
+    seen_attr: set[int] = set()
+    for v in merged:
+        b = resolved_brand.get(v.attribute_id)
+        if b is None:
+            out.append(v)
+            continue
+        seen_attr.add(v.attribute_id)
+        cur = str(v.value).strip()
+        if cur.lower().replace("ё", "е") == b.lower().replace("ё", "е"):
+            out.append(v)  # уже корректный бренд
+            continue
+        logger.info(
+            "[Pipeline] brand-from-name: перезапись attr %s '%s'→'%s' (из имени)",
+            v.attribute_id, v.value, b,
+        )
+        out.append(v.model_copy(update={
+            "value": b,
+            "value_id": None,        # пере-резолвится стратегией в _finalize
+            "confidence": 0.95,
+            "source": Source.DESCRIPTION,
+            "evidence": _BRAND_FROM_NAME_EVIDENCE,
+        }))
+
+    # Незаполненные brand-таргеты с найденным B — создаём значение.
+    for attr_id, b in resolved_brand.items():
+        if attr_id in seen_attr:
+            continue
+        logger.info(
+            "[Pipeline] brand-from-name: заполнение attr %s='%s' (из имени)",
+            attr_id, b,
+        )
+        out.append(AttributeValue(
+            attribute_id=attr_id,
+            value=b,
+            confidence=0.95,
+            source=Source.DESCRIPTION,
+            evidence=_BRAND_FROM_NAME_EVIDENCE,
+        ))
     return out
 
 
@@ -750,6 +905,12 @@ class PipelineOrchestrator:
         # или навеянные только external-guess источниками при нейтральном имени.
         all_values = _apply_gender_guard(all_values, targets, context)
         merged = self._merge(all_values)
+
+        # Brand-from-name POST-merge: имя товара авторитетно для бренда. Заполняет
+        # пустой «Бренд» / перезаписывает мусорный (чужой allowed-enum) ровно-одним
+        # allowed-брендом, присутствующим в имени. Идёт ДО resolve_value_ids, чтобы
+        # заполненный/перезаписанный бренд получил словарный value_id.
+        merged = _apply_brand_from_name(merged, targets, context)
 
         # Strategy post-processing FIRST (добавляет CategoryDefaults + cross-fills с source=DESCRIPTION).
         # Должно идти ДО resolve_value_ids, иначе свежедобавленные AVs не получат value_id.
