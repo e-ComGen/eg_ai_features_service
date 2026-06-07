@@ -66,6 +66,13 @@ _GENDER_EXTERNAL_SOURCES = {
 }
 
 
+# FIX 2: тег и confidence для пола, восстановленного из имени товара, когда гард
+# опустошил REQUIRED поле «Пол». DESCRIPTION — товар-специфичный сигнал (заголовок
+# этого товара). Confidence умеренный: явный сигнал имени, но дефолт-страховка.
+_EG_GENDER_FROM_NAME_EVIDENCE = "gender_from_name_required_fallback"
+_EG_GENDER_REQUIRED_FALLBACK_CONF = 0.75
+
+
 def _apply_gender_guard(
     all_values: list[AttributeValue],
     targets: list[TargetAttribute],
@@ -91,14 +98,22 @@ def _apply_gender_guard(
     Не-gender targets и кандидаты на них проходят сквозь без изменений.
     """
     # attribute_id → True если это gender-target (по имени таргета).
+    # required_gender_ids — подмножество, помеченное is_required: для них поле НЕ
+    # должно молча опустеть, если есть уверенный сигнал пола из имени (FIX 2).
     gender_attr_ids: set[int] = set()
+    required_gender_ids: set[int] = set()
     for t in targets:
         if _is_gender_target_name(t.name):
             gender_attr_ids.add(t.id)
+            if getattr(t, "is_required", False):
+                required_gender_ids.add(t.id)
     if not gender_attr_ids:
         return all_values
 
     name_gender = _extract_gender_signal(context.product_name or "")
+    # Канон Ozon-значения для пола из ИМЕНИ (только взрослые male/female — детские
+    # каноны из имени _extract_gender_signal не различает, поэтому их не навязываем).
+    _eg_name_gender_canon = {"male": "Мужской", "female": "Женский"}.get(name_gender)
 
     # Для правила 3: какие источники подтверждают каждый (attribute_id, элемент).
     support: dict[tuple[int, str], set] = {}
@@ -121,6 +136,8 @@ def _apply_gender_guard(
         return bool(srcs) and srcs.issubset(_GENDER_EXTERNAL_SOURCES)
 
     out: list[AttributeValue] = []
+    # attribute_id required-gender целей, для которых ХОТЬ ОДИН кандидат уцелел.
+    required_filled: set[int] = set()
     for v in all_values:
         if v.attribute_id not in gender_attr_ids:
             out.append(v)
@@ -137,6 +154,8 @@ def _apply_gender_guard(
                     v.value, v.source.value, name_gender,
                 )
                 continue  # поле опустело → кандидат выбрасывается
+            if v.attribute_id in required_gender_ids:
+                required_filled.add(v.attribute_id)
             if len(kept_idx) != len(v.value):
                 new_value = [v.value[i] for i in kept_idx]
                 new_ids = None
@@ -152,7 +171,31 @@ def _apply_gender_guard(
                     v.attribute_id, v.value, v.source.value, name_gender,
                 )
                 continue
+            if v.attribute_id in required_gender_ids:
+                required_filled.add(v.attribute_id)
             out.append(v)
+
+    # FIX 2: REQUIRED поле «Пол» не должно молча опустеть из-за гард-дропа, когда
+    # есть УВЕРЕННЫЙ пол из имени товара («Футболка мужская» → «Мужской»). Если
+    # required gender-target опустел И имя дало явный взрослый пол (male/female) —
+    # подставляем его канон. Имя нейтрально/неизвестно → НЕ выдумываем (оставляем
+    # пусто). Детский пол из имени мы не различаем, поэтому его не навязываем.
+    if _eg_name_gender_canon is not None:
+        for attr_id in required_gender_ids:
+            if attr_id in required_filled:
+                continue
+            out.append(AttributeValue(
+                attribute_id=attr_id,
+                value=_eg_name_gender_canon,
+                confidence=_EG_GENDER_REQUIRED_FALLBACK_CONF,
+                source=Source.DESCRIPTION,
+                evidence=_EG_GENDER_FROM_NAME_EVIDENCE,
+            ))
+            logger.info(
+                "[Pipeline] gender-guard: REQUIRED поле %s опустело после дропа — "
+                "подставлен пол из имени '%s'",
+                attr_id, _eg_name_gender_canon,
+            )
     return out
 
 

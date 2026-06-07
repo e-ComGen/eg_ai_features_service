@@ -209,8 +209,69 @@ def _normalize_token(s: str) -> str:
     return s.strip(" .,;:!?\"'()[]")
 
 
+# ---------------------------------------------------------------------------
+# Гендер-синоним-нормализатор (генеральный, без хардкода категорий)
+# ---------------------------------------------------------------------------
+# Карточка/источники отдают пол как свободные фразы («Мужчинам», «Для мужчин»,
+# «men's»), а словарь Ozon хранит канон «Мужской/Женский/Девочки/Мальчики».
+# fuzzy≥85 такие фразы НЕ мапит на канон (другая основа), и value_id теряется.
+# Здесь — явный map вариант→канон, применяется ДО резолва value_id для целей-пола.
+#
+# КРИТИЧНО: детские каноны (Девочки/Мальчики) остаются ОТДЕЛЬНЫМИ от взрослых
+# (Женский/Мужской) — НИКОГДА не схлопываем детей во взрослых. Порядок проверки:
+# сначала детские (длиннее/специфичнее), потом взрослые, чтобы «для девочек» не
+# поймался взрослым «жен».
+_EG_GENDER_CANON_SYNONYMS: tuple[tuple[str, frozenset[str]], ...] = (
+    ("Девочки", frozenset({
+        "девочки", "девочка", "для девочек", "girls", "girl",
+    })),
+    ("Мальчики", frozenset({
+        "мальчики", "мальчик", "для мальчиков", "boys", "boy",
+    })),
+    ("Мужской", frozenset({
+        "муж", "мужской", "мужская", "мужское", "мужчинам", "мужчины",
+        "для мужчин", "men", "men's", "mens", "male",
+    })),
+    ("Женский", frozenset({
+        "жен", "женский", "женская", "женское", "женщинам", "женщины",
+        "для женщин", "women", "women's", "womens", "female",
+    })),
+)
+
+
+def normalize_gender_value(s: str) -> Optional[str]:
+    """Сопоставить гендер-вариант его канону Ozon (Мужской/Женский/Девочки/Мальчики).
+
+    Генеральный, без хардкода категорий: только явный словарь вариант→канон.
+    Вход нормализуется (lower+strip) перед сравнением. Детские каноны держим
+    ОТДЕЛЬНО от взрослых — «для девочек» → «Девочки», НЕ «Женский».
+
+    Возвращает канон-строку или None (если вариант неизвестен — не выдумываем).
+    """
+    if not s:
+        return None
+    key = str(s).strip().lower()
+    if not key:
+        return None
+    for canon, variants in _EG_GENDER_CANON_SYNONYMS:
+        if key in variants:
+            return canon
+    return None
+
+
 def _try_match_one_value(value: str, values_list: list) -> Optional[int]:
     """Try multiple match strategies for a single value string against dict values_list."""
+    # Gender-synonym pre-pass: вариант пола («Мужчинам»/«men's») → канон Ozon
+    # («Мужской»), затем матчим канон по словарю exact-ом. Срабатывает ТОЛЬКО
+    # когда (а) value — известный гендер-вариант И (б) канон есть в values_list,
+    # т.е. для НЕгендерных атрибутов нейтрально (канона в словаре нет → пропуск).
+    gender_canon = normalize_gender_value(value)
+    if gender_canon is not None:
+        canon_lower = gender_canon.lower()
+        for entry in values_list:
+            if str(entry.get("value", "")).lower() == canon_lower:
+                return entry.get("id")
+
     # Strategy 1: exact case-insensitive
     value_lower = value.lower()
     for entry in values_list:

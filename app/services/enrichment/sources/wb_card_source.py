@@ -74,6 +74,9 @@ from app.services.enrichment.strategies.dictionaries.ozon_loader import (
     get_ozon_characteristics_for_type,
     resolve_value_id,
 )
+from app.services.enrichment.strategies.dictionaries.eg_wb_ozon_field_map import (
+    eg_get_field_map,
+)
 from app.services.providers.factory import get_web_search_client
 
 logger = logging.getLogger(__name__)
@@ -127,15 +130,22 @@ def _target_type_lemma(
 
     Возвращает лемму типа или None если тип определить нельзя.
     """
-    # 1. Категория-leaf: первое значимое существительное.
+    # 1. Категория-leaf: ПЕРВЫЙ значимый токен — БЕЗ noun-гейта.
+    #    Leaf — это явный ярлык категории, а не свободный текст: его первое
+    #    значимое слово ВСЕГДА тип товара. pymorphy3 ошибочно парсит несклоняемые
+    #    («худи»→глагол «худить», «пальто», «боди», «бикини») как НЕ-сущ., поэтому
+    #    noun-гейт тут отбрасывал бы корректный тип. Доверяем leaf безусловно;
+    #    noun-scan названия (шаг 2) нужен ТОЛЬКО когда leaf нет (иначе он цепляет
+    #    спек/фичу — «молния», «карман», «капюшон»).
     if cat_leaf:
         for tok in _TYPE_TOKEN_RE.findall(cat_leaf.lower()):
-            if len(tok) < 3 or tok in _LEADING_STOPWORDS:
+            # БЕЗ stopword-фильтра: «худи» внесён в _LEADING_STOPWORDS как
+            # разговорный тип, но в leaf это и есть искомый тип. Скипаем только
+            # короткий мусор (len<3).
+            if len(tok) < 3:
                 continue
-            lem = _lemma(tok)
-            if _is_noun_lemma(tok):
-                return lem
-    # 2. Ведущее существительное названия товара.
+            return _lemma(tok)
+    # 2. Ведущее существительное названия товара (только при отсутствии leaf).
     for tok in _TYPE_TOKEN_RE.findall(product_name.lower()):
         if len(tok) < 3 or tok in _LEADING_STOPWORDS or _is_spec_or_unit_token(tok):
             continue
@@ -217,6 +227,29 @@ _MAX_CANDIDATES = 10  # топ-N уникальных nm_id из Serper (мно�
 # (стабильно пустой товар), на успехе ретраев нет.
 _SERPER_MAX_ATTEMPTS = 3        # всего попыток (1 основная + 2 ретрая)
 _SERPER_BACKOFF_BASE = 1.0      # сек: задержки 1с, 2с (экспонента 2^n)
+
+
+class _EgPermanentSearchError(Exception):
+    """Непреходящая (4xx) ошибка поиска — ретраить бессмысленно.
+
+    Поднимается из `_search_once`, когда бэкенд вернул non-transport 4xx
+    (400 «Not enough credits» / 401 / 403): неверный ключ, исчерпан кредит,
+    запрещённый запрос. Бэкофф+ретрай таких НЕ чинит — `_search` должен
+    немедленно вернуть [] без задержек. 429 (троттлинг) и 5xx — НЕ сюда,
+    они транзиентны и ретраятся как раньше.
+    """
+
+
+def _eg_is_permanent_4xx(exc: BaseException) -> bool:
+    """True если исключение — non-transport клиентская 4xx (кроме 429).
+
+    Ретраить такие нельзя: 400/401/403 указывают на проблему ключа/кредита/
+    запроса. 429 (rate-limit) исключаем — он транзиентный (ретраим с бэкоффом),
+    как и 5xx/таймауты/коннект-ошибки.
+    """
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None)
+    return isinstance(status, int) and 400 <= status < 500 and status != 429
 
 # Сколько card.json реально скачать прежде чем выбирать лучший. Многие nm_id
 # архивные/несуществующие → 404 по всем basket. Перебираем кандидатов по порядку,
@@ -342,12 +375,19 @@ def _wb_query_type_word(product_name: str, cat_leaf: Optional[str]) -> Optional[
     «Куртки» → «Куртки»), затем ведущее русское существительное названия.
     Возвращаем словоформу как есть (Serper токенизирует, лемма не нужна).
     """
+    # Leaf — явный ярлык категории: первое значимое РУССКОЕ слово ВСЕГДА тип,
+    # БЕЗ noun-гейта И БЕЗ stopword-фильтра. Несклоняемые («худи»/«пальто»/«боди»)
+    # pymorphy парсит как не-сущ.; вдобавок «худи» внесён в _LEADING_STOPWORDS как
+    # разговорный тип (для среза в середине названия). Оба фильтра ошибочно
+    # выкинули бы тип из leaf, и noun-scan названия подобрал бы спек-слово
+    # («молния»/«карман»). В leaf первое значимое слово — это тип по определению,
+    # поэтому фильтруем только мусор (len<3 / не-русское). Noun-scan названия —
+    # fallback ТОЛЬКО при отсутствии leaf.
     if cat_leaf:
         for tok in cat_leaf.split():
             low = tok.lower()
-            if len(low) >= 3 and low not in _LEADING_STOPWORDS and re.search(r"[а-яё]", low):
-                if _is_noun_lemma(low):
-                    return tok
+            if len(low) >= 3 and re.search(r"[а-яё]", low):
+                return tok
     for tok in product_name.split():
         low = tok.lower()
         if len(low) < 3 or low in _LEADING_STOPWORDS or _is_spec_or_unit_token(low):
@@ -584,7 +624,7 @@ class WbCardSource(AttributeSource):
 
             # ---- MAP & EMIT ----
             return self._map_characteristics(
-                chars, targets, context, mode, title, score,
+                chars, targets, context, mode, title, score, card,
             )
 
     async def _search(self, query: str) -> list[int]:
@@ -597,7 +637,16 @@ class WbCardSource(AttributeSource):
         по стеку это fallback, не падение).
         """
         for attempt in range(1, _SERPER_MAX_ATTEMPTS + 1):
-            nm_ids = await self._search_once(query)
+            try:
+                nm_ids = await self._search_once(query)
+            except _EgPermanentSearchError as exc:
+                # Непреходящая 4xx (нет кредитов / неверный ключ / запрет):
+                # ретрай+бэкофф её не починит → fail-fast, [] без задержек.
+                logger.warning(
+                    "[WbCard] Serper непреходящая 4xx (%s) — fail-fast без ретрая",
+                    exc,
+                )
+                return []
             if nm_ids:
                 if attempt > 1:
                     logger.info(
@@ -633,6 +682,12 @@ class WbCardSource(AttributeSource):
                 serper_query, num_results=_SERPER_NUM_RESULTS
             )
         except Exception as exc:
+            # Non-transport 4xx (400 «Not enough credits»/401/403) — непреходящая:
+            # пробрасываем как _EgPermanentSearchError, чтобы _search не жёг
+            # бэкофф-ретраи. Прочие (429/5xx/таймаут/коннект) → транзиентные,
+            # деградируем к [] и _search ретраит как раньше.
+            if _eg_is_permanent_4xx(exc):
+                raise _EgPermanentSearchError(str(exc)) from exc
             logger.info("[WbCard] Serper search err: %s", exc)
             return []
 
@@ -1057,6 +1112,7 @@ class WbCardSource(AttributeSource):
         mode: str,
         title: str,
         score: float,
+        card: Optional[dict] = None,
     ) -> list[AttributeValue]:
         """Сопоставить WB-char names с target.name через Ozon dictionary.
 
@@ -1103,6 +1159,24 @@ class WbCardSource(AttributeSource):
 
         target_by_id: dict[int, TargetAttribute] = {t.id: t for t in targets}
 
+        # Verified WB→Ozon field map (eg-importer). Имя WB-характеристики →
+        # Ozon attr id напрямую (без fuzzy). Используется как первый шаг гейта:
+        # если verified id совпадает с одной из текущих targets — берём его,
+        # иначе падаем на старую fuzzy-логику. wb_subject из card.json; если его
+        # нет — fallback-merge по (cat_id, type_id) внутри eg_get_field_map.
+        wb_subject: Optional[str] = None
+        if card:
+            for key in ("subj_name", "subj_root_name"):
+                val = card.get(key)
+                if isinstance(val, str) and val.strip():
+                    wb_subject = val.strip()
+                    break
+        verified_map: dict[str, int] = {}
+        try:
+            verified_map = eg_get_field_map(wb_subject, cat_id, type_id)
+        except Exception as exc:
+            logger.debug("[WbCard] eg_get_field_map failed: %s", exc)
+
         evidence_short = f"wb:{title[:50]} | match={score:.1f}"
         conf = _CONF_EXACT if mode == "exact" else _CONF_BRAND_LINE
 
@@ -1122,7 +1196,18 @@ class WbCardSource(AttributeSource):
             if mode == "brand_line" and char_name_low in _BRAND_LINE_BLACKLIST:
                 continue
 
-            target_id = name_to_target_id.get(char_name_low)
+            target_id: Optional[int] = None
+
+            # 1) Verified path: точный WB name → Ozon attr id из field-map.
+            #    Берём только если этот id присутствует среди текущих targets
+            #    (иначе verified-id нерелевантен этому запросу публикации).
+            verified_id = verified_map.get(char_name_low)
+            if verified_id is not None and verified_id in target_by_id:
+                target_id = verified_id
+
+            # 2) Fallback: существующая exact/substring/fuzzy логика (без изменений).
+            if target_id is None:
+                target_id = name_to_target_id.get(char_name_low)
             if target_id is None:
                 for tn, tid in name_to_target_id.items():
                     if char_name_low in tn or tn in char_name_low:
