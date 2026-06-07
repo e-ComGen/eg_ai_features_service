@@ -460,10 +460,19 @@ async def main():
     # a diagnostic and keeps Serper/Scrappey load gentle.
     print(f"[Trace] Running {len(products)} products sequentially", flush=True)
     t0 = time.time()
+    _ckpt_dir = PROJECT_ROOT / "scripts" / "eval_results"
+    _ckpt_dir.mkdir(parents=True, exist_ok=True)
+    _ckpt_path = _ckpt_dir / "apparel_trace_partial.json"
     results = []
     for i, (cat_id, type_id, name) in enumerate(products, 1):
         r = await trace_one(orch, i, len(products), cat_id, type_id, name)
         results.append(r)
+        # checkpoint after every product — the final timestamped JSON is only
+        # written at the end, so a mid-run kill would otherwise lose everything.
+        _ckpt_path.write_text(
+            json.dumps({"per_product": results}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     elapsed = time.time() - t0
 
     active = [r for r in results if not r.get("skipped")]

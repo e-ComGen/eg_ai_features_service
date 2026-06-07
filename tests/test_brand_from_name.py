@@ -23,8 +23,13 @@ from app.services.enrichment.pipeline import (
 _BRAND_ID = _BRAND_TARGET_ATTR_ID  # 31
 
 
-def _ctx(name: str) -> ExtractionContext:
-    return ExtractionContext(product_id=1, product_name=name, category_id=1)
+def _ctx(name: str, category_path=None) -> ExtractionContext:
+    return ExtractionContext(
+        product_id=1,
+        product_name=name,
+        category_id=1,
+        category_path=category_path or [],
+    )
 
 
 def _brand_target(allowed, *, id=_BRAND_ID, name="Бренд") -> TargetAttribute:
@@ -304,6 +309,79 @@ def test_yo_normalization_in_brand():
     out = _apply_brand_from_name([], [target], ctx)
     v = _val_for(out)
     assert v is not None and v.value == "Аленка"
+
+
+# ── APPAREL DISAMBIGUATION: generic enum «Бренд в одежде и обуви» (id 31) ─────
+# That enum embeds GENERIC words as fake "brands" (футболка, Мужская, NORTH,
+# Original...). Without filtering, «Футболка мужская Nike» matched
+# {Nike, футболка, Мужская} = 3 → ambiguous SKIP → REQUIRED brand stayed empty
+# and garbage from other sources survived. The disambiguator must collapse
+# containment and drop gender/type noise so EXACTLY ONE real brand remains.
+
+
+def test_apparel_gender_and_type_noise_filtered_to_single():
+    """(1) {Nike, футболка, Мужская} → noise dropped → resolves to Nike."""
+    ctx = _ctx("Футболка мужская Nike Sportswear Club", category_path=["Одежда", "Футболки"])
+    target = _brand_target(["Nike", "футболка", "Мужская", "Adidas"])
+    out = _apply_brand_from_name([], [target], ctx)
+    v = _val_for(out)
+    assert v is not None and v.value == "Nike"
+    assert v.evidence == "brand_from_name"
+
+
+def test_apparel_containment_collapse_plus_gender():
+    """(2) {The North Face, NORTH, Мужская} → NORTH⊂The North Face + gender drop."""
+    ctx = _ctx("Куртка мужская The North Face Resolve 2", category_path=["Одежда", "Куртки"])
+    target = _brand_target(["The North Face", "NORTH", "Мужская", "куртка"])
+    out = _apply_brand_from_name([], [target], ctx)
+    v = _val_for(out)
+    assert v is not None and v.value == "The North Face"
+
+
+def test_apparel_overwrite_garbage_after_noise_filter():
+    """(3) garbage LEGO + 'Джинсы мужские Levi's 501' {Levi's, Мужские} → Levi's."""
+    ctx = _ctx("Джинсы мужские Levi's 501", category_path=["Одежда", "Джинсы"])
+    target = _brand_target(["Levi's", "Мужские", "джинсы", "LEGO"])
+    out = _apply_brand_from_name([_brand_value("LEGO")], [target], ctx)
+    v = _val_for(out)
+    assert v is not None and v.value == "Levi's"
+    assert v.evidence == "brand_from_name"
+    assert v.value_id is None
+
+
+def test_apparel_two_real_brands_still_skip():
+    """(4) TWO genuinely distinct real brands remain after filter → SKIP (no fill)."""
+    ctx = _ctx("Футболка мужская Nike x Adidas", category_path=["Одежда", "Футболки"])
+    target = _brand_target(["Nike", "Adidas", "футболка", "Мужская"])
+    out = _apply_brand_from_name([_brand_value("HUGO")], [target], ctx)
+    v = _val_for(out)
+    assert v is not None and v.value == "HUGO"  # ambiguous → not overridden
+
+
+def test_apparel_regression_clean_single_token_fills():
+    """(5a) clean 'Кроссовки Adidas Ultraboost 22' still fills Adidas."""
+    ctx = _ctx("Кроссовки Adidas Ultraboost 22", category_path=["Обувь", "Кроссовки"])
+    target = _brand_target(["Adidas", "Nike", "кроссовки"])
+    out = _apply_brand_from_name([], [target], ctx)
+    v = _val_for(out)
+    assert v is not None and v.value == "Adidas"
+
+
+def test_apparel_regression_no_brand_stays_empty():
+    """(5b) no real brand in title → field stays empty (only noise present)."""
+    ctx = _ctx("Футболка мужская оверсайз чёрная", category_path=["Одежда", "Футболки"])
+    target = _brand_target(["футболка", "Мужская", "Nike", "Adidas"])
+    out = _apply_brand_from_name([], [target], ctx)
+    assert _val_for(out) is None
+
+
+def test_disambiguation_does_not_break_non_apparel_no_category_path():
+    """No category_path (type_words empty) → behaves as before for clean cases."""
+    ctx = _ctx("Толстовка худи Champion Reverse Weave")
+    target = _brand_target(["Nike", "Champion", "Adidas"])
+    out = _apply_brand_from_name([], [target], ctx)
+    v = _val_for(out)
+    assert v is not None and v.value == "Champion"
 
 
 if __name__ == "__main__":

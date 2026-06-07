@@ -259,6 +259,119 @@ def _brand_in_name(brand: str, name_tokens: list[str]) -> bool:
     return False
 
 
+def _brand_match_span(brand: str, name_tokens: list[str]) -> Optional[tuple[int, int]]:
+    """Token-span (start, end-exclusive) ПЕРВОГО вхождения бренда в имя, иначе None.
+
+    Зеркало _brand_in_name, но возвращает позицию матча — нужно для
+    containment-collapse (вложенные матчи: «NORTH» ⊂ «The North Face»,
+    «Original» ⊂ «Adidas Originals» дают пересекающиеся/вложенные спаны).
+    Бренд < _BRAND_MIN_LEN символов игнорируется (как в _brand_in_name).
+    """
+    b_tokens = _brand_norm_tokens(brand)
+    if not b_tokens:
+        return None
+    if sum(len(t) for t in b_tokens) < _BRAND_MIN_LEN:
+        return None
+    n = len(b_tokens)
+    for i in range(len(name_tokens) - n + 1):
+        if name_tokens[i:i + n] == b_tokens:
+            return (i, i + n)
+    return None
+
+
+def _is_gender_noise_token(token: str) -> bool:
+    """True если ОДИНОЧНЫЙ токен — гендер-слово (Мужская/Женские/...) → шум.
+
+    Переиспользует _extract_gender_signal (грамматические стемы пола, генерально,
+    без хардкода): одиночный токен с явным/унисекс гендер-сигналом — это
+    атрибут «Пол» из заголовка, а не бренд.
+    """
+    return _extract_gender_signal(token) is not None
+
+
+def _category_type_words(category_path: list[str]) -> set[str]:
+    """Нормализованные основы слов категории-leaf — слова «типа товара».
+
+    leaf «Футболки» → {'футболк'}; «Джинсы мужские» → {'джинс','мужск'}.
+    Используется для дропа noise-матча, чей токен совпадает с типом товара
+    (футболка/куртка/джинсы). Грубый стем = первые 5 символов нормализованного
+    слова: покрывает словоформы (футболк-а/-и, куртк-а/-у) без лемматизатора.
+    Generic, без хардкода списка одежды — берётся из category_path товара.
+    """
+    if not category_path:
+        return set()
+    leaf = category_path[-1]
+    words: set[str] = set()
+    for w in _brand_norm_tokens(leaf):
+        if len(w) >= _BRAND_MIN_LEN:
+            words.add(w[:5])
+    return words
+
+
+def _is_type_noise_token(token: str, type_words: set[str]) -> bool:
+    """True если одиночный токен совпадает с типом товара (категория-leaf) → шум."""
+    if not type_words:
+        return False
+    norm = _brand_norm_tokens(token)
+    if len(norm) != 1:
+        return False
+    return norm[0][:5] in type_words
+
+
+def _disambiguate_brand_matches(
+    matches: list[str],
+    name_tokens: list[str],
+    type_words: set[str],
+) -> list[str]:
+    """Бренд-aware фильтр матчей ДО подсчёта двусмысленности (генеральный).
+
+    Шаги (в порядке):
+      1. Containment-collapse: если token-спан одного матча ВЛОЖЕН в спан другого
+         (NORTH ⊂ The North Face, Original ⊂ Adidas Originals) — дроп короткого,
+         оставляем максимальный по покрытию.
+      2. Дроп noise-матчей, чей единственный токен = ГЕНДЕР-слово (Мужская/Женские)
+         или = ТИП товара из category-leaf (футболка/куртка/джинсы).
+    Возвращает дедупнутый список «настоящих» брендов. НЕ хардкодит бренды/одежду.
+    """
+    # Уникальные матчи со спанами (по нормализованной форме — дедуп написаний).
+    spanned: dict[tuple[str, ...], tuple[str, tuple[int, int]]] = {}
+    for b in matches:
+        span = _brand_match_span(str(b), name_tokens)
+        if span is None:
+            continue
+        key = tuple(_brand_norm_tokens(str(b)))
+        # Оставляем матч с максимальным покрытием на случай дублей.
+        prev = spanned.get(key)
+        if prev is None or (span[1] - span[0]) > (prev[1][1] - prev[1][0]):
+            spanned[key] = (str(b), span)
+
+    items = list(spanned.values())
+
+    # --- Шаг 1: containment-collapse ---
+    kept: list[tuple[str, tuple[int, int]]] = []
+    for brand, (s, e) in items:
+        contained = False
+        for other_brand, (os_, oe) in items:
+            if (os_, oe) == (s, e) and other_brand == brand:
+                continue
+            # строго БОЛЬШИЙ спан, полностью покрывающий текущий
+            if os_ <= s and e <= oe and (oe - os_) > (e - s):
+                contained = True
+                break
+        if not contained:
+            kept.append((brand, (s, e)))
+
+    # --- Шаг 2: дроп гендер/тип-шума (только одиночные токены) ---
+    real: list[str] = []
+    for brand, (s, e) in kept:
+        if e - s == 1:
+            tok = name_tokens[s]
+            if _is_gender_noise_token(tok) or _is_type_noise_token(tok, type_words):
+                continue
+        real.append(brand)
+    return real
+
+
 def _apply_brand_from_name(
     merged: list[AttributeValue],
     targets: list[TargetAttribute],
@@ -299,6 +412,10 @@ def _apply_brand_from_name(
     if not name_tokens:
         return merged
 
+    # Слова «типа товара» из category-leaf (футболк-/куртк-/джинс-) — для дропа
+    # noise-матчей, маскирующихся под бренд в enum «Бренд в одежде и обуви».
+    type_words = _category_type_words(context.category_path)
+
     # Какое каноническое B подобрать для каждого brand-таргета (ровно один матч).
     resolved_brand: dict[int, str] = {}
     for attr_id, t in brand_targets.items():
@@ -316,15 +433,17 @@ def _apply_brand_from_name(
         if not options:
             continue
         matches = [b for b in options if _brand_in_name(str(b), name_tokens)]
-        # Дедуп по нормализованной форме (один и тот же бренд в разных написаниях).
-        uniq = {tuple(_brand_norm_tokens(str(b))): str(b) for b in matches}
-        if len(uniq) == 1:
-            resolved_brand[attr_id] = next(iter(uniq.values()))
-        elif len(uniq) > 1:
+        # Бренд-aware дизамбигуация ДО подсчёта: containment-collapse + дроп
+        # гендер/тип-шума (фейковые «бренды» в enum «Бренд в одежде»: футболка,
+        # Мужская, NORTH ⊂ The North Face). Дедуп по норм-форме внутри.
+        real = _disambiguate_brand_matches(matches, name_tokens, type_words)
+        if len(real) == 1:
+            resolved_brand[attr_id] = real[0]
+        elif len(real) > 1:
             logger.info(
                 "[Pipeline] brand-from-name: %d брендов в имени '%s' для attr %s — "
                 "двусмысленно, не трогаем",
-                len(uniq), context.product_name, attr_id,
+                len(real), context.product_name, attr_id,
             )
 
     if not resolved_brand:
