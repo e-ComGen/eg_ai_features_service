@@ -73,6 +73,55 @@ _EG_GENDER_FROM_NAME_EVIDENCE = "gender_from_name_required_fallback"
 _EG_GENDER_REQUIRED_FALLBACK_CONF = 0.75
 
 
+# Brand-identity guard на merge-слое (генеральный, безопасность-критичный).
+# Бренд — это ИДЕНТИЧНОСТЬ товара, его НЕЛЬЗЯ угадывать. «Guess/identity-unsafe»
+# источники домысливают бренд по фото/похожим листингам/общим знаниям, а не видят
+# реальную идентичность ЭТОГО товара: vision→«HUGO», web_search→«LEGO»,
+# llm_knowledge→«Великобритания» (страна!) на Nike/Levi's/Adidas. Бренд-значение
+# ТОЛЬКО от таких источников отбрасывается ДО merge. Авторитетные (карточка/опис/
+# IceCat/PDF/ТНВЭД) и brand-from-name остаются — заполняют пустой/правильный таргет.
+_BRAND_GUESS_SOURCES = {
+    Source.VISION,
+    Source.WEB_SEARCH,
+    Source.LLM_KNOWLEDGE,
+    Source.COMPETITOR_RAG,
+}
+
+
+def _apply_brand_source_guard(
+    all_values: list[AttributeValue],
+    targets: list[TargetAttribute],
+) -> list[AttributeValue]:
+    """Дроп brand-таргет кандидатов от guess/identity-unsafe источников.
+
+    Бренд — идентичность: vision/web_search/llm_knowledge/competitor_rag НЕ видят
+    реальную идентичность товара, а домысливают её (HUGO/LEGO/Великобритания на
+    Nike/Levi's/Adidas). Их кандидаты на brand-таргет (детект по id==31 ИЛИ имени
+    «Бренд/Brand/Торговая марка») выбрасываются ДО merge. Авторитетные источники
+    (ozon_card/wb_card/description/icecat/pdf_datasheet/tnved) и brand-from-name
+    (source=DESCRIPTION, добавляется ПОСЛЕ merge) проходят. Не-brand таргеты — без
+    изменений.
+    """
+    brand_attr_ids: set[int] = {
+        t.id for t in targets
+        if t.id == _BRAND_TARGET_ATTR_ID or _is_brand_target_name(t.name)
+    }
+    if not brand_attr_ids:
+        return all_values
+
+    out: list[AttributeValue] = []
+    for v in all_values:
+        if v.attribute_id in brand_attr_ids and v.source in _BRAND_GUESS_SOURCES:
+            logger.info(
+                "[Pipeline] brand-guard: дроп '%s'='%s' (source=%s) — guess-источник "
+                "не видит идентичность товара",
+                v.attribute_id, v.value, v.source.value,
+            )
+            continue
+        out.append(v)
+    return out
+
+
 def _apply_gender_guard(
     all_values: list[AttributeValue],
     targets: list[TargetAttribute],
@@ -331,7 +380,13 @@ def _disambiguate_brand_matches(
          оставляем максимальный по покрытию.
       2. Дроп noise-матчей, чей единственный токен = ГЕНДЕР-слово (Мужская/Женские)
          или = ТИП товара из category-leaf (футболка/куртка/джинсы).
-    Возвращает дедупнутый список «настоящих» брендов. НЕ хардкодит бренды/одежду.
+      3. Leftmost-tiebreak: если после шагов 1-2 уцелело ≥2 «настоящих» бренда
+         («Nike Sportswear Club»→{Nike,Sportswear,Club}, «Wrangler Texas»→
+         {Wrangler,Texas}) — выбираем ОДИН по самому раннему вхождению в имени.
+         RU marketplace-заголовки кладут настоящий бренд первым в описательной
+         части («<Тип> <пол> <БРЕНД> <модель>...»), поэтому leftmost = бренд.
+    Возвращает дедупнутый список «настоящих» брендов (после шага 3 — ≤1 элемент при
+    наличии хотя бы одного матча). НЕ хардкодит бренды/одежду.
     """
     # Уникальные матчи со спанами (по нормализованной форме — дедуп написаний).
     spanned: dict[tuple[str, ...], tuple[str, tuple[int, int]]] = {}
@@ -362,14 +417,28 @@ def _disambiguate_brand_matches(
             kept.append((brand, (s, e)))
 
     # --- Шаг 2: дроп гендер/тип-шума (только одиночные токены) ---
-    real: list[str] = []
+    real: list[tuple[str, tuple[int, int]]] = []
     for brand, (s, e) in kept:
         if e - s == 1:
             tok = name_tokens[s]
             if _is_gender_noise_token(tok) or _is_type_noise_token(tok, type_words):
                 continue
-        real.append(brand)
-    return real
+        real.append((brand, (s, e)))
+
+    # --- Шаг 3: leftmost-tiebreak при ≥2 уцелевших «настоящих» брендах ---
+    # Заголовок RU-маркетплейса: «<Тип> <пол> <БРЕНД> <модель>...» — настоящий бренд
+    # стоит ПЕРВЫМ в описательной части после типа/пола. Шум типа/пола уже отсеян на
+    # шаге 2, поэтому самый ранний по позиции токена матч — это бренд. Резолвим в
+    # ОДИН бренд по наименьшей стартовой позиции спана.
+    if len(real) >= 2:
+        brand, _span = min(real, key=lambda item: item[1][0])
+        logger.info(
+            "[Pipeline] brand-from-name: %d брендов уцелело после фильтра — "
+            "leftmost-tiebreak выбрал '%s'",
+            len(real), brand,
+        )
+        return [brand]
+    return [b for b, _span in real]
 
 
 def _apply_brand_from_name(
@@ -1153,6 +1222,13 @@ class PipelineOrchestrator:
         context: ExtractionContext,
     ) -> list[AttributeValue]:
         """Merge + strategy post-process + strategy validation. Used at every early-exit point."""
+        # Brand-identity guard ДО merge: бренд — идентичность, его нельзя угадывать.
+        # Дроп кандидатов на «Бренд» от guess-источников (vision/web_search/
+        # llm_knowledge/competitor_rag): HUGO/LEGO/Великобритания на Nike/Levi's/
+        # Adidas. Остаются только авторитетные (карточка/опис/IceCat/PDF/ТНВЭД), а
+        # brand-from-name ниже заполнит опустевший/правильный таргет из имени.
+        all_values = _apply_brand_source_guard(all_values, targets)
+
         # Гендер-гард ДО merge: генеральный, для всех источников (web_search/llm/
         # vision/cards). Отсекает гендерные «Пол»-значения, конфликтующие с именем
         # или навеянные только external-guess источниками при нейтральном имени.

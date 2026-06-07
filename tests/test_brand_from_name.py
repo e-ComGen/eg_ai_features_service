@@ -104,20 +104,25 @@ def test_no_brand_in_name_keeps_existing():
 
 # ── (d) two brands in name → untouched (ambiguous) ────────────────────────────
 
-def test_two_brands_ambiguous_untouched():
-    """(d) TWO allowed brands appear in name → left untouched."""
+def test_two_brands_leftmost_wins_unfilled():
+    """(d) TWO allowed brands in name → leftmost (Nike) wins (PART 2 tiebreak).
+
+    RU marketplace titles list the real brand first; leftmost occurrence resolves
+    the otherwise-ambiguous pair to a single brand rather than skipping.
+    """
     ctx = _ctx("Кроссовки Nike x Adidas коллаборация")
     target = _brand_target(["Nike", "Adidas", "Puma"])
     out = _apply_brand_from_name([], [target], ctx)
-    assert _val_for(out) is None  # ambiguous: not filled
+    v = _val_for(out)
+    assert v is not None and v.value == "Nike"  # leftmost wins
 
 
-def test_two_brands_ambiguous_existing_untouched():
+def test_two_brands_leftmost_overrides_existing():
     ctx = _ctx("Кроссовки Nike x Adidas коллаборация")
     target = _brand_target(["Nike", "Adidas", "HUGO"])
     out = _apply_brand_from_name([_brand_value("HUGO")], [target], ctx)
     v = _val_for(out)
-    assert v is not None and v.value == "HUGO"  # ambiguous → not overridden
+    assert v is not None and v.value == "Nike"  # leftmost overrides garbage
 
 
 # ── (e) multi-word brand ──────────────────────────────────────────────────────
@@ -232,8 +237,8 @@ def test_truncated_brand_dict_empty_skips():
     assert _val_for(out) is None
 
 
-def test_truncated_brand_ambiguous_from_dict_untouched():
-    """Two dict brands in name → ambiguous → field left untouched (anti-garbage)."""
+def test_truncated_brand_two_brands_leftmost_from_dict():
+    """Two dict brands in name → leftmost (Nike) wins via PART 2 tiebreak."""
     ctx = _ctx("Кроссовки Nike x Adidas коллаборация")
     target = _brand_target([])
     full_dict = ["Nike", "Adidas", "Puma"]
@@ -242,7 +247,7 @@ def test_truncated_brand_ambiguous_from_dict_untouched():
         brand_options_fn=lambda attr_id: full_dict,
     )
     v = _val_for(out)
-    assert v is not None and v.value == "HUGO"  # ambiguous → not overridden
+    assert v is not None and v.value == "Nike"  # leftmost wins
 
 
 def test_truncated_brand_multiword_from_dict():
@@ -349,13 +354,17 @@ def test_apparel_overwrite_garbage_after_noise_filter():
     assert v.value_id is None
 
 
-def test_apparel_two_real_brands_still_skip():
-    """(4) TWO genuinely distinct real brands remain after filter → SKIP (no fill)."""
+def test_apparel_two_real_brands_leftmost_wins():
+    """(4) TWO real brands remain after noise filter → leftmost (Nike) wins.
+
+    PART 2: after gender/type noise is dropped, a still-ambiguous pair is resolved
+    by leftmost occurrence in the title (the real brand leads the descriptive part).
+    """
     ctx = _ctx("Футболка мужская Nike x Adidas", category_path=["Одежда", "Футболки"])
     target = _brand_target(["Nike", "Adidas", "футболка", "Мужская"])
     out = _apply_brand_from_name([_brand_value("HUGO")], [target], ctx)
     v = _val_for(out)
-    assert v is not None and v.value == "HUGO"  # ambiguous → not overridden
+    assert v is not None and v.value == "Nike"  # leftmost after noise filter
 
 
 def test_apparel_regression_clean_single_token_fills():
@@ -382,6 +391,135 @@ def test_disambiguation_does_not_break_non_apparel_no_category_path():
     out = _apply_brand_from_name([], [target], ctx)
     v = _val_for(out)
     assert v is not None and v.value == "Champion"
+
+
+# ── PART 1: brand-source-guard (brand is IDENTITY, never guessed) ─────────────
+# vision/web_search/llm_knowledge/competitor_rag GUESS the brand (HUGO/LEGO/
+# Великобритания on Nike/Levi's/Adidas). Those candidates are DROPPED before
+# merge; authoritative cards/description/icecat are KEPT.
+
+from app.services.enrichment.pipeline import (
+    _apply_brand_source_guard,
+    _BRAND_GUESS_SOURCES,
+)
+
+
+@pytest.mark.parametrize(
+    "guess_src, garbage",
+    [
+        (Source.VISION, "HUGO"),
+        (Source.WEB_SEARCH, "LEGO"),
+        (Source.LLM_KNOWLEDGE, "Великобритания"),
+        (Source.COMPETITOR_RAG, "Reebok"),
+    ],
+)
+def test_guard_drops_brand_from_guess_sources(guess_src, garbage):
+    """(1) Brand value from a guess source → DROPPED (HUGO/LEGO/Великобритания gone)."""
+    target = _brand_target(["Nike", "The North Face"])
+    vals = [_brand_value(garbage, source=guess_src)]
+    out = _apply_brand_source_guard(vals, [target])
+    assert _val_for(out) is None  # guess-source brand dropped
+
+
+@pytest.mark.parametrize("card_src", [Source.OZON_CARD, Source.WB_CARD])
+def test_guard_keeps_brand_from_cards(card_src):
+    """(2) Brand value from ozon_card/wb_card → KEPT (authoritative identity)."""
+    target = _brand_target(["The North Face", "Nike"])
+    vals = [_brand_value("The North Face", source=card_src)]
+    out = _apply_brand_source_guard(vals, [target])
+    v = _val_for(out)
+    assert v is not None and v.value == "The North Face"
+    assert v.source == card_src
+
+
+@pytest.mark.parametrize(
+    "auth_src",
+    [
+        Source.DESCRIPTION,
+        Source.ICECAT,
+        Source.PDF_DATASHEET,
+    ],
+)
+def test_guard_keeps_brand_from_other_authoritative(auth_src):
+    """description/icecat/pdf_datasheet are authoritative → KEPT.
+
+    (tnved emits Source.LLM_KNOWLEDGE but never produces brand candidates, so it
+    is not a real source of brand values; no Source.TNVED enum exists.)
+    """
+    target = _brand_target(["Nike"])
+    out = _apply_brand_source_guard([_brand_value("Nike", source=auth_src)], [target])
+    v = _val_for(out)
+    assert v is not None and v.value == "Nike"
+
+
+def test_guard_set_membership():
+    """The guess set is exactly the four identity-unsafe sources."""
+    assert _BRAND_GUESS_SOURCES == {
+        Source.VISION, Source.WEB_SEARCH, Source.LLM_KNOWLEDGE, Source.COMPETITOR_RAG,
+    }
+
+
+def test_guard_leaves_non_brand_attrs_alone():
+    """Guard only touches brand targets; other attrs from guess sources pass."""
+    color = TargetAttribute(id=10, name="Цвет", type="enum", allowed_values=["Чёрный"])
+    cand = [AttributeValue(attribute_id=10, value="Чёрный", confidence=0.9,
+                           source=Source.WEB_SEARCH)]
+    out = _apply_brand_source_guard(cand, [color])
+    assert len(out) == 1 and out[0].value == "Чёрный"
+
+
+# ── PART 2: leftmost-occurrence recovery on real traced products ──────────────
+
+
+def test_part2_nike_sportswear_club_leftmost():
+    """(3) 'Футболка мужская Nike Sportswear Club' → Nike (leftmost after noise)."""
+    ctx = _ctx("Футболка мужская Nike Sportswear Club", category_path=["Одежда", "Футболки"])
+    target = _brand_target(["Nike", "Sportswear", "Club", "Мужская", "футболка"])
+    out = _apply_brand_from_name([], [target], ctx)
+    v = _val_for(out)
+    assert v is not None and v.value == "Nike"
+    assert v.evidence == "brand_from_name"
+
+
+def test_part2_levis_501_original():
+    """(4) 'Джинсы мужские Levis 501 Original' → Levis."""
+    ctx = _ctx("Джинсы мужские Levis 501 Original", category_path=["Одежда", "Джинсы"])
+    target = _brand_target(["Levis", "Original", "Мужские", "джинсы"])
+    out = _apply_brand_from_name([], [target], ctx)
+    v = _val_for(out)
+    assert v is not None and v.value == "Levis"
+
+
+def test_part2_adidas_ultraboost():
+    """(4) 'Кроссовки Adidas Ultraboost 22' → Adidas."""
+    ctx = _ctx("Кроссовки Adidas Ultraboost 22", category_path=["Обувь", "Кроссовки"])
+    target = _brand_target(["Adidas", "Ultraboost", "кроссовки"])
+    out = _apply_brand_from_name([], [target], ctx)
+    v = _val_for(out)
+    assert v is not None and v.value == "Adidas"
+
+
+def test_part2_wrangler_texas():
+    """(4) 'Джинсы Wrangler Texas' → Wrangler (Texas is a model, leftmost wins)."""
+    ctx = _ctx("Джинсы Wrangler Texas", category_path=["Одежда", "Джинсы"])
+    target = _brand_target(["Wrangler", "Texas", "джинсы"])
+    out = _apply_brand_from_name([], [target], ctx)
+    v = _val_for(out)
+    assert v is not None and v.value == "Wrangler"
+
+
+def test_part2_no_brand_only_guess_values_ends_empty():
+    """(5) No brand in title + only guess-source garbage → brand ends EMPTY (honest).
+
+    Combines PART 1 (guard drops the guess value) + PART 2 (no name match → no fill).
+    """
+    ctx = _ctx("Футболка мужская оверсайз чёрная", category_path=["Одежда", "Футболки"])
+    target = _brand_target(["Nike", "Adidas", "футболка", "Мужская"])
+    # guess-source garbage that the guard must drop, then brand-from-name finds nothing
+    guarded = _apply_brand_source_guard([_brand_value("LEGO", source=Source.WEB_SEARCH)],
+                                        [target])
+    out = _apply_brand_from_name(guarded, [target], ctx)
+    assert _val_for(out) is None  # empty, not garbage
 
 
 if __name__ == "__main__":
