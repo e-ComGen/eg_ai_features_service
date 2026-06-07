@@ -441,11 +441,51 @@ def _disambiguate_brand_matches(
     return [b for b, _span in real]
 
 
+def _resolve_brand_value_id(
+    brand: str,
+    attr_id: int,
+    brand_id_fn: Optional[Callable[[int], dict[str, int]]],
+) -> Optional[int]:
+    """Словарный value_id выбранного бренда ТОЧНЫМ матчем, иначе None.
+
+    Берёт {value:id}-карту словаря через brand_id_fn(attr_id) и ищет brand
+    exact-ом (case + ё/е-инсенситивно). Без fuzzy/частичных совпадений — owner
+    чувствителен к неверным id, поэтому привязываем id ТОЛЬКО при точном
+    совпадении строки бренда со словарным ключом. brand_id_fn недоступен/упал/
+    нет ключа → None (не выдумываем id).
+    """
+    if brand_id_fn is None:
+        return None
+    try:
+        pairs = brand_id_fn(attr_id) or {}
+    except Exception as exc:
+        logger.warning(
+            "[Pipeline] brand-from-name: {value:id}-карта брендов для attr %s "
+            "недоступна: %s", attr_id, exc,
+        )
+        return None
+    if not pairs:
+        return None
+    # Exact lookup: сперва как есть, затем по нормализованному ключу (ё→е, lower).
+    if brand in pairs:
+        return pairs[brand]
+
+    def _norm(s: str) -> str:
+        return s.lower().replace("ё", "е")
+
+    target = _norm(brand)
+    for val, vid in pairs.items():
+        if _norm(val) == target:
+            return vid
+    return None
+
+
 def _apply_brand_from_name(
     merged: list[AttributeValue],
     targets: list[TargetAttribute],
     context: ExtractionContext,
     brand_options_fn: Optional[Callable[[int], list[str]]] = None,
+    brand_id_fn: Optional[Callable[[int], dict[str, int]]] = None,
 ) -> list[AttributeValue]:
     """POST-merge brand-from-name резолвер для поля «Бренд» (генеральный).
 
@@ -466,8 +506,16 @@ def _apply_brand_from_name(
     Если оба источника пусты — таргет пропускается (нечего матчить).
 
     НИКОГДА не пишет бренд, отсутствующий И в имени, И в списке брендов: B всегда
-    выбирается из списка И присутствует в имени. value_id заполняется стратегией
-    позже (resolve_value_ids в _finalize), как для прочих значений.
+    выбирается из списка И присутствует в имени.
+
+    value_id: «Бренд» (id 31) — часто truncated enum (>100k значений), статический
+    словарь держит лишь первые 5000, поэтому sync resolve_value_ids в _finalize
+    нередко НЕ находит id выбранного бренда → value_id=None → бренд дропается на
+    required-enum (drain C). Чтобы этого избежать, прямо здесь привязываем словарный
+    value_id для выбранного B через brand_id_fn (та же {value:id}-карта словаря,
+    что отдаёт стратегия) ТОЧНЫМ матчем (case/ё-insensitive, без fuzzy — owner
+    чувствителен к неверным id). Если id не резолвится — оставляем None (не
+    выдумываем), последующий resolve_value_ids ещё раз попробует.
     """
     # brand-таргеты (allowed_values НЕ требуется — для truncated «Бренд» он пуст).
     brand_targets: dict[int, TargetAttribute] = {}
@@ -487,6 +535,8 @@ def _apply_brand_from_name(
 
     # Какое каноническое B подобрать для каждого brand-таргета (ровно один матч).
     resolved_brand: dict[int, str] = {}
+    # Привязанный словарный value_id выбранного бренда (exact-матч), если нашёлся.
+    resolved_brand_id: dict[int, int] = {}
     for attr_id, t in brand_targets.items():
         # Полный список брендов: target.allowed_values (мелкий enum) ИЛИ словарь.
         options = list(t.allowed_values or [])
@@ -507,7 +557,16 @@ def _apply_brand_from_name(
         # Мужская, NORTH ⊂ The North Face). Дедуп по норм-форме внутри.
         real = _disambiguate_brand_matches(matches, name_tokens, type_words)
         if len(real) == 1:
-            resolved_brand[attr_id] = real[0]
+            chosen = real[0]
+            resolved_brand[attr_id] = chosen
+            # Привязка словарного value_id выбранного бренда ТОЧНЫМ матчем. «Бренд» —
+            # truncated enum: sync resolve_value_ids в _finalize часто не находит id
+            # (нет в первых 5000 словаря) → бренд дропается. Берём id из той же
+            # {value:id}-карты словаря, что и список опций. Без fuzzy — owner
+            # чувствителен к неверным id; только exact (case/ё-insensitive).
+            vid = _resolve_brand_value_id(chosen, attr_id, brand_id_fn)
+            if vid is not None:
+                resolved_brand_id[attr_id] = vid
         elif len(real) > 1:
             logger.info(
                 "[Pipeline] brand-from-name: %d брендов в имени '%s' для attr %s — "
@@ -536,7 +595,10 @@ def _apply_brand_from_name(
         )
         out.append(v.model_copy(update={
             "value": b,
-            "value_id": None,        # пере-резолвится стратегией в _finalize
+            # Словарный value_id выбранного бренда (exact). None → пере-резолвится
+            # стратегией в _finalize. Привязка здесь спасает truncated «Бренд» от
+            # drain-C дропа (sync resolve_value_ids не находит id вне первых 5000).
+            "value_id": resolved_brand_id.get(v.attribute_id),
             "confidence": 0.95,
             "source": Source.DESCRIPTION,
             "evidence": _BRAND_FROM_NAME_EVIDENCE,
@@ -553,6 +615,7 @@ def _apply_brand_from_name(
         out.append(AttributeValue(
             attribute_id=attr_id,
             value=b,
+            value_id=resolved_brand_id.get(attr_id),  # exact словарный id, иначе None
             confidence=0.95,
             source=Source.DESCRIPTION,
             evidence=_BRAND_FROM_NAME_EVIDENCE,
@@ -1242,6 +1305,7 @@ class PipelineOrchestrator:
         merged = _apply_brand_from_name(
             merged, targets, context,
             brand_options_fn=lambda attr_id: self._strategy.brand_value_options(attr_id, context),
+            brand_id_fn=lambda attr_id: self._strategy.brand_value_id_options(attr_id, context),
         )
 
         # Strategy post-processing FIRST (добавляет CategoryDefaults + cross-fills с source=DESCRIPTION).

@@ -279,6 +279,100 @@ def test_allowed_values_preferred_over_dict_when_present():
     assert v is not None and v.value == "Champion"
 
 
+# ── value_id attach (drain-C fix) ─────────────────────────────────────────────
+
+def test_brand_from_name_attaches_value_id_unfilled():
+    """FIX: brand filled from name carries the dict value_id (not None).
+
+    The truncated «Бренд» enum dropped brand-from-name values because value_id
+    stayed None (drain C). brand_id_fn supplies {brand: id}; on an EXACT match the
+    emitted AttributeValue MUST carry both value='Nike' AND value_id=12345.
+    """
+    ctx = _ctx("Кроссовки Nike Air мужские")
+    target = _brand_target([])  # truncated enum
+    full_dict = ["Nike", "Adidas", "Puma"]
+    id_map = {"Nike": 12345, "Adidas": 999}
+    out = _apply_brand_from_name(
+        [], [target], ctx,
+        brand_options_fn=lambda attr_id: full_dict,
+        brand_id_fn=lambda attr_id: id_map,
+    )
+    v = _val_for(out)
+    assert v is not None and v.value == "Nike"
+    assert v.value_id == 12345  # survives drain-C (was None before the fix)
+
+
+def test_brand_from_name_attaches_value_id_overwrite():
+    """Overriding a garbage brand also attaches the chosen brand's dict value_id."""
+    ctx = _ctx("Джинсы мужские Levi's 501")
+    target = _brand_target([])
+    full_dict = ["HUGO", "Levi's", "Wrangler"]
+    id_map = {"Levi's": 555, "HUGO": 111}
+    out = _apply_brand_from_name(
+        [_brand_value("HUGO")], [target], ctx,
+        brand_options_fn=lambda attr_id: full_dict,
+        brand_id_fn=lambda attr_id: id_map,
+    )
+    v = _val_for(out)
+    assert v is not None and v.value == "Levi's"
+    assert v.value_id == 555
+
+
+def test_brand_value_id_exact_only_no_fuzzy():
+    """No EXACT key in the id-map → value_id stays None (no fuzzy/invented ids).
+
+    Owner is sensitive to wrong ids: a brand present in the options list but absent
+    from the {brand: id} map must fill the string with value_id=None, not guess.
+    """
+    ctx = _ctx("Кроссовки Nike Air")
+    target = _brand_target([])
+    full_dict = ["Nike", "Adidas"]
+    id_map = {"Adidas": 999}  # Nike intentionally missing
+    out = _apply_brand_from_name(
+        [], [target], ctx,
+        brand_options_fn=lambda attr_id: full_dict,
+        brand_id_fn=lambda attr_id: id_map,
+    )
+    v = _val_for(out)
+    assert v is not None and v.value == "Nike"
+    assert v.value_id is None
+
+
+def test_brand_value_id_case_yo_insensitive():
+    """Exact match is case + ё/е insensitive (dict key casing differs from name)."""
+    ctx = _ctx("Пуховик Тёма зимний")
+    target = _brand_target([])
+    full_dict = ["Тема", "Other"]
+    id_map = {"Тема": 7}  # name has ё, dict key has е
+    out = _apply_brand_from_name(
+        [], [target], ctx,
+        brand_options_fn=lambda attr_id: full_dict,
+        brand_id_fn=lambda attr_id: id_map,
+    )
+    v = _val_for(out)
+    assert v is not None and v.value == "Тема"
+    assert v.value_id == 7
+
+
+def test_brand_id_fn_failure_does_not_crash():
+    """brand_id_fn raising → resolver still fills the brand, value_id None."""
+    ctx = _ctx("Кроссовки Nike Air")
+    target = _brand_target([])
+    full_dict = ["Nike"]
+
+    def _boom(_attr_id):
+        raise RuntimeError("dict unavailable")
+
+    out = _apply_brand_from_name(
+        [], [target], ctx,
+        brand_options_fn=lambda attr_id: full_dict,
+        brand_id_fn=_boom,
+    )
+    v = _val_for(out)
+    assert v is not None and v.value == "Nike"
+    assert v.value_id is None
+
+
 def test_detect_by_id_when_name_differs():
     """Target with id==31 but odd name still detected as brand target."""
     ctx = _ctx("Толстовка Champion Reverse Weave")

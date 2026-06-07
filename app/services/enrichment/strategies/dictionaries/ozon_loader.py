@@ -384,6 +384,34 @@ def get_attr_value_options(
     return [str(e.get("value", "")) for e in values_list if e.get("value")]
 
 
+def get_attr_value_pairs(
+    cat_id: int,
+    type_id: int,
+    attribute_id: int,
+) -> dict[str, int]:
+    """Вернуть {value-строка: dict-id} для характеристики (тот же источник, что и
+    get_attr_value_options, но СОХРАНЯЕТ id).
+
+    Нужен brand-from-name резолверу: он матчит бренд из имени против СТРОК словаря,
+    а затем должен привязать его словарный value_id ТОЧНО (без fuzzy) — owner
+    чувствителен к неверным id. Возвращает {} если характеристика/значения не
+    найдены. Ключи — ровно как в словаре (case/ё сохранены); сравнение exact-ом
+    делает вызывающая сторона.
+    """
+    chars = get_ozon_characteristics_for_type(cat_id, type_id)
+    char = next((c for c in chars if c.get("id") == attribute_id), None)
+    if not char:
+        return {}
+    values_list = char.get("values") or []
+    pairs: dict[str, int] = {}
+    for e in values_list:
+        val = str(e.get("value", ""))
+        vid = e.get("id")
+        if val and vid is not None:
+            pairs[val] = vid
+    return pairs
+
+
 def is_truncated(cat_id: int, type_id: int, attribute_id: int) -> bool:
     """Return True if the cached values for this attribute were truncated at 5000.
 

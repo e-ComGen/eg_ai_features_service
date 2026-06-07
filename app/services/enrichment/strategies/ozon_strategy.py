@@ -15,6 +15,7 @@ from app.services.enrichment.strategies.dictionaries.ozon_loader import (
     get_ozon_characteristics_for_category,
     get_ozon_category_name,
     get_attr_value_options,
+    get_attr_value_pairs,
     resolve_value_id,
     is_truncated,
 )
@@ -613,6 +614,24 @@ class OzonStrategy(MarketplaceStrategy):
         if type_id is None:
             return []
         return get_attr_value_options(context.category_id, type_id, attribute_id)
+
+    def brand_value_id_options(
+        self,
+        attribute_id: int,
+        context: ExtractionContext,
+    ) -> dict[str, int]:
+        """Карта {бренд: словарный value_id} для (cat_id, type_id, attribute_id).
+
+        brand-from-name резолвер выбрал бренд из имени, сматчив его против СТРОК
+        brand_value_options; здесь даём ему те же словарные пары с id, чтобы
+        привязать value_id точно (exact). Бренд — часто truncated enum, поэтому
+        sync resolve_value_id мог не найти id в статическом словаре — а здесь id
+        берётся ровно для того entry, который уже в словаре есть.
+        """
+        type_id = context.ozon_type_id
+        if type_id is None:
+            return {}
+        return get_attr_value_pairs(context.category_id, type_id, attribute_id)
 
     def resolve_value_ids(
         self,

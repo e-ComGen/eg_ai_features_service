@@ -111,6 +111,22 @@ class MarketplaceStrategy(ABC):
         """
         return []
 
+    def brand_value_id_options(
+        self,
+        attribute_id: int,
+        context: "ExtractionContext",
+    ) -> dict[str, int]:
+        """Карта {бренд-строка: словарный value_id} для бренд-характеристики.
+
+        Нужна brand-from-name резолверу: выбрав бренд из имени, он привязывает его
+        словарный value_id ТОЧНО (exact, без fuzzy) — иначе бренд уходит с
+        value_id=None и дропается на required-enum. Тот же словарный источник, что
+        и brand_value_options, но сохраняет id.
+
+        Default: {} (no-op для не-словарных стратегий). Ozon переопределяет.
+        """
+        return {}
+
     async def llm_resolve_tail(
         self,
         values: list[AttributeValue],
