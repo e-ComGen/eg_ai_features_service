@@ -16,6 +16,8 @@ from app.services.enrichment.strategies.dictionaries.ozon_loader import (
     get_ozon_category_name,
     get_attr_value_options,
     get_attr_value_pairs,
+    get_attr_value_options_any_type,
+    get_attr_value_pairs_any_type,
     resolve_value_id,
     is_truncated,
 )
@@ -609,11 +611,20 @@ class OzonStrategy(MarketplaceStrategy):
         Бренд — огромный (часто truncated) enum, его allowed_values НЕ попадают в
         target.allowed_values. brand-from-name резолверу нужен ПОЛНЫЙ список — его
         и отдаёт get_attr_value_options (читает char['values'] из словаря).
+
+        Когда ozon_type_id недоступен в контексте — перебирает ВСЕ type-записи
+        категории через get_attr_value_options_any_type и возвращает значения из
+        первой, у которой values непусты. get_ozon_characteristics_for_category
+        НЕ подходит: она берёт первый type-entry, у которого values для «Бренд»
+        могут быть пусты (values_truncated=True, значения не загружены).
+        Без корректного fallback brand-from-name получает пустой список и не
+        заполняет «Бренд» ни для одного реального продукта (drain B).
         """
         type_id = context.ozon_type_id
-        if type_id is None:
-            return []
-        return get_attr_value_options(context.category_id, type_id, attribute_id)
+        if type_id is not None:
+            return get_attr_value_options(context.category_id, type_id, attribute_id)
+        # Fallback: ozon_type_id неизвестен — перебираем все type-entries.
+        return get_attr_value_options_any_type(context.category_id, attribute_id)
 
     def brand_value_id_options(
         self,
@@ -627,11 +638,16 @@ class OzonStrategy(MarketplaceStrategy):
         привязать value_id точно (exact). Бренд — часто truncated enum, поэтому
         sync resolve_value_id мог не найти id в статическом словаре — а здесь id
         берётся ровно для того entry, который уже в словаре есть.
+
+        Когда ozon_type_id недоступен — перебирает ВСЕ type-записи через
+        get_attr_value_pairs_any_type (аналогично brand_value_options).
+        Без корректного fallback value_id остаётся None → drain C.
         """
         type_id = context.ozon_type_id
-        if type_id is None:
-            return {}
-        return get_attr_value_pairs(context.category_id, type_id, attribute_id)
+        if type_id is not None:
+            return get_attr_value_pairs(context.category_id, type_id, attribute_id)
+        # Fallback: ozon_type_id неизвестен — перебираем все type-entries.
+        return get_attr_value_pairs_any_type(context.category_id, attribute_id)
 
     def resolve_value_ids(
         self,

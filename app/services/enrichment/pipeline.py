@@ -288,6 +288,23 @@ def _brand_norm_tokens(text: str) -> list[str]:
     return _matcher_token_re.findall(text.lower().replace("ё", "е"))
 
 
+# RE для удаления апострофов и дефисов ВНУТРИ слова перед токенизацией.
+# Нужен для «Levi's»→'levis', «Dri-FIT»→'drifit' canon-формы.
+_punct_collapse_re = re.compile(r"['’\-]")
+
+
+def _brand_canon_tokens(text: str) -> list[str]:
+    """Canon-токены: апостроф/дефис убираются ПЕРЕД токенизацией.
+
+    «Levi's» → 'levis' → ['levis'] — та же форма, что и title-токен 'Levis'.
+    «Dri-FIT» → 'Drifit' → ['drifit'].
+    Используется как ЗАПАСНОЕ сравнение в _brand_in_name/_brand_match_span:
+    если нормальные токены не совпали — пробуем canon-форму обеих сторон.
+    """
+    stripped = _punct_collapse_re.sub("", text)
+    return _brand_norm_tokens(stripped)
+
+
 def _brand_in_name(brand: str, name_tokens: list[str]) -> bool:
     """True если бренд присутствует в имени как непрерывная цепочка токенов.
 
@@ -295,6 +312,10 @@ def _brand_in_name(brand: str, name_tokens: list[str]) -> bool:
     вательность токенов имени — без ложняков на разбросанных совпадениях.
     Бренд короче _BRAND_MIN_LEN символов (после нормализации, склейка токенов)
     игнорируется.
+
+    ДОПОЛНИТЕЛЬНО: если нормальные токены не совпали — пробуем canon-форму
+    (апостроф/дефис убраны перед токенизацией), чтобы «Levi's» ↔ «Levis»
+    совпадали: _brand_canon_tokens('Levi's')=['levis'] vs name_token 'levis' ✓.
     """
     b_tokens = _brand_norm_tokens(brand)
     if not b_tokens:
@@ -305,6 +326,16 @@ def _brand_in_name(brand: str, name_tokens: list[str]) -> bool:
     for i in range(len(name_tokens) - n + 1):
         if name_tokens[i:i + n] == b_tokens:
             return True
+    # Canon-fallback: апостроф/дефис-инсенситивный матч.
+    # «Levi's»→['levis'] vs name_token 'levis'. Длина canon-токенов МОЖЕТ
+    # отличаться от нормальных → ищем canon-бренд в canon-имени.
+    b_canon = _brand_canon_tokens(brand)
+    if b_canon != b_tokens:
+        name_canon = [_punct_collapse_re.sub("", t) for t in name_tokens]
+        nc = len(b_canon)
+        for i in range(len(name_canon) - nc + 1):
+            if name_canon[i:i + nc] == b_canon:
+                return True
     return False
 
 
@@ -315,6 +346,9 @@ def _brand_match_span(brand: str, name_tokens: list[str]) -> Optional[tuple[int,
     containment-collapse (вложенные матчи: «NORTH» ⊂ «The North Face»,
     «Original» ⊂ «Adidas Originals» дают пересекающиеся/вложенные спаны).
     Бренд < _BRAND_MIN_LEN символов игнорируется (как в _brand_in_name).
+
+    ДОПОЛНИТЕЛЬНО: canon-fallback (апостроф/дефис-инсенситивный матч).
+    Позиция спана возвращается ВСЕГДА в координатах ИСХОДНЫХ name_tokens.
     """
     b_tokens = _brand_norm_tokens(brand)
     if not b_tokens:
@@ -325,6 +359,19 @@ def _brand_match_span(brand: str, name_tokens: list[str]) -> Optional[tuple[int,
     for i in range(len(name_tokens) - n + 1):
         if name_tokens[i:i + n] == b_tokens:
             return (i, i + n)
+    # Canon-fallback: апостроф/дефис-инсенситивный матч.
+    b_canon = _brand_canon_tokens(brand)
+    if b_canon != b_tokens:
+        name_canon = [_punct_collapse_re.sub("", t) for t in name_tokens]
+        nc = len(b_canon)
+        for i in range(len(name_canon) - nc + 1):
+            if name_canon[i:i + nc] == b_canon:
+                # Возвращаем спан в исходных координатах: canon-токены могут
+                # меньше нормальных (слияние апостроф-частей), поэтому конец
+                # спана = start + len(name_tokens), но мы матчим nc canon-токенов
+                # — каждый соответствует ОДНОМУ исходному name_token (apострофы
+                # убираются из исходного токена, не склеивают два токена). OK.
+                return (i, i + nc)
     return None
 
 
@@ -365,6 +412,49 @@ def _is_type_noise_token(token: str, type_words: set[str]) -> bool:
     if len(norm) != 1:
         return False
     return norm[0][:5] in type_words
+
+
+# Окончания русских КАЧЕСТВЕННЫХ/ОТНОСИТЕЛЬНЫХ прилагательных (общие падежные формы).
+# Используется для дропа шумовых «брендов» вида «Спортивные», «Чёрные», «Прямые».
+# Список ГЕНЕРАЛЬНЫЙ (морфология, не хардкод слов): прилагательные во всех падежах/
+# числах/родах рус. языка оканчиваются на эти суффиксы. Наречия/существительные
+# редко на них заканчиваются — ложняки минимальны.
+_RU_ADJ_ENDINGS = (
+    "ые", "ие", "ая", "яя", "ое", "ее",
+    "ый", "ий", "ой",
+    "ому", "ему",
+    "ыми", "ими",
+    "ых", "их",
+    "ую", "юю",
+    "ого", "его",
+    "ым", "им",
+)
+
+
+def _is_adjective_noise_token(token: str) -> bool:
+    """True если ОДИНОЧНЫЙ токен — русское прилагательное по морфологии → шум.
+
+    Генеральное правило (не хардкод слов): кириллический токен длиной ≥6 символов,
+    оканчивающийся на типичное русское падежное/родовое окончание прилагательного
+    (-ые/-ие/-ая/-яя/-ое/-ее/-ый/-ий/-ой/-ому/-ыми/-ых и т.д.).
+    Латинские токены — НИКОГДА не прилагательные (бренды Nike/Adidas/Dri-FIT латинские).
+    Минимальная длина 6 уберегает от ложняков на коротких словах («дне», «тые»).
+    Примеры:
+      «спортивные» → True  (шум-описатель, не бренд)
+      «чёрные»     → True
+      «прямые»     → True
+      «nike»       → False (латиница)
+      «wrangler»   → False (латиница)
+      «адидас»     → False (нет прил. окончания)
+    """
+    # Только кириллические токены могут быть прилагательными рус. языка
+    if not token or not all(c in "абвгдеёжзийклмнопрстуфхцчшщъыьэюя" for c in token.lower()):
+        return False
+    # Нормализуем ё→е перед проверкой окончаний
+    t = token.lower().replace("ё", "е")
+    if len(t) < 6:
+        return False
+    return t.endswith(_RU_ADJ_ENDINGS)
 
 
 def _disambiguate_brand_matches(
@@ -416,14 +506,32 @@ def _disambiguate_brand_matches(
         if not contained:
             kept.append((brand, (s, e)))
 
-    # --- Шаг 2: дроп гендер/тип-шума (только одиночные токены) ---
+    # --- Шаг 2: дроп гендер/тип/прилагательного-шума (только одиночные токены) ---
+    # Прилагательное-шум: «Спортивные», «Чёрные», «Прямые» — реальные enum-бренды
+    # в «Бренд в одежде», но НЕ торговые марки. Генеральное морфо-правило:
+    # кириллический токен с типичным рус. прилагательным окончанием → шум.
+    # Bias to SAFETY: если после дропа НЕ осталось НИ ОДНОГО НЕ-прилагательного
+    # матча — возвращаем пустой список (empty > wrong).
     real: list[tuple[str, tuple[int, int]]] = []
+    adj_only_kept: list[tuple[str, tuple[int, int]]] = []  # только прилагательные
     for brand, (s, e) in kept:
         if e - s == 1:
             tok = name_tokens[s]
             if _is_gender_noise_token(tok) or _is_type_noise_token(tok, type_words):
                 continue
+            if _is_adjective_noise_token(tok):
+                adj_only_kept.append((brand, (s, e)))
+                continue
         real.append((brand, (s, e)))
+    # Safety: если real пуст, но adj_only_kept не пуст → НЕ возвращаем прилагательное.
+    # empty better than wrong descriptor adjective as brand.
+    if not real and adj_only_kept:
+        logger.info(
+            "[Pipeline] brand-from-name: все уцелевшие матчи — прилагательные %s "
+            "→ пустой результат (empty > wrong descriptor)",
+            [b for b, _ in adj_only_kept],
+        )
+        return []
 
     # --- Шаг 3: leftmost-tiebreak при ≥2 уцелевших «настоящих» брендах ---
     # Заголовок RU-маркетплейса: «<Тип> <пол> <БРЕНД> <модель>...» — настоящий бренд

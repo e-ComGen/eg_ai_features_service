@@ -412,6 +412,62 @@ def get_attr_value_pairs(
     return pairs
 
 
+def get_attr_value_options_any_type(
+    cat_id: int,
+    attribute_id: int,
+) -> list[str]:
+    """Вернуть список строковых allowed-значений для attr без знания type_id.
+
+    Перебирает ВСЕ type-записи категории и возвращает значения из ПЕРВОЙ записи,
+    у которой для attribute_id есть непустой values-список. Используется как
+    fallback когда ozon_type_id недоступен в контексте — например, для
+    brand_value_options при ozon_type_id=None.
+
+    Возвращает [] если ни одна запись не содержит непустых значений.
+    """
+    entries = get_ozon_entries_for_category(cat_id)
+    for entry in entries:
+        chars = entry.get("characteristics", [])
+        char = next((c for c in chars if c.get("id") == attribute_id), None)
+        if not char:
+            continue
+        values_list = char.get("values") or []
+        if values_list:
+            return [str(e.get("value", "")) for e in values_list if e.get("value")]
+    return []
+
+
+def get_attr_value_pairs_any_type(
+    cat_id: int,
+    attribute_id: int,
+) -> dict[str, int]:
+    """Вернуть {value-строка: dict-id} для attr без знания type_id.
+
+    Перебирает ВСЕ type-записи категории и возвращает пары из ПЕРВОЙ записи,
+    у которой для attribute_id есть непустой values-список. Аналог
+    get_attr_value_options_any_type, но сохраняет id.
+
+    Используется как fallback в brand_value_id_options при ozon_type_id=None.
+    """
+    entries = get_ozon_entries_for_category(cat_id)
+    for entry in entries:
+        chars = entry.get("characteristics", [])
+        char = next((c for c in chars if c.get("id") == attribute_id), None)
+        if not char:
+            continue
+        values_list = char.get("values") or []
+        if not values_list:
+            continue
+        pairs: dict[str, int] = {}
+        for e in values_list:
+            val = str(e.get("value", ""))
+            vid = e.get("id")
+            if val and vid is not None:
+                pairs[val] = vid
+        return pairs
+    return {}
+
+
 def is_truncated(cat_id: int, type_id: int, attribute_id: int) -> bool:
     """Return True if the cached values for this attribute were truncated at 5000.
 

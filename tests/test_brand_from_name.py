@@ -616,5 +616,77 @@ def test_part2_no_brand_only_guess_values_ends_empty():
     assert _val_for(out) is None  # empty, not garbage
 
 
+# ── REGRESSION FIX 1: apostrophe-insensitive brand matching (Levi's ↔ Levis) ──
+# "Levi's" in dict splits to ['levi','s'] which never matched title token 'levis'.
+# Canon-fallback: strip apostrophes before tokenising → both collapse to 'levis'.
+
+
+def test_levis_apostrophe_insensitive_match_unfilled():
+    """FIX1: 'Levis' in title matches dict brand 'Levi's' (apostrophe-insensitive)."""
+    ctx = _ctx("Джинсы мужские Levis 501 Original", category_path=["Одежда", "Джинсы"])
+    target = _brand_target([], name="Бренд")
+    id_map = {"Levi's": 971812807, "ORIGINAL": 971939550}
+    out = _apply_brand_from_name(
+        [_brand_value("ORIGINAL")],
+        [target],
+        ctx,
+        brand_options_fn=lambda aid: ["Levi's", "ORIGINAL", "Мужские", "джинсы"],
+        brand_id_fn=lambda aid: id_map,
+    )
+    v = _val_for(out)
+    assert v is not None and v.value == "Levi's", f"expected Levi's, got {v}"
+    assert v.value_id == 971812807, f"expected vid 971812807, got {v.value_id}"
+    assert v.evidence == "brand_from_name"
+
+
+def test_levis_apostrophe_insensitive_value_id_correct():
+    """FIX1: value_id must be 971812807 (Levi's), NOT 971939550 (ORIGINAL)."""
+    ctx = _ctx("Джинсы мужские Levis 501 Original", category_path=["Одежда", "Джинсы"])
+    target = _brand_target(["Levi's", "ORIGINAL"])
+    id_map = {"Levi's": 971812807, "ORIGINAL": 971939550}
+    out = _apply_brand_from_name(
+        [], [target], ctx, brand_id_fn=lambda aid: id_map
+    )
+    v = _val_for(out)
+    assert v is not None and v.value == "Levi's"
+    assert v.value_id == 971812807
+
+
+# ── REGRESSION FIX 2: Russian descriptor-adjective masquerading as brand ──────
+# "Спортивные" is a real dict brand token sitting before "Nike" in the title.
+# The adjective morphology filter drops single Cyrillic tokens with adj. endings.
+
+
+def test_adjective_noise_dropped_nike_wins():
+    """FIX2: 'Спортивные' (adj ending -ые) dropped → Nike wins correctly."""
+    ctx = _ctx("Шорты мужские спортивные Nike Dri-FIT", category_path=["Одежда", "Шорты"])
+    target = _brand_target([], name="Бренд")
+    id_map = {"Nike": 971812808, "Спортивные": 971939550}
+    out = _apply_brand_from_name(
+        [_brand_value("Спортивные")],
+        [target],
+        ctx,
+        brand_options_fn=lambda aid: ["Спортивные", "Nike", "Мужские", "шорты"],
+        brand_id_fn=lambda aid: id_map,
+    )
+    v = _val_for(out)
+    assert v is not None and v.value == "Nike", f"expected Nike, got {v}"
+    assert v.value_id == 971812808
+    assert v.evidence == "brand_from_name"
+
+
+def test_all_adjective_title_returns_empty():
+    """FIX2 safety: if ONLY adjective-looking tokens match, return EMPTY not garbage.
+
+    Title: 'Чёрные спортивные прямые' — all three are adjectives by morphology.
+    No real brand → brand field must stay EMPTY (empty > wrong descriptor).
+    """
+    ctx = _ctx("Чёрные спортивные прямые", category_path=["Одежда", "Джинсы"])
+    # All three happen to be in the brand dict as fake brands (common in the enum)
+    target = _brand_target(["Чёрные", "Спортивные", "Прямые"])
+    out = _apply_brand_from_name([], [target], ctx)
+    assert _val_for(out) is None, "all-adjective title must yield empty, not a descriptor adjective"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])
