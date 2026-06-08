@@ -1,3 +1,4 @@
+import atexit
 import pickle
 import os
 import re
@@ -5,6 +6,9 @@ import numpy as np
 from rapidfuzz import fuzz
 from sentence_transformers import SentenceTransformer, util
 import torch
+
+# Regex for Fix 3: pure numeric codes (6–14 digits), e.g. TNVED codes
+_NUMERIC_CODE_RE = re.compile(r"^\d{6,14}$")
 
 # Морфология (RU): прилагательное-кандидат → существительное-основа словаря Ozon.
 # Лемматизация + сопоставление общей основы (корня), без хардкода словарей синонимов.
@@ -34,6 +38,10 @@ class MatcherService:
         # Файл для хранения векторов (замена Redis)
         self.vector_file = 'vectors.pkl'
         self.vector_cache = self._load_vectors()
+        # Fix 1: count new entries since last disk flush; persist every N encodes
+        self._new_entries_since_save = 0
+        self._SAVE_INTERVAL = 500
+        atexit.register(self._save_vectors)
 
         # Кэш лемм по строкам и кэш лемматизированных allowed-списков по id(list).
         # Критично для перфоманса: один и тот же enum не лемматизируем повторно.
@@ -70,8 +78,11 @@ class MatcherService:
         # 3. Сохраняем в память
         self.vector_cache[text] = vector
 
-        # 4. Сохраняем на диск (для надежности можно делать это реже, но пока пишем сразу)
-        self._save_vectors()
+        # Fix 1: flush to disk every SAVE_INTERVAL new entries (not on every encode)
+        self._new_entries_since_save += 1
+        if self._new_entries_since_save >= self._SAVE_INTERVAL:
+            self._save_vectors()
+            self._new_entries_since_save = 0
 
         return vector
 
@@ -183,6 +194,13 @@ class MatcherService:
         if target_clean in ['unknown', 'n/a', 'not specified', 'none', 'null']:
             return None
 
+        # Fix 3: short-circuit exact numeric-code prefix match (TNVED and similar)
+        # e.g. target "6204620000" vs options like "6204620000 - Брюки женские"
+        if _NUMERIC_CODE_RE.match(target_clean):
+            for opt in options:
+                if opt.startswith(target_clean + " ") or opt.split()[0] == target_clean:
+                    return opt
+
         is_ram_debug = "8gb" in target_clean or "8 gb" in target_clean
 
         target_nospace = target_clean.replace(" ", "").replace("-", "")
@@ -214,7 +232,20 @@ class MatcherService:
 
         # --- ЭТАП 2: Вектора (Смысл) ---
         target_vec = self.get_embedding(target)
-        option_vecs = [self.get_embedding(opt) for opt in options]
+
+        # Fix 2: batch-encode only options not yet in vector_cache
+        missing = [opt for opt in options if opt not in self.vector_cache]
+        if missing:
+            batch_vecs = self.model.encode(missing, convert_to_numpy=True, batch_size=256)
+            for text, vec in zip(missing, batch_vecs):
+                self.vector_cache[text] = vec
+            # Periodic flush accounting
+            self._new_entries_since_save += len(missing)
+            if self._new_entries_since_save >= self._SAVE_INTERVAL:
+                self._save_vectors()
+                self._new_entries_since_save = 0
+
+        option_vecs = [self.vector_cache[opt] for opt in options]
 
         cosine_scores = util.cos_sim(target_vec, np.array(option_vecs))[0]
         best_vec_idx = int(np.argmax(cosine_scores))
