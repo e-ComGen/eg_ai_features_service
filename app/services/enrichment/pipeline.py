@@ -37,6 +37,10 @@ from app.services.enrichment.sources.ozon_card_source import (
     _extract_gender_signal,
     _is_gender_target_name,
 )
+# Лемматизатор тип-слова (pymorphy3, морфология опциональна) — переиспользуем тот же
+# helper, что и wb_card_source._target_type_lemma/_card_subj_lemmas, чтобы
+# «Футболки»↔«Футболка» сходились без новой зависимости и без своей морфологии.
+from app.services.enrichment.sources.wb_card_source import _lemma as _type_lemma
 from app.services.enrichment.intelligence import LlmClassifier, CostPredictor
 from app.services.providers.factory import get_main_manager
 from app.services.enrichment.confidence_aware_judge import ConfidenceAwareJudgeWrapper
@@ -728,6 +732,111 @@ def _apply_brand_from_name(
             source=Source.DESCRIPTION,
             evidence=_BRAND_FROM_NAME_EVIDENCE,
         ))
+    return out
+
+
+_TYPE_FROM_CATEGORY_EVIDENCE = "type_from_category"
+
+
+def _apply_type_from_category(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+    context: ExtractionContext,
+    value_id_fn: Optional[Callable[[int, str], Optional[int]]] = None,
+) -> list[AttributeValue]:
+    """POST-merge guard: заполняет ПУСТОЙ обязательный enum из category-leaf (генеральный).
+
+    Зеркало _apply_brand_from_name, но для «типа товара»: category leaf — это И ЕСТЬ
+    тип товара (leaf «Футболки» → enum-значение «Футболка»). Без хардкода поля «Тип»
+    или имени категории — срабатывает только по ТОЧНОМУ enum-матчу:
+
+    Для КАЖДОГО REQUIRED enum-таргета (allowed_values непуст), который сейчас ПУСТ или
+    нерезолвнут (value_id=None):
+      • нормализуем category-leaf = context.category_path[-1] (lower+strip+лемма через
+        тот же _lemma/pymorphy3, что и wb_card_source — без новой зависимости);
+      • если нормализованный leaf ТОЧНО (case + морфология, БЕЗ fuzzy) совпадает ровно с
+        одной из allowed-опций таргета — заполняем таргет этой опцией (строка как в
+        словаре) + её value_id (через value_id_fn тем же путём, что brand-from-name).
+      • нет точного совпадения → НЕ трогаем (drop-guard ниже опустошит мусор).
+
+    Это GENERAL, не per-category: для не-«Тип» enum (Цвет/Материал…) leaf не совпадёт с
+    их опциями → harmless no-op. Никогда НЕ перезаписывает уже резолвнутое значение
+    (value_id присутствует) — empty > wrong, resolved > derived.
+
+    Ordering: вызывается в _finalize_async ПОСЛЕ brand-from-name/gender/llm_resolve_tail,
+    но ДО _drop_unresolved_required_enums — чтобы корректно выведенный тип заполнился и
+    НЕ был сдроплен.
+    """
+    if not context.category_path:
+        return merged
+    leaf = (context.category_path[-1] or "").strip()
+    if not leaf:
+        return merged
+    leaf_lemma = _type_lemma(leaf)
+    if not leaf_lemma:
+        return merged
+
+    def _norm(s: str) -> str:
+        return _type_lemma(str(s).strip()) if str(s).strip() else ""
+
+    # Существующие значения по attr_id: пусто/None-value_id → кандидат на заполнение.
+    by_attr: dict[int, AttributeValue] = {}
+    for v in merged:
+        by_attr.setdefault(v.attribute_id, v)
+
+    out = list(merged)
+    for t in targets:
+        # Scope: ТОЛЬКО required enum (conservative). Не enum / optional → no-op.
+        if not t.is_required or not t.allowed_values:
+            continue
+        existing = by_attr.get(t.id)
+        # Уже резолвнутое значение (value_id есть) — НИКОГДА не трогаем.
+        if existing is not None and existing.value_id is not None:
+            continue
+        # Ровно-один ТОЧНЫЙ (норм/лемма) матч leaf среди allowed-опций.
+        matches = [opt for opt in t.allowed_values if _norm(opt) == leaf_lemma]
+        if len(matches) != 1:
+            continue
+        chosen = matches[0]
+        vid: Optional[int] = None
+        if value_id_fn is not None:
+            try:
+                vid = value_id_fn(t.id, chosen)
+            except Exception as exc:  # резолвер упал — не падаем, оставляем None
+                logger.warning(
+                    "[Pipeline] type-from-category: value_id для attr %s '%s' "
+                    "недоступен: %s", t.id, chosen, exc,
+                )
+                vid = None
+        if existing is not None:
+            # Перезаписываем ПУСТОЕ/нерезолвнутое значение того же attr_id.
+            logger.info(
+                "[Pipeline] type-from-category: заполнение attr %s='%s' из category-leaf '%s'",
+                t.id, chosen, leaf,
+            )
+            out = [
+                v.model_copy(update={
+                    "value": chosen,
+                    "value_id": vid,
+                    "confidence": 0.9,
+                    "source": Source.DESCRIPTION,
+                    "evidence": _TYPE_FROM_CATEGORY_EVIDENCE,
+                }) if v is existing else v
+                for v in out
+            ]
+        else:
+            logger.info(
+                "[Pipeline] type-from-category: заполнение пустого attr %s='%s' из "
+                "category-leaf '%s'", t.id, chosen, leaf,
+            )
+            out.append(AttributeValue(
+                attribute_id=t.id,
+                value=chosen,
+                value_id=vid,
+                confidence=0.9,
+                source=Source.DESCRIPTION,
+                evidence=_TYPE_FROM_CATEGORY_EVIDENCE,
+            ))
     return out
 
 
@@ -1485,6 +1594,21 @@ class PipelineOrchestrator:
 
         finalized = self._finalize(filtered_values, targets, context)
         resolved = await self._strategy.llm_resolve_tail(finalized, targets, context)
+
+        # Type-from-category: ПОСЛЕ brand-from-name/gender/llm_resolve_tail, но ДО
+        # drop-guard. Category leaf — это И ЕСТЬ тип товара; заполняем ПУСТОЙ/нерезолвнутый
+        # required enum точным enum-матчем leaf-леммы, привязывая словарный value_id (тем
+        # же resolve_value_ids-путём). Заполненный тип получает value_id → НЕ дропается ниже.
+        resolved = _apply_type_from_category(
+            resolved, targets, context,
+            value_id_fn=lambda attr_id, val: self._strategy.resolve_value_ids(
+                AttributeValue(
+                    attribute_id=attr_id, value=val, confidence=0.9,
+                    source=Source.DESCRIPTION,
+                ),
+                context,
+            ).value_id,
+        )
 
         # ПОСЛЕ полной резолюции value_id (детерминированный + LLM-хвост):
         # 1. Дроп OPTIONAL enum-значений без value_id (fake-fill, Ozon отклонит).
