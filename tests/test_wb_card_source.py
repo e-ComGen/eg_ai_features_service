@@ -189,6 +189,99 @@ async def test_transient_503_still_retries():
     assert client.search.await_count == _SERPER_MAX_ATTEMPTS
 
 
+class _FakeResults:
+    """Minimal stand-in for SerperResults (source reads .organic_results)."""
+
+    def __init__(self, organic):
+        self.organic_results = organic
+
+
+class _FakeOrganic:
+    """Minimal stand-in for OrganicResult (source reads .link)."""
+
+    def __init__(self, link):
+        self.link = link
+
+
+@pytest.mark.asyncio
+async def test_zero_result_retries_then_succeeds():
+    """Empty-200 on attempt 1 (0 organic → 0 nm_id) → retry → attempt 2 returns nm_ids.
+
+    This is the core zero-result retry layer: Serper flakes under concurrency and
+    returns 0 organic on the first try, then the SAME query returns real WB cards
+    on the next. The source must retry-on-zero and surface the recovered nm_ids.
+    """
+    nike_hoodie_link = (
+        "https://www.wildberries.ru/catalog/123456789/detail.aspx"
+    )
+    client = MagicMock()
+    client.search = AsyncMock(side_effect=[
+        _FakeResults([]),                            # attempt 1: zero flake
+        _FakeResults([_FakeOrganic(nike_hoodie_link)]),  # attempt 2: recovered
+    ])
+    src = _make_source(client)
+
+    import app.services.enrichment.sources.wb_card_source as mod
+    orig_sleep = mod.asyncio.sleep
+    mod.asyncio.sleep = AsyncMock()  # skip real backoff
+    try:
+        result = await src._search("Худи Nike")
+    finally:
+        mod.asyncio.sleep = orig_sleep
+
+    assert result == [123456789], (
+        f"retry-on-zero must recover nm_ids on attempt 2; got {result}"
+    )
+    assert client.search.await_count == 2, (
+        f"expected exactly 2 attempts (1 zero + 1 success); "
+        f"got {client.search.await_count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_zero_result_exhausts_attempts_then_empty():
+    """Persistently zero (0 organic every attempt) → all attempts used → []."""
+    client = MagicMock()
+    client.search = AsyncMock(return_value=_FakeResults([]))
+    src = _make_source(client)
+
+    import app.services.enrichment.sources.wb_card_source as mod
+    orig_sleep = mod.asyncio.sleep
+    mod.asyncio.sleep = AsyncMock()
+    try:
+        result = await src._search("q")
+    finally:
+        mod.asyncio.sleep = orig_sleep
+
+    assert result == []
+    assert client.search.await_count == _SERPER_MAX_ATTEMPTS, (
+        "a genuine zero must retry up to _SERPER_MAX_ATTEMPTS"
+    )
+
+
+@pytest.mark.asyncio
+async def test_permanent_4xx_no_retry_even_with_zero_layer():
+    """4xx fail-fast is preserved on top of the zero-retry layer (single attempt)."""
+    client = MagicMock()
+    client.search = AsyncMock(side_effect=_http_status_error(400))
+    src = _make_source(client)
+
+    import app.services.enrichment.sources.wb_card_source as mod
+    orig_sleep = mod.asyncio.sleep
+    fake_sleep = AsyncMock()
+    mod.asyncio.sleep = fake_sleep
+    try:
+        result = await src._search("q")
+    finally:
+        mod.asyncio.sleep = orig_sleep
+
+    assert result == []
+    assert client.search.await_count == 1, (
+        "permanent 4xx must fail fast even with the zero-retry layer present"
+    )
+    fake_sleep.assert_not_awaited()  # no backoff burned on permanent 4xx
+
+
 @pytest.mark.asyncio
 async def test_transient_429_still_retries():
     """HTTP 429 (rate limit) is transient → retried (excluded from permanent gate)."""

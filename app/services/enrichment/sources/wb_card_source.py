@@ -732,10 +732,28 @@ class WbCardSource(AttributeSource):
             # деградируем к [] и _search ретраит как раньше.
             if _eg_is_permanent_4xx(exc):
                 raise _EgPermanentSearchError(str(exc)) from exc
-            logger.info("[WbCard] Serper search err: %s", exc)
+            # Инструментация: транзиентная ошибка (429/5xx/таймаут/коннект).
+            # Логируем HTTP-статус (если есть) для per-attempt-видимости флака.
+            _resp = getattr(exc, "response", None)
+            _status = getattr(_resp, "status_code", None)
+            logger.info(
+                "[WbCard] Serper attempt: q='%s' http=%s err=%s (transient)",
+                serper_query[:120],
+                _status if _status is not None else "n/a",
+                exc,
+            )
             return []
 
         organic = getattr(results, "organic_results", None) or []
+        # Инструментация (PERMANENT, production-safe): на УСПЕШНОЙ Serper-попытке
+        # ответ — HTTP 200 (serper_client.raise_for_status уже прошёл; иначе сюда
+        # не дошли бы). Логируем per-attempt query + http=200 + organic-count ДО
+        # извлечения nm_id, чтобы zero-флак (200, но 0 organic) был виден в проде
+        # отдельно от «200, organic есть, но 0 nm_id». Дёшево, без PII, без prints.
+        logger.info(
+            "[WbCard] Serper attempt: q='%s' http=200 organic=%d",
+            serper_query[:120], len(organic),
+        )
 
         # Собираем (nm_id, prefer_ru) в порядке появления, дедуп.
         ordered_main: list[int] = []   # с wildberries.ru
@@ -1318,8 +1336,15 @@ class WbCardSource(AttributeSource):
                         resolved = [
                             resolve_value_id(cat_id, type_id, target.id, p) for p in parts
                         ]
-                        if any(r is not None for r in resolved):
-                            value_ids = resolved
+                        # value_ids — Optional[list[int]]: None-элементы (часть
+                        # parts не легла в словарь) недопустимы внутри списка и
+                        # роняют AttributeValue ValidationError → весь extract
+                        # падал в except и давал card=N. Оставляем только успешно
+                        # резолвнутые int (порядок-агностично: это набор словарных
+                        # ID, а не позиционное соответствие parts).
+                        resolved_ids = [r for r in resolved if r is not None]
+                        if resolved_ids:
+                            value_ids = resolved_ids
                     except Exception as exc:
                         logger.debug("[WbCard] resolve_value_id (list) failed: %s", exc)
             else:
