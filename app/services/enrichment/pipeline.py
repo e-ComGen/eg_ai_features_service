@@ -768,6 +768,32 @@ def _is_collection_value(v: AttributeValue) -> bool:
     return bool(v.is_collection) or isinstance(v.value, list)
 
 
+# ---------------------------------------------------------------------------
+# Placeholder values that must NEVER fill an enum field (they are non-values).
+# Checked case-insensitively, stripped of surrounding whitespace.
+# ---------------------------------------------------------------------------
+_PLACEHOLDER_VALUES: frozenset[str] = frozenset({
+    "нет",
+    "-",
+    "—",
+    "none",
+    "n/a",
+    "без",
+    "не указано",
+    "нет данных",
+})
+
+
+def _is_placeholder_value(raw: object) -> bool:
+    """True если значение — заведомый плейсхолдер/пустышка.
+
+    Используется ДО/ВО ВРЕМЯ резолюции: такие значения не несут информации
+    и никогда не должны заполнять enum-поле. Проверяется case-insensitive,
+    strip whitespace. Список хранится в _PLACEHOLDER_VALUES (константа модуля).
+    """
+    return str(raw).strip().lower() in _PLACEHOLDER_VALUES
+
+
 def _drop_unresolved_optional_enums(
     merged: list[AttributeValue],
     targets: list[TargetAttribute],
@@ -785,17 +811,70 @@ def _drop_unresolved_optional_enums(
     СТРОГИЙ scope (чтобы не навредить):
     - ТОЛЬКО таргеты С allowed_values (enum). Free-text — без value_id by design,
       их НИКОГДА не трогаем.
-    - ТОЛЬКО OPTIONAL (is_required == False). Required-enum вне scope.
+    - ТОЛЬКО OPTIONAL (is_required == False). Required-enum покрывается отдельным
+      гардом _drop_unresolved_required_enums — вызывается в _finalize_async ПОСЛЕ
+      llm_resolve_tail, когда оба optional и required получают одинаковый дроп.
     - Дроп ТОЛЬКО когда value_id None/пуст ПОСЛЕ всей резолюции.
     - is_collection: дропаем только нерезолвнутые элементы, резолвнутые оставляем.
       Если ВСЕ элементы нерезолвнуты → дроп всего поля.
+    """
+    return _drop_unresolved_enums(merged, targets, required_only=False)
+
+
+def _drop_unresolved_required_enums(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+) -> list[AttributeValue]:
+    """Дроп REQUIRED enum-значений, не резолвнувшихся в словарный value_id.
+
+    Симметричный гард для обязательных enum-полей. REQUIRED enum с value_id=None
+    — мусор, который Ozon отклонит так же как optional. Пустое поле честнее:
+    Ozon сообщает об отсутствующем обязательном поле, а не отклоняет всю карточку
+    из-за неверного enum-значения. Применяется ПОСЛЕ optional-гарда (обе функции
+    вызываются из _finalize_async через _drop_unresolved_enum_garbage).
+
+    Типичные случаи:
+      - «Тип» (garment type) ← LLM/WbCard кладёт «без карманов»/«открытые»
+        (feature value, не garment type) → matcher отказывает, value_id=None.
+      - «Тип» ← «нет» (плейсхолдер принят как значение) → value_id=None.
+
+    Scope:
+    - ТОЛЬКО таргеты С allowed_values (enum).
+    - ТОЛЬКО REQUIRED (is_required == True).
+    - Дроп ТОЛЬКО когда value_id None ПОСЛЕ ВСЕЙ резолюции (вкл. llm_resolve_tail).
+    - НЕ трогает значения с корректным value_id (brand-from-name, gender-fill и т.п.
+      уже получили value_id до этого этапа → они в безопасности).
+    """
+    return _drop_unresolved_enums(merged, targets, required_only=True)
+
+
+def _drop_unresolved_enums(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+    *,
+    required_only: bool,
+) -> list[AttributeValue]:
+    """Общая реализация дропа нерезолвнутых enum-значений.
+
+    required_only=False → обрабатывает ТОЛЬКО optional (is_required=False).
+    required_only=True  → обрабатывает ТОЛЬКО required (is_required=True).
+
+    Не вызывайте напрямую — используйте публичные обёртки:
+      _drop_unresolved_optional_enums / _drop_unresolved_required_enums.
     """
     targets_by_id = {t.id: t for t in targets}
     out: list[AttributeValue] = []
     for v in merged:
         target = targets_by_id.get(v.attribute_id)
-        # Вне scope → пропускаем как есть: нет таргета, не enum, или required.
-        if target is None or not target.allowed_values or target.is_required:
+        # Вне scope → пропускаем как есть: нет таргета, не enum, или
+        # is_required не совпадает с режимом вызова.
+        if target is None or not target.allowed_values:
+            out.append(v)
+            continue
+        if required_only and not target.is_required:
+            out.append(v)
+            continue
+        if not required_only and target.is_required:
             out.append(v)
             continue
 
@@ -804,21 +883,18 @@ def _drop_unresolved_optional_enums(
             n_resolved = len(ids)
             if n_resolved == 0:
                 logger.info(
-                    "[Pipeline] drop-unresolved-enum: дроп optional enum-коллекции "
+                    "[Pipeline] drop-unresolved-enum: дроп %s enum-коллекции "
                     "attr=%s value=%r — все элементы без value_id",
+                    "required" if required_only else "optional",
                     v.attribute_id, v.value,
                 )
                 continue  # все элементы нерезолвнуты → дроп поля
             if n_resolved < len(v.value):
-                # Резолвер (ozon resolve_value_ids) компактит value_ids до списка
-                # ТОЛЬКО резолвнутых id (resolved = [i for i in ids if i is not None]),
-                # сохраняя порядок — но НЕ удаляет нерезолвнутые элементы из value.
-                # Оставляем первые n_resolved элементов value (резолвнутый префикс),
-                # дропаем хвост нерезолвнутых. value_ids уже компактный → как есть.
                 new_value = v.value[:n_resolved]
                 logger.info(
-                    "[Pipeline] drop-unresolved-enum: частичный дроп optional "
+                    "[Pipeline] drop-unresolved-enum: частичный дроп %s "
                     "enum-коллекции attr=%s оставлено %d/%d",
+                    "required" if required_only else "optional",
                     v.attribute_id, n_resolved, len(v.value),
                 )
                 out.append(v.model_copy(update={"value": new_value}))
@@ -827,8 +903,9 @@ def _drop_unresolved_optional_enums(
         else:
             if v.value_id is None:
                 logger.info(
-                    "[Pipeline] drop-unresolved-enum: дроп optional enum attr=%s "
+                    "[Pipeline] drop-unresolved-enum: дроп %s enum attr=%s "
                     "value=%r — нет словарного value_id после резолюции",
+                    "required" if required_only else "optional",
                     v.attribute_id, v.value,
                 )
                 continue
@@ -1378,13 +1455,45 @@ class PipelineOrchestrator:
         детерминированный resolve_value_ids + validation). Затем один батч-LLM-вызов
         добивает нерезолвнутые enum-value_id (семантика/перевод). Для не-Ozon
         стратегий llm_resolve_tail — no-op. Используется во ВСЕХ точках выхода enrich.
+
+        Placeholder guard (ДО финализации): скалярные значения-плейсхолдеры («нет»,
+        «-», «n/a» и т.п.) удаляются из enum-кандидатов ДО resolve, чтобы они не
+        попали в LLM-хвост и не заняли required-поле.
+
+        Enum garbage guard (ПОСЛЕ полной резолюции value_id): любой enum-таргет
+        (optional ИЛИ required), чьё значение не резолвнулось в словарный value_id,
+        дропается — Ozon отклонит такую карточку на загрузке. Пустое честнее.
+        Порядок гарантирует безопасность: brand-from-name и gender-fill получают
+        value_id ДО этого этапа (в _finalize и llm_resolve_tail), поэтому их
+        корректно-резолвнутые значения НЕ затрагиваются.
         """
-        finalized = self._finalize(all_values, targets, context)
+        # Placeholder pre-filter: «нет», «-», «n/a» etc. удаляем из enum-таргетов
+        # ДО resolve_value_ids, чтобы они не осели как «filled» с value_id=None.
+        targets_by_id = {t.id: t for t in targets}
+        filtered_values: list[AttributeValue] = []
+        for v in all_values:
+            tgt = targets_by_id.get(v.attribute_id)
+            if tgt is not None and tgt.allowed_values and not isinstance(v.value, list):
+                if _is_placeholder_value(v.value):
+                    logger.info(
+                        "[Pipeline] placeholder-filter: дроп enum attr=%s value=%r "
+                        "(плейсхолдер не является enum-значением)",
+                        v.attribute_id, v.value,
+                    )
+                    continue
+            filtered_values.append(v)
+
+        finalized = self._finalize(filtered_values, targets, context)
         resolved = await self._strategy.llm_resolve_tail(finalized, targets, context)
-        # ПОСЛЕ полной резолюции value_id (детерминированный + LLM-хвост): дроп
-        # OPTIONAL enum-значений, оставшихся без словарного value_id (fake-fill,
-        # который Ozon отклонит). Required-enum и free-text не трогаем. См. docstring.
-        return _drop_unresolved_optional_enums(resolved, targets)
+
+        # ПОСЛЕ полной резолюции value_id (детерминированный + LLM-хвост):
+        # 1. Дроп OPTIONAL enum-значений без value_id (fake-fill, Ozon отклонит).
+        # 2. Дроп REQUIRED enum-значений без value_id — мусор в обязательном поле
+        #    хуже пустоты: Ozon отвергает карточку, а не просто помечает поле пустым.
+        #    Correctly-resolved required values (value_id is set) НЕ затрагиваются.
+        resolved = _drop_unresolved_optional_enums(resolved, targets)
+        resolved = _drop_unresolved_required_enums(resolved, targets)
+        return resolved
 
     def _finalize(
         self,
