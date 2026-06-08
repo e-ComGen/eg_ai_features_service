@@ -180,7 +180,17 @@ def build_targets(chars: list[dict]) -> list[TargetAttribute]:
     for c in chars:
         allowed = None
         if c.get("values"):
-            allowed = [v["value"] for v in c["values"][:50]]
+            # Mirror production: truncated enums (values_truncated=True or list > 50)
+            # must NOT be sliced into allowed_values — that would short-circuit
+            # brand_options_fn and feed the matcher only a tiny subset.
+            # Production leaves allowed_values=None for these; brand-from-name then
+            # uses brand_options_fn(attr_id) → full dict list.  Small enums (≤50,
+            # not truncated) are kept as-is, same as before.
+            is_truncated_enum = (
+                c.get("values_truncated", False) or len(c["values"]) > 50
+            )
+            if not is_truncated_enum:
+                allowed = [v["value"] for v in c["values"]]
         out.append(TargetAttribute(
             id=c["id"],
             name=c["name"],
