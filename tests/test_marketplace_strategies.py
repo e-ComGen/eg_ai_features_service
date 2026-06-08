@@ -632,3 +632,100 @@ def test_default_strategy_resolve_value_ids_passthrough():
     av = AttributeValue(attribute_id=1, value="test", confidence=0.8, source=Source.DESCRIPTION)
     result = strategy.resolve_value_ids(av, ctx)
     assert result is av  # возвращает тот же объект без изменений
+
+
+# ---------------------------------------------------------------------------
+# llm_resolve_tail — graceful skip on LLM timeout / network error
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_llm_resolve_tail_graceful_on_timeout(tmp_path):
+    """llm_resolve_tail returns input unchanged when the LLM call raises an exception.
+
+    This covers the production hang scenario: a stalled/timed-out DeepSeek
+    response must NOT block the product — the resolver must skip tail resolution
+    and leave value_id=None as-is.
+    """
+    import json
+    from unittest.mock import patch, AsyncMock
+    from openai import APITimeoutError
+
+    dict_with_options = {
+        "schema_version": 2,
+        "source": "ozon_seller_api",
+        "generated_at": "2026-06-08",
+        "categories": {
+            "10:20": {
+                "description_category_id": 10,
+                "type_id": 20,
+                "name": "Тест",
+                "path": ["Тест"],
+                "characteristics": [
+                    {
+                        "id": 55,
+                        "name": "Сезон",
+                        "type": "Option",
+                        "is_required": False,
+                        "is_collection": False,
+                        "description": "Сезон носки",
+                        "values": [
+                            {"id": 101, "value": "Лето"},
+                            {"id": 102, "value": "Зима"},
+                            {"id": 103, "value": "На любой сезон"},
+                        ],
+                    }
+                ],
+            }
+        },
+    }
+    (tmp_path / "ozon_dictionary.json").write_text(
+        json.dumps(dict_with_options), encoding="utf-8"
+    )
+
+    # Clear module-level LLM resolve cache to avoid cross-test pollution.
+    import app.services.enrichment.strategies.ozon_strategy as _ozon_mod
+    _ozon_mod._LLM_RESOLVE_CACHE.clear()
+
+    with patch(
+        "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+        tmp_path,
+    ):
+        from app.services.enrichment.strategies.dictionaries.ozon_loader import (
+            load_ozon_dictionary,
+        )
+        load_ozon_dictionary.cache_clear()
+
+        strategy = OzonStrategy()
+        ctx = ExtractionContext(
+            product_id=1, product_name="Тест", category_id=10, ozon_type_id=20
+        )
+        # Unmatched value (value_id still None) — tail resolver should try it.
+        av = AttributeValue(
+            attribute_id=55,
+            value="Круглогодичный",
+            confidence=0.8,
+            source=Source.DESCRIPTION,
+            is_collection=False,
+        )
+        av.value_id = None  # not yet resolved
+
+        targets = [
+            TargetAttribute(id=55, name="Сезон", type="enum"),
+        ]
+
+        # Simulate LLM timeout raised from _llm_batch_choose → get_main_manager().structured_request
+        mock_llm = AsyncMock()
+        mock_llm.structured_request = AsyncMock(
+            side_effect=APITimeoutError(request=None)
+        )
+
+        with patch(
+            "app.services.providers.factory.get_main_manager",
+            return_value=mock_llm,
+        ):
+            result = await strategy.llm_resolve_tail([av], targets, ctx)
+
+    # Product must complete — value returned unchanged, value_id stays None.
+    assert len(result) == 1
+    assert result[0].value_id is None
+    assert result[0].value == "Круглогодичный"

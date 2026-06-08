@@ -5,6 +5,11 @@ from openai import AsyncOpenAI
 # Generic Type для Pydantic моделей
 T = TypeVar("T", bound=BaseModel)
 
+# Default HTTP timeout (seconds) for all OpenAI API calls.
+# Matches the 60 s default used by DeepSeekProvider / OpenRouterProvider so
+# one stalled API response never hangs the pipeline indefinitely.
+_DEFAULT_TIMEOUT = 60
+
 
 class OpenAIManager:
     def __init__(self, api_key: str):
@@ -14,7 +19,8 @@ class OpenAIManager:
     async def structured_request(self,
                                  system_prompt: str,
                                  user_text: str,
-                                 response_model: Type[T]) -> Tuple[Optional[T], int]:
+                                 response_model: Type[T],
+                                 timeout: int = _DEFAULT_TIMEOUT) -> Tuple[Optional[T], int]:
         """
         Универсальный метод: отправляет промпт и возвращает Pydantic-объект.
         """
@@ -27,7 +33,8 @@ class OpenAIManager:
                 ],
                 response_format=response_model,
                 temperature=0.2,
-                seed=42
+                seed=42,
+                timeout=timeout,
             )
 
             usage = completion.usage

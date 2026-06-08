@@ -70,7 +70,11 @@ _OZON_SEARCH_URL = "https://www.ozon.ru/search/"
 _OZON_PRODUCT_BASE = "https://www.ozon.ru/product/"
 _SCRAPPEY_ENDPOINT = "https://publisher.scrappey.com/api/v1"
 _MAX_SEARCH_TILES = 5
-_HTTP_TIMEOUT = 180.0  # Scrappey browser bypass обычно 8-20s, иногда до 60s
+_HTTP_TIMEOUT = 60.0   # Scrappey browser bypass обычно 8-20s, иногда до 60s.
+                       # 60s matches the timeout floor used across all other network
+                       # callers (LLM providers, WbCard, ozon_runtime_lookup).
+_OZON_CARD_TOTAL_TIMEOUT = 90.0  # Hard cap on the entire _do_extract (all retries).
+                                  # Prevents N-retry × 60s stalls when Scrappey is slow.
 
 # Regex для парсинга
 _PRODUCT_LINK_RE = re.compile(
@@ -919,9 +923,22 @@ class OzonCardSource(AttributeSource):
             # тоже должны дойти до merger-а — он выберет лучшее через consensus.
             return self._filter_for_targets(self._cache[cache_key], targets)
 
-        # Network calls
+        # Network calls — bounded by hard total timeout to prevent stalls when
+        # Scrappey is slow or retrying multiple times (N retries × _HTTP_TIMEOUT
+        # could otherwise block the pipeline for minutes).
         try:
-            all_values = await self._do_extract(context, targets)
+            all_values = await asyncio.wait_for(
+                self._do_extract(context, targets),
+                timeout=_OZON_CARD_TOTAL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[OzonCard] total timeout (%.0fs) for '%s' — skipping OzonCard stage",
+                _OZON_CARD_TOTAL_TIMEOUT,
+                context.product_name[:60],
+            )
+            self._cache_put(cache_key, [])
+            return []
         except Exception as exc:
             logger.warning(
                 "[OzonCard] unexpected error для '%s': %s",

@@ -55,12 +55,18 @@ class OpenAIStrictProvider:
         system_prompt: str,
         user_text: str,
         response_model: Type[T],
+        timeout: int = 60,
     ) -> Tuple[Optional[T], int]:
         """Strict json_schema запрос к OpenAI с token-level enum enforcement.
 
+        Args:
+            timeout: HTTP timeout in seconds for the API call (default 60s).
+                     Mirrors the timeout used by DeepSeekProvider / StructuredLlmManager
+                     so a stalled API response never hangs the pipeline indefinitely.
+
         Returns:
             (parsed_instance, total_tokens) — аналогично StructuredLlmManager.
-            При ошибке — (None, 0).
+            При ошибке / таймауте — (None, 0).
         """
         schema = response_model.model_json_schema()
         model_name = response_model.__name__
@@ -79,6 +85,7 @@ class OpenAIStrictProvider:
                 messages=messages,
                 temperature=0.0,
                 max_tokens=6000,
+                timeout=timeout,
                 response_format={
                     "type": "json_schema",
                     "json_schema": {

@@ -47,6 +47,7 @@ class StructuredLlmManager:
         user_text: str,
         response_model: Type[T],
         temperature: float = 0.2,
+        timeout: int = 60,
     ) -> Tuple[Optional[T], int]:
         """Send a chat completion and parse the response into *response_model*.
 
@@ -98,6 +99,7 @@ class StructuredLlmManager:
                 temperature=temperature,
                 max_tokens=6000,
                 response_format={"type": "json_object"},
+                timeout=timeout,
             )
         except Exception as exc:
             logger.error("StructuredLlmManager: LLM call failed: %s", exc)
