@@ -20,6 +20,7 @@ from app.services.enrichment.sources.wb_card_source import (
     _build_wb_query,
     _wb_query_type_word,
     _target_type_lemma,
+    _type_lemma,
     _lemma,
     _SERPER_MAX_ATTEMPTS,
 )
@@ -71,8 +72,14 @@ def test_hoodie_type_word_is_leaf():
 
 
 def test_hoodie_type_lemma_from_leaf():
-    # pymorphy parses "худи" as a non-noun; leaf-trust must still yield it.
-    assert _target_type_lemma("Худи мужское черное на молнии Nike", "Худи") == _lemma("худи")
+    # pymorphy parses indeclinable "худи" as a fabricated verb ("худить"), which
+    # used to poison the type-gate. The fixed _target_type_lemma keeps the surface
+    # form "худи" for non-NOUN top-parses, and — crucially — it must MATCH what the
+    # card side (_card_subj_lemmas via _type_lemma) produces for the same word, so a
+    # real Nike-hoodie card (subj "Худи") passes the gate.
+    target_lemma = _target_type_lemma("Худи мужское черное на молнии Nike", "Худи")
+    assert target_lemma == "худи"
+    assert target_lemma == _type_lemma("Худи")  # gate symmetry: target == card subj
 
 
 def test_coat_leaf_trust():

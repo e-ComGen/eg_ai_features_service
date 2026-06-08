@@ -104,6 +104,36 @@ def _lemma(word: str) -> str:
         return w
 
 
+def _type_lemma(word: str) -> str:
+    """Лемма ТИП-слова товара, устойчивая к несклоняемым существительным.
+
+    Обычный ``_lemma`` слепо берёт ``parse()[0].normal_form``, а pymorphy3 для
+    разговорных/заимствованных НЕСКЛОНЯЕМЫХ существительных («худи», «боди»)
+    верхней гипотезой ставит выдуманный ГЛАГОЛ («худи»→«худить», «боди»→«бодить»)
+    или мусорный noun («худь»). Это отравляло тип-гейт: цель-лемма «худить» не
+    совпадает НИ с одной карточкой-худи (subj «Худи»/«Толстовки») → отбраковка
+    всех валидных кандидатов → честный 0 на товаре, где карточек сотни.
+
+    Правило (general, без хардкода списков типов): лемматизируем ТОЛЬКО когда
+    верхняя гипотеза pymorphy — существительное (NOUN). Иначе (глагол/иное, как у
+    несклоняемых) возвращаем сам токен в нижнем регистре — несклоняемое и так не
+    меняет форму, а surface-форма стабильно совпадает с обеих сторон гейта
+    (цель «худи» ↔ карточка «худи»). Склоняемые («толстовки»→«толстовка»,
+    «куртки»→«куртка») по-прежнему нормализуются корректно (их топ-парс — NOUN).
+    """
+    w = word.strip().lower()
+    if not w or _MORPH is None:
+        return w
+    try:
+        parse = _MORPH.parse(w)
+        if parse and "NOUN" in parse[0].tag:
+            return parse[0].normal_form
+        # Топ-гипотеза не сущ. (несклоняемое слово → выдуманный глагол): surface.
+        return w
+    except Exception:  # noqa: BLE001
+        return w
+
+
 def _is_noun_lemma(word: str) -> bool:
     """True если слово (по pymorphy) — существительное. Без морфологии — всегда True."""
     if _MORPH is None:
@@ -144,7 +174,11 @@ def _target_type_lemma(
             # короткий мусор (len<3).
             if len(tok) < 3:
                 continue
-            return _lemma(tok)
+            # _type_lemma (не _lemma): несклоняемые «худи»/«боди» pymorphy
+            # лемматизирует в выдуманный глагол «худить»/«бодить», что отравляет
+            # тип-гейт (цель «худить» ≠ карточка «худи»). _type_lemma лемматизирует
+            # только NOUN-топ-парсы, иначе оставляет surface-форму.
+            return _type_lemma(tok)
     # 2. Ведущее существительное названия товара (только при отсутствии leaf).
     for tok in _TYPE_TOKEN_RE.findall(product_name.lower()):
         if len(tok) < 3 or tok in _LEADING_STOPWORDS or _is_spec_or_unit_token(tok):
@@ -159,14 +193,24 @@ def _target_type_lemma(
 
 
 def _card_subj_lemmas(card: dict) -> set[str]:
-    """Леммы тип-слов карточки из subj_name / subj_root_name (множество)."""
+    """Леммы тип-слов карточки из subj_name / subj_root_name (множество).
+
+    subj_name/subj_root_name — это ЯРЛЫК ТИПА карточки (как category leaf:
+    «Худи», «Толстовки»), а не свободный текст. Поэтому:
+      - НЕ фильтруем по _LEADING_STOPWORDS: «худи» внесён туда как разговорный
+        тип (для среза в середине названия), но в subj это и есть искомый тип —
+        фильтр выкинул бы его, и карточка-«Худи» давала бы пустой набор лемм, из-за
+        чего тип-гейт пропускал бы её мимо проверки (ложный pass);
+      - используем _type_lemma (а не _lemma) — симметрично цели: несклоняемое
+        «худи» остаётся «худи» с обеих сторон, склоняемое «толстовки»→«толстовка».
+    """
     out: set[str] = set()
     for key in ("subj_name", "subj_root_name"):
         val = card.get(key)
         if isinstance(val, str) and val.strip():
             for tok in _TYPE_TOKEN_RE.findall(val.lower()):
-                if len(tok) >= 3 and tok not in _LEADING_STOPWORDS:
-                    out.add(_lemma(tok))
+                if len(tok) >= 3:
+                    out.add(_type_lemma(tok))
     return out
 
 
