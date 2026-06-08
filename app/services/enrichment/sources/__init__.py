@@ -4,6 +4,7 @@ from .llm_knowledge_source import LlmKnowledgeSource
 from .vision_source import VisionSource
 from .web_search_source import WebSearchSource
 from .competitor_rag_source import CompetitorRagSource
+from .wb_apparel_rag_source import WbApparelRagSource
 from .icecat_source import IceCatSource
 from .pdf_datasheet_source import PdfDatasheetSource
 from .ozon_card_source import OzonCardSource
@@ -17,6 +18,7 @@ __all__ = [
     "VisionSource",
     "WebSearchSource",
     "CompetitorRagSource",
+    "WbApparelRagSource",
     "IceCatSource",
     "PdfDatasheetSource",
     "OzonCardSource",

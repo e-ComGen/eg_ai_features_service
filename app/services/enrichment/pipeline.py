@@ -7,6 +7,7 @@ cost gating (CostPredictor перед expensive web search).
 Spec: docs/architecture/pipeline.md, section "PipelineOrchestrator".
 """
 import logging
+import os
 import re
 from typing import Callable, Optional
 
@@ -26,6 +27,7 @@ from app.services.enrichment.sources import (
     VisionSource,
     WebSearchSource,
     CompetitorRagSource,
+    WbApparelRagSource,
     IceCatSource,
     PdfDatasheetSource,
     OzonCardSource,
@@ -1160,6 +1162,23 @@ class PipelineOrchestrator:
         # и нет смысла включать в classifier routing (он не LLM-based).
         # Передаём None → source не создаётся автоматически (нет готового индекса по умолчанию).
         self._competitor_rag: Optional[CompetitorRagSource] = competitor_rag_source
+        # WbApparelRagSource — OPT-IN apparel-RAG из WB, ВЫКЛЮЧЕН по умолчанию.
+        # Активен ТОЛЬКО когда WB_APPAREL_RAG_ENABLED=1 И явный competitor_rag не передан.
+        # Шарит Source.COMPETITOR_RAG → ездит на том же stage/judge без новых веток.
+        # Сам source дормантен пока wb_apparel_rag.qdrant не построен (gate внутри).
+        if (
+            self._competitor_rag is None
+            and os.environ.get("WB_APPAREL_RAG_ENABLED", "0") == "1"
+        ):
+            try:
+                self._competitor_rag = WbApparelRagSource()
+                logger.info(
+                    "[Pipeline] WB_APPAREL_RAG_ENABLED=1 → WbApparelRagSource registered "
+                    "(dormant until wb_apparel_rag.qdrant exists)"
+                )
+            except Exception as e:  # noqa: BLE001 — не ломаем pipeline, если что-то не так
+                logger.warning("[Pipeline] WbApparelRagSource init failed: %s", e)
+                self._competitor_rag = None
         # IceCatSource хранится отдельно: brand-verified, HTTP, без LLM.
         # None → IceCat stage пропускается.
         self._icecat: Optional[IceCatSource] = icecat_source
