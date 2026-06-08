@@ -622,7 +622,14 @@ class OzonStrategy(MarketplaceStrategy):
         """
         type_id = context.ozon_type_id
         if type_id is not None:
-            return get_attr_value_options(context.category_id, type_id, attribute_id)
+            opts = get_attr_value_options(context.category_id, type_id, attribute_id)
+            if opts:
+                return opts
+            # Type-запись есть, но её values для «Бренд» пусты (не загружены /
+            # truncated на этом type) — brand-from-name остался бы без списка и не
+            # заполнил бы бренд из имени даже при card=N. Падаем на any_type: тот же
+            # cat_id, любой type-entry с непустыми значениями (123k брендов, вкл. Nike).
+            return get_attr_value_options_any_type(context.category_id, attribute_id)
         # Fallback: ozon_type_id неизвестен — перебираем все type-entries.
         return get_attr_value_options_any_type(context.category_id, attribute_id)
 
@@ -645,7 +652,12 @@ class OzonStrategy(MarketplaceStrategy):
         """
         type_id = context.ozon_type_id
         if type_id is not None:
-            return get_attr_value_pairs(context.category_id, type_id, attribute_id)
+            pairs = get_attr_value_pairs(context.category_id, type_id, attribute_id)
+            if pairs:
+                return pairs
+            # values пусты на этом type — падаем на any_type (см. brand_value_options),
+            # иначе value_id выбранного бренда остался бы None → drain C.
+            return get_attr_value_pairs_any_type(context.category_id, attribute_id)
         # Fallback: ozon_type_id неизвестен — перебираем все type-entries.
         return get_attr_value_pairs_any_type(context.category_id, attribute_id)
 
