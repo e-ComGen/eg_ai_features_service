@@ -205,5 +205,48 @@ def test_pick_best_match_penalty_flips_passing_score_to_skip():
     assert no_brand - with_brand == pytest.approx(_BRAND_MISMATCH_PENALTY, abs=0.01)
 
 
+# ---------------------------------------------------------------------------
+# best-of-top-N: SSR ordering jitter must not starve the exact card
+# ---------------------------------------------------------------------------
+
+def test_pick_best_match_selects_exact_card_not_first_tile():
+    """Ozon SSR tile ORDERING jitters run-to-run: the exact card is present every
+    run but not always ranked #1. _pick_best_match must score ALL top-N tiles and
+    pick the HIGHEST-scoring one, so the exact card (high score) wins even when a
+    weak decoy is ranked first.
+
+    Setup: a low-score decoy is tile #1, the exact-match card is tile #3.
+    The source must select the exact card (best of top-N), not the decoy.
+    """
+    query = "Толстовка женская Adidas Originals Trefoil"
+    tiles = [
+        # #1 decoy: same type/brand-family but clearly a different product (low score)
+        {"title": "Носки Adidas комплект 3 пары", "slug": "noski-adidas", "pid": "1"},
+        # #2 another weak neighbour
+        {"title": "Футболка мужская Adidas Performance", "slug": "futbolka-adidas", "pid": "2"},
+        # #3 the EXACT card (high score) — ranked third due to SSR jitter
+        {
+            "title": "Толстовка женская Adidas Originals Trefoil",
+            "slug": "tolstovka-adidas-trefoil", "pid": "3",
+        },
+        {"title": "Шапка Adidas зимняя", "slug": "shapka-adidas", "pid": "4"},
+    ]
+    best_tile, score = OzonCardSource._pick_best_match(
+        query=query,
+        tiles=tiles,
+        category_leaf="Толстовка",
+        query_brand="Adidas",
+        query_name=query,
+    )
+    assert best_tile is not None
+    assert best_tile["pid"] == "3", (
+        f"expected the exact card (pid=3) to win best-of-top-N, got pid="
+        f"{best_tile.get('pid')} (title={best_tile.get('title')!r}, score={score:.1f})"
+    )
+    assert _classify_match(score) != "skip", (
+        f"exact card scored {score:.1f}, must clear the threshold"
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])

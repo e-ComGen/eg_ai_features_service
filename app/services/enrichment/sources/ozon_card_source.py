@@ -69,7 +69,15 @@ logger = logging.getLogger(__name__)
 _OZON_SEARCH_URL = "https://www.ozon.ru/search/"
 _OZON_PRODUCT_BASE = "https://www.ozon.ru/product/"
 _SCRAPPEY_ENDPOINT = "https://publisher.scrappey.com/api/v1"
-_MAX_SEARCH_TILES = 5
+_MAX_SEARCH_TILES = 8
+# Score the top-N parsed SSR tiles and pick the HIGHEST-scoring one (best-of-N),
+# instead of relying on the single top tile. Ozon's SSR tile ORDERING jitters
+# run-to-run: the exact card is present every run but not always ranked #1.
+# Scoring N tiles and taking the best kills that ordering dependence — the exact
+# card (which scores ~91 whenever present) wins regardless of its rank. N=8 is a
+# small buffer above the typical jitter window (the exact card has been observed
+# ranking up to ~6th) while staying cheap (scoring is pure-CPU rapidfuzz, no I/O).
+_MATCH_TOP_N = 8
 _HTTP_TIMEOUT = 60.0   # Scrappey browser bypass обычно 8-20s, иногда до 60s.
                        # 60s matches the timeout floor used across all other network
                        # callers (LLM providers, WbCard, ozon_runtime_lookup).
@@ -1129,10 +1137,32 @@ class OzonCardSource(AttributeSource):
             }
 
         top_tile, top_score = self._pick_best_match(
-            query, tiles[:_MAX_SEARCH_TILES], category_leaf=cat_leaf,
+            query, tiles[:_MATCH_TOP_N], category_leaf=cat_leaf,
             query_brand=context.brand, query_name=full_name,
         )
         mode = self._classify_match(top_score) if top_tile is not None else "skip"
+
+        # Secondary net (bounded, 1 extra fetch): if even the best of top-N is
+        # below threshold, the SSR ordering/content jitter may have starved this
+        # particular fetch of the exact card. Re-run the SAME search ONCE and
+        # re-score; keep the better of the two attempts. The hard total timeout
+        # (_OZON_CARD_TOTAL_TIMEOUT) still bounds the whole _do_extract.
+        if (top_tile is None or mode == "skip") and query is not None:
+            retry_html = await self._scrappey_fetch(client, f"{_OZON_SEARCH_URL}?text={query}")
+            if retry_html is not None:
+                retry_tiles = self._parse_search_tiles_html(retry_html)
+                if retry_tiles:
+                    r_tile, r_score = self._pick_best_match(
+                        query, retry_tiles[:_MATCH_TOP_N], category_leaf=cat_leaf,
+                        query_brand=context.brand, query_name=full_name,
+                    )
+                    logger.info(
+                        "[OzonCard] retry search best score=%.1f (prev=%.1f)",
+                        r_score, top_score,
+                    )
+                    if r_tile is not None and r_score > top_score:
+                        top_tile, top_score, tiles = r_tile, r_score, retry_tiles
+                        mode = self._classify_match(top_score)
 
         if top_tile is None or mode == "skip":
             logger.info(
@@ -1692,9 +1722,21 @@ class OzonCardSource(AttributeSource):
             # чужого бренда. Крупный штраф (60) гарантирует уход ниже порога.
             if _brand_conflict(query_brand, query_name or query, title):
                 score -= _BRAND_MISMATCH_PENALTY
+            # Per-tile score logging under existing instrumentation — makes the
+            # best-of-top-N selection (chosen tile + its score) visible run-to-run,
+            # so SSR ordering jitter can be confirmed/diagnosed.
+            logger.info(
+                "[OzonCard] tile score=%.1f title='%s'",
+                score, title[:80],
+            )
             if score > best_score:
                 best_score = score
                 best_tile = tile
+        if best_tile is not None:
+            logger.info(
+                "[OzonCard] best-of-top-N score=%.1f title='%s'",
+                best_score, (best_tile.get("title") or "")[:80],
+            )
         return best_tile, best_score
 
     @staticmethod
