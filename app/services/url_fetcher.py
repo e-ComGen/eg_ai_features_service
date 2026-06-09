@@ -499,6 +499,8 @@ class FetchResult:
     url: str
     content: str          # extracted text, already trimmed to MAX_CONTENT_BYTES
     source_type: str      # "wb" | "ali" | "ozon" | "generic"
+    raw_html: Optional[str] = None  # full raw HTML before cap/trafilatura (generic pages only)
+                                    # used by composition_extractor which needs the full page
 
 
 # ---------------------------------------------------------------------------
@@ -755,7 +757,12 @@ async def fetch_url_content(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optiona
 
 
 async def _extract_generic_from_html(url: str, html: str) -> Optional[FetchResult]:
-    """Extract main content from HTML. Tries trafilatura, then strips tags."""
+    """Extract main content from HTML. Tries trafilatura, then strips tags.
+
+    Stores the FULL raw HTML in FetchResult.raw_html (capped at 1 MB) so that
+    composition_extractor can mine fabric composition from the original page
+    before trafilatura/content-cap discard the spec block.
+    """
     content: Optional[str] = None
 
     # Try trafilatura (best quality)
@@ -780,13 +787,62 @@ async def _extract_generic_from_html(url: str, html: str) -> Optional[FetchResul
     if not content:
         return None
 
+    # Keep raw_html for composition mining (cap at 1 MB to avoid OOM on huge pages)
+    raw_html_for_mining = html[:1_000_000] if html else None
+
     content = content[:MAX_CONTENT_BYTES]
-    return FetchResult(url=url, content=content, source_type="generic")
+    return FetchResult(url=url, content=content, source_type="generic", raw_html=raw_html_for_mining)
 
 
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
+
+async def _fetch_one_result(url: str) -> Optional[FetchResult]:
+    """Fetch a single URL and return a FetchResult (with raw_html for generic pages)."""
+    if not url.startswith("https://"):
+        logger.warning("fetch_all: skipping non-HTTPS URL %r", url)
+        return None
+    source = detect_source(url)
+    try:
+        if source == "wb":
+            return await fetch_wildberries(url)
+        elif source == "ali":
+            return await fetch_aliexpress(url)
+        elif source == "ozon":
+            return await fetch_ozon(url)
+        else:
+            return await fetch_url_content(url)
+    except Exception as exc:
+        logger.warning("fetch_all: unhandled error for %r: %s", url, exc)
+        return None
+
+
+async def fetch_all_results(urls: list[str]) -> list[FetchResult]:
+    """Parallel fetch all URLs. Returns list of FetchResult (preserves raw_html).
+
+    Use this when you need raw HTML for composition mining.
+    Individual failures are silently skipped (non-fatal).
+    Only HTTPS URLs are accepted.
+    """
+    if not urls:
+        return []
+
+    gathered = await asyncio.gather(
+        *[_fetch_one_result(u) for u in urls], return_exceptions=True
+    )
+
+    out: list[FetchResult] = []
+    for url, result in zip(urls, gathered):
+        if isinstance(result, Exception):
+            logger.warning("fetch_all_results: exception for %r: %s", url, result)
+            continue
+        if result is None:
+            continue
+        out.append(result)
+
+    return out
+
 
 async def fetch_all(urls: list[str]) -> str:
     """
@@ -797,33 +853,10 @@ async def fetch_all(urls: list[str]) -> str:
     if not urls:
         return ""
 
-    async def _fetch_one(url: str) -> Optional[FetchResult]:
-        if not url.startswith("https://"):
-            logger.warning("fetch_all: skipping non-HTTPS URL %r", url)
-            return None
-        source = detect_source(url)
-        try:
-            if source == "wb":
-                return await fetch_wildberries(url)
-            elif source == "ali":
-                return await fetch_aliexpress(url)
-            elif source == "ozon":
-                return await fetch_ozon(url)
-            else:
-                return await fetch_url_content(url)
-        except Exception as exc:
-            logger.warning("fetch_all: unhandled error for %r: %s", url, exc)
-            return None
-
-    results = await asyncio.gather(*[_fetch_one(u) for u in urls], return_exceptions=True)
+    results = await fetch_all_results(urls)
 
     parts: list[str] = []
-    for url, result in zip(urls, results):
-        if isinstance(result, Exception):
-            logger.warning("fetch_all: exception for %r: %s", url, result)
-            continue
-        if result is None:
-            continue
+    for result in results:
         parts.append(f"=== Source: {result.url} ===\n{result.content}")
 
     return "\n\n".join(parts)
