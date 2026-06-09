@@ -272,6 +272,42 @@ def _try_match_one_value(value: str, values_list: list) -> Optional[int]:
             if str(entry.get("value", "")).lower() == canon_lower:
                 return entry.get("id")
 
+    # Strategy 0.5: digit-normalized prefix match for pure-numeric codes (e.g. TNVED).
+    # TNVED codes come in different granularities: the LLM may produce "6109100010"
+    # (EAEU 10-digit subposition) while Ozon stores "6109100000 - Футболки...".
+    # Both sides are stripped to digits-only, then we match when one code is a
+    # prefix of the other (min 6 digits). Only activates for pure-digit inputs —
+    # has zero effect on text attributes.
+    import re as _re
+    _digits_only = _re.sub(r"\D", "", value)
+    if _digits_only == value and len(_digits_only) >= 6:
+        # Digit-normalized prefix match for customs codes (TNVED/HS/CN/EAEU).
+        #
+        # Problem: LLM produces EAEU 10-digit code "6109100010" (national subposition)
+        # while Ozon stores "6109100000 - Футболки..." (HS-8 base, last 2 = "00").
+        # They share the first 8 digits ("61091000") — the HS-8 subheading — but
+        # differ in the last 2 national subposition digits.
+        #
+        # Strategy: extract digits-only from the option's code portion, then compare
+        # the first min(8, len_target, len_option) digits. 8 = HS-8 subheading level
+        # (stable, no national divergence). Falls through to prefix check for shorter
+        # codes (6-digit HS heading or 4-digit HS chapter lookups).
+        #
+        # Only activates for pure-digit inputs ≥ 6 digits — zero effect on text attrs.
+        _HS8_LEVEL = 8
+        _MIN_DIGITS = 6
+        for entry in values_list:
+            entry_val = str(entry.get("value", ""))
+            # Extract the code portion: everything before " - " separator handles both
+            # "6109100000 - Футболки..." and spaced "6109 10 000 0 - ..." formats.
+            code_part = entry_val.split(" - ")[0] if " - " in entry_val else entry_val
+            entry_digits = _re.sub(r"\D", "", code_part)
+            if not entry_digits or len(entry_digits) < _MIN_DIGITS:
+                continue
+            cmp_len = min(len(_digits_only), len(entry_digits), _HS8_LEVEL)
+            if cmp_len >= _MIN_DIGITS and _digits_only[:cmp_len] == entry_digits[:cmp_len]:
+                return entry.get("id")
+
     # Strategy 1: exact case-insensitive
     value_lower = value.lower()
     for entry in values_list:

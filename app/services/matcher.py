@@ -194,11 +194,27 @@ class MatcherService:
         if target_clean in ['unknown', 'n/a', 'not specified', 'none', 'null']:
             return None
 
-        # Fix 3: short-circuit exact numeric-code prefix match (TNVED and similar)
-        # e.g. target "6204620000" vs options like "6204620000 - Брюки женские"
+        # Fix 3: short-circuit numeric-code prefix match (TNVED and similar).
+        # Handles both exact matches ("6204620000" vs "6204620000 - Брюки женские")
+        # and granularity mismatches ("6109100010" vs "6109100000 - Футболки..."):
+        # strip non-digits from both sides; match when one is a prefix of the other
+        # (min 6 digits). Zero effect on text attributes — only for pure-digit targets.
         if _NUMERIC_CODE_RE.match(target_clean):
+            target_digits = re.sub(r"\D", "", target_clean)
+            _HS8_LEVEL = 8
+            _MIN_DIGITS = 6
             for opt in options:
-                if opt.startswith(target_clean + " ") or opt.split()[0] == target_clean:
+                # Extract code portion: everything before " - " separator handles both
+                # "6109100000 - desc" and spaced "6109 10 000 0 - desc" formats.
+                opt_code_part = opt.split(" - ")[0] if " - " in opt else opt
+                opt_digits = re.sub(r"\D", "", opt_code_part)
+                if len(opt_digits) < _MIN_DIGITS:
+                    continue
+                # Compare at HS-8 subheading granularity (first 8 digits) so that
+                # "6109100010" (EAEU national subposition) matches "6109100000"
+                # (Ozon HS-8 base code). Falls back to full prefix for shorter codes.
+                cmp_len = min(len(target_digits), len(opt_digits), _HS8_LEVEL)
+                if cmp_len >= _MIN_DIGITS and target_digits[:cmp_len] == opt_digits[:cmp_len]:
                     return opt
 
         is_ram_debug = "8gb" in target_clean or "8 gb" in target_clean
