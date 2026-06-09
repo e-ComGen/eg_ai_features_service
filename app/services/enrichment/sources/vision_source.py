@@ -47,6 +47,36 @@ VISUAL_SEMANTIC_TYPES = {
     "visible_size", "visible_label", "pattern", "texture",
 }
 
+# Semantic types which are NEVER visually determinable from a photo.
+# Fabric composition, season, care instructions, country of origin, weight, etc.
+# cannot be inferred from a product image — emitting them is hallucination.
+# This denylist acts as a hard gate: any attribute whose semantic_type is listed
+# here is silently dropped from Vision output regardless of what the LLM returns.
+# Extend this set; never shrink it without an explicit architectural decision.
+NON_VISUAL_SEMANTIC_TYPES: frozenset[str] = frozenset({
+    # Fabric / textile composition (Материал, Состав материала, …)
+    "material",
+    "material_composition",
+    "composition",
+    "fabric",
+    "fabric_composition",
+    # Seasonal applicability (Сезон)
+    "season",
+    # Laundry / care (Уход, Рекомендации по уходу)
+    "care",
+    "care_instructions",
+    # Physical measurements not readable from photo without a reference scale
+    "weight",
+    "net_weight",
+    "gross_weight",
+    # Origin / geography (Страна производства)
+    "country",
+    "country_of_origin",
+    # Thermal / functional specs (Температурный режим, …)
+    "temperature",
+    "thermal",
+})
+
 
 class _VisionExtractedAttr(BaseModel):
     model_config = {"populate_by_name": True}
@@ -111,19 +141,22 @@ class VisionSource(AttributeSource):
         return Source.VISION
 
     def is_applicable(self, context: ExtractionContext, target: TargetAttribute) -> bool:
-        """Применим если есть image_urls И целевой attribute не numeric.
+        """Применим если есть image_urls И целевой attribute не numeric И не из
+        NON_VISUAL_SEMANTIC_TYPES.
 
-        Semantic types это hint а не whitelist: пробуем все non-numeric attrs
-        когда есть фото, judge отфильтрует мусор. Это даёт vision доступ к
-        package labels (80 PLUS, бренд, страна, артикул, гарантия).
+        Semantic types используются как soft hint для позитивных случаев, но
+        NON_VISUAL_SEMANTIC_TYPES — жёсткий запрет: fabric/composition/season/care/weight
+        НЕЛЬЗЯ определить с фото, поэтому Vision не должен даже пытаться.
         """
         if not context.image_urls:
             return False
-        # Numeric targets — vision plохо измеряет числа без референса.
+        # Numeric targets — vision плохо измеряет числа без референса.
         if target.type == "numeric":
             return False
-        # Semantic type — hint: если задан и явно визуальный, ok; если задан
-        # но не визуальный, всё равно пробуем (judge решит).
+        # Hard denylist: attrs whose semantic_type is known to be non-visual.
+        # These cannot be determined from a photo — attempting them causes hallucinations.
+        if target.semantic_type and target.semantic_type.lower() in NON_VISUAL_SEMANTIC_TYPES:
+            return False
         return True
 
     async def extract(
@@ -227,20 +260,31 @@ class VisionSource(AttributeSource):
                 logger.info("[Vision] context enrich: %s", ", ".join(enriched))
 
         target_by_id = {t.id: t for t in targets}
-        return [
-            AttributeValue(
+        results: list[AttributeValue] = []
+        for a in parsed.extracted:
+            tgt = target_by_id.get(a.attribute_id)
+            sem_type = tgt.semantic_type if tgt else None
+            # Second chokepoint: drop any non-visual attr the LLM tried to emit.
+            # This catches cases where is_applicable was bypassed (e.g. direct
+            # inject paths) or where semantic_type was None at scheduling time but
+            # is known now via the target_by_id lookup.
+            if sem_type and sem_type.lower() in NON_VISUAL_SEMANTIC_TYPES:
+                logger.warning(
+                    "[Vision] dropping non-visual attr %s (semantic_type=%s, value=%r) — "
+                    "fabric/composition/season cannot be determined from a photo",
+                    a.attribute_id, sem_type, a.value,
+                )
+                continue
+            results.append(AttributeValue(
                 attribute_id=a.attribute_id,
                 value=a.value,
                 confidence=a.confidence,
                 source=Source.VISION,
                 evidence=a.evidence,
-                semantic_type=target_by_id[a.attribute_id].semantic_type
-                              if a.attribute_id in target_by_id else None,
-                is_collection=target_by_id[a.attribute_id].is_collection
-                              if a.attribute_id in target_by_id else False,
-            )
-            for a in parsed.extracted
-        ]
+                semantic_type=sem_type,
+                is_collection=tgt.is_collection if tgt else False,
+            ))
+        return results
 
     def get_judge(self) -> LlmJudge:
         return self._judge

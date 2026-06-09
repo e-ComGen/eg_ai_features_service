@@ -8,7 +8,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from app.services.enrichment.base import (
     AttributeValue, ExtractionContext, Source, TargetAttribute,
 )
-from app.services.enrichment.sources.vision_source import VisionSource, VISUAL_SEMANTIC_TYPES
+from app.services.enrichment.sources.vision_source import (
+    VisionSource, VISUAL_SEMANTIC_TYPES, NON_VISUAL_SEMANTIC_TYPES,
+)
 from app.services.enrichment.judges.vision_judge import VisionJudge
 from app.services.enrichment.vision_producer import VisionProducer
 from app.services.providers.structured_adapter import StructuredLlmManager
@@ -87,16 +89,23 @@ def test_is_applicable_no_images():
     assert source.is_applicable(ctx, target) is False
 
 
-def test_is_applicable_non_numeric_semantic_type_is_hint_not_whitelist():
-    """semantic_type — это hint, а не whitelist: любой non-numeric attr применим при наличии фото.
+def test_is_applicable_non_visual_semantic_type_is_blocked():
+    """NON_VISUAL_SEMANTIC_TYPES acts as a hard denylist, not a hint.
 
-    Раньше VISUAL_SEMANTIC_TYPES работал как whitelist; теперь is_applicable пробует
-    все non-numeric таргеты (semantic_type только подсказка), поэтому enum-таргет с
-    semantic_type='weight' остаётся применимым.
+    Weight cannot be determined from a photo, so Vision must refuse it even
+    when the target type is enum (non-numeric).
     """
     source, _, _ = _make_vision_source()
     ctx = _make_context(image_urls=["https://example.com/img.jpg"])
-    target = _make_target(semantic_type="weight")  # type='enum' (non-numeric)
+    target = _make_target(semantic_type="weight")  # type='enum' but non-visual
+    assert source.is_applicable(ctx, target) is False
+
+
+def test_is_applicable_unknown_semantic_type_passes_through():
+    """An unknown/unrecognised semantic_type is not blocked (permissive for novel types)."""
+    source, _, _ = _make_vision_source()
+    ctx = _make_context(image_urls=["https://example.com/img.jpg"])
+    target = _make_target(semantic_type="some_unknown_type")
     assert source.is_applicable(ctx, target) is True
 
 
@@ -218,3 +227,139 @@ async def test_extract_semantic_type_none_when_target_has_no_semantic_type():
 
     assert len(result) == 1
     assert result[0].semantic_type is None
+
+
+# ---------------------------------------------------------------------------
+# NON_VISUAL_SEMANTIC_TYPES gate tests
+# ---------------------------------------------------------------------------
+
+def test_non_visual_semantic_types_contains_required_entries():
+    """NON_VISUAL_SEMANTIC_TYPES must block material, composition, season, care, weight."""
+    required = {"material", "composition", "fabric", "season", "care", "weight", "country"}
+    assert required.issubset(NON_VISUAL_SEMANTIC_TYPES), (
+        f"Missing entries in NON_VISUAL_SEMANTIC_TYPES: {required - NON_VISUAL_SEMANTIC_TYPES}"
+    )
+
+
+def test_visual_semantic_types_not_blocked():
+    """VISUAL_SEMANTIC_TYPES must not overlap with NON_VISUAL_SEMANTIC_TYPES."""
+    overlap = VISUAL_SEMANTIC_TYPES & NON_VISUAL_SEMANTIC_TYPES
+    assert not overlap, f"Overlap between visual and non-visual sets: {overlap}"
+
+
+def test_is_applicable_blocks_material_semantic_type():
+    """is_applicable returns False for target with semantic_type='material'."""
+    source, _, _ = _make_vision_source()
+    ctx = _make_context(image_urls=["https://example.com/img.jpg"])
+    target = _make_target(attr_id=4496, name="Материал", semantic_type="material")
+    assert source.is_applicable(ctx, target) is False
+
+
+def test_is_applicable_blocks_composition_semantic_type():
+    """is_applicable returns False for target with semantic_type='composition' (Состав материала)."""
+    source, _, _ = _make_vision_source()
+    ctx = _make_context(image_urls=["https://example.com/img.jpg"])
+    target = _make_target(attr_id=4604, name="Состав материала", semantic_type="composition")
+    assert source.is_applicable(ctx, target) is False
+
+
+def test_is_applicable_blocks_season_semantic_type():
+    """is_applicable returns False for target with semantic_type='season'."""
+    source, _, _ = _make_vision_source()
+    ctx = _make_context(image_urls=["https://example.com/img.jpg"])
+    target = _make_target(attr_id=4495, name="Сезон", semantic_type="season")
+    assert source.is_applicable(ctx, target) is False
+
+
+def test_is_applicable_allows_color():
+    """is_applicable returns True for target with semantic_type='color'."""
+    source, _, _ = _make_vision_source()
+    ctx = _make_context(image_urls=["https://example.com/img.jpg"])
+    target = _make_target(attr_id=10096, name="Цвет", semantic_type="color")
+    assert source.is_applicable(ctx, target) is True
+
+
+def test_is_applicable_allows_pattern():
+    """is_applicable returns True for target with semantic_type='pattern'."""
+    source, _, _ = _make_vision_source()
+    ctx = _make_context(image_urls=["https://example.com/img.jpg"])
+    target = _make_target(attr_id=200, name="Рисунок", semantic_type="pattern")
+    assert source.is_applicable(ctx, target) is True
+
+
+@pytest.mark.asyncio
+async def test_extract_drops_material_hallucination_camel_wool():
+    """Vision emitting 'Верблюжья шерсть' for Материал (semantic_type=material) must be dropped.
+
+    Reproduces the live Levi's 501 jeans hallucination: the LLM returned
+    'Верблюжья шерсть' as fabric composition — which is impossible to determine
+    from a photo. The second-chokepoint gate in extract() must silently drop it.
+    """
+    from app.services.enrichment.sources.vision_source import _VisionExtractedAttr
+    # LLM hallucinated camel wool for a denim jeans photo
+    extracted = [
+        _VisionExtractedAttr(attribute_id=4496, value="Верблюжья шерсть", confidence=0.75,
+                             evidence="fabric texture looks like wool"),
+    ]
+    source, _, _ = _make_vision_source(
+        vision_text="Photo of Levi's 501 jeans. Blue denim, 5-pocket design.",
+        extracted=extracted,
+    )
+    ctx = _make_context()
+    # Target has semantic_type=material — non-visual
+    target_material = _make_target(attr_id=4496, name="Материал", semantic_type="material")
+
+    result = await source.extract(ctx, [target_material])
+
+    # The hallucinated camel wool value must NOT appear in the result
+    assert result == [], (
+        f"Expected empty result; got {result!r} — Vision must not emit fabric composition"
+    )
+
+
+@pytest.mark.asyncio
+async def test_extract_drops_composition_semantic_type():
+    """Vision emitting a value for Состав материала (semantic_type=composition) is blocked."""
+    from app.services.enrichment.sources.vision_source import _VisionExtractedAttr
+    extracted = [
+        _VisionExtractedAttr(attribute_id=4604, value="Вискоза", confidence=0.80,
+                             evidence="soft drape in photo"),
+    ]
+    source, _, _ = _make_vision_source(
+        vision_text="Lightweight dress, soft drape.",
+        extracted=extracted,
+    )
+    ctx = _make_context()
+    target_comp = _make_target(attr_id=4604, name="Состав материала", semantic_type="composition")
+
+    result = await source.extract(ctx, [target_comp])
+
+    assert result == [], "Vision must not emit fabric composition regardless of LLM output"
+
+
+@pytest.mark.asyncio
+async def test_extract_keeps_color_while_dropping_material():
+    """Vision keeps color fills but drops material fills in the same extraction batch."""
+    from app.services.enrichment.sources.vision_source import _VisionExtractedAttr
+    extracted = [
+        _VisionExtractedAttr(attribute_id=10096, value="Синий", confidence=0.92,
+                             evidence="blue denim fabric clearly visible"),
+        _VisionExtractedAttr(attribute_id=4496, value="Верблюжья шерсть", confidence=0.75,
+                             evidence="texture looks soft"),
+    ]
+    source, _, _ = _make_vision_source(
+        vision_text="Blue denim jeans, clearly visible colour.",
+        extracted=extracted,
+    )
+    ctx = _make_context()
+    targets = [
+        _make_target(attr_id=10096, name="Цвет", semantic_type="color"),
+        _make_target(attr_id=4496, name="Материал", semantic_type="material"),
+    ]
+
+    result = await source.extract(ctx, targets)
+
+    result_ids = [av.attribute_id for av in result]
+    assert 10096 in result_ids, "Color fill must be kept"
+    assert 4496 not in result_ids, "Material fill must be dropped"
+    assert len(result) == 1
