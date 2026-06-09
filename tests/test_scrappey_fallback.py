@@ -83,8 +83,15 @@ async def test_flag_on_domain_in_set_403_uses_scrappey(monkeypatch, banned_url):
 
 
 @pytest.mark.asyncio
-async def test_flag_on_domain_not_in_set_403_no_scrappey(monkeypatch):
-    """Flag ON but domain NOT in set + 403 → scrappey NOT called, None returned."""
+async def test_flag_on_domain_not_in_fast_set_403_still_uses_scrappey(monkeypatch):
+    """Flag ON + domain NOT in fast set + 403 → scrappey IS called for any non-CDN host.
+
+    The strict domain allowlist was replaced by a content-quality-based trigger:
+    any host that is not in the non-text denylist (CDN/tracker/social) is now
+    eligible for the Scrappey fallback.  URL_FETCHER_SCRAPPEY_DOMAINS remains
+    supported as an optional 'fast-eligible' annotation but no longer gates
+    which hosts can ever use the fallback.
+    """
     monkeypatch.setenv("URL_FETCHER_SCRAPPEY_FALLBACK", "1")
     monkeypatch.setenv("URL_FETCHER_SCRAPPEY_DOMAINS", "ozon.ru,dns-shop.ru")
     monkeypatch.setattr(httpx.AsyncClient, "get", _make_get_returning(403))
@@ -93,15 +100,17 @@ async def test_flag_on_domain_not_in_set_403_no_scrappey(monkeypatch):
 
     async def _spy(url, timeout=120.0):
         called["n"] += 1
-        return "<html>nope</html>"
+        return "<html>real product content here with lots of text " + "x" * 600 + "</html>"
 
     monkeypatch.setattr(
         "app.services.providers.scrappey_client.scrappey_fetch", _spy
     )
 
     resp = await url_fetcher._get_with_retry("https://random-other-site.com/p/1")
-    assert resp is None
-    assert called["n"] == 0
+    # Scrappey fires for any product domain (not just the fast-set)
+    assert called["n"] == 1
+    assert resp is not None
+    assert resp.status_code == 200
 
 
 @pytest.mark.asyncio
