@@ -40,6 +40,7 @@ Latency: ~1-3s Serper + 8-20s Scrappey.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -76,6 +77,7 @@ from app.services.enrichment.sources.wb_card_source import (
     _type_lemma,            # noun-aware lemma for card-type compatibility check
 )
 from app.services.providers.factory import get_web_search_client
+from app.services.providers.scrappey_client import scrappey_fetch as _scrappey_fetch_page
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +100,13 @@ _SKIP_FILL_RATIO = 0.80
 
 # LRU
 _CACHE_MAX = 256
+
+# Timeout constants — mirror OzonCardSource to prevent hangs.
+# 60s matches the httpx-level timeout floor in OzonCard/_HTTP_TIMEOUT.
+# 90s is the hard asyncio.wait_for cap (_OZON_CARD_TOTAL_TIMEOUT) — cloned here
+# so YandexMarket can't stall the pipeline on N-retry × 60s Scrappey slowness.
+_SCRAPPEY_HTTP_TIMEOUT = 60.0
+_YM_TOTAL_TIMEOUT = 90.0
 
 # Извлечение product-id/slug из URL карточки Маркета. Покрывает форматы:
 #   https://market.yandex.ru/product--<slug>/<digits>
@@ -124,6 +133,18 @@ _INITIAL_STATE_RE = re.compile(
 _NEXT_DATA_RE = re.compile(
     r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>\s*(\{.*?)</script>',
     re.DOTALL,
+)
+# Live Yandex Market (2024-2026) does NOT use __INITIAL_STATE__ / __NEXT_DATA__.
+# Instead it renders product specs into search-tile blobs of the form:
+#   "specs":{"friendly":["Цвет: Чёрный","Пол: Мужской",...]}
+# These are brief key-value strings that we can parse by splitting on ": ".
+# They appear in search-result tiles embedded in the page alongside the target
+# product, so we harvest ALL tiles and let the caller filter by score.
+# Pattern uses [^\]]* (no-] char class) rather than .*? to reliably capture
+# the list content without accidentally matching past the closing bracket when
+# specs strings contain Unicode escape sequences. re.DOTALL not needed here.
+_SPECS_FRIENDLY_RE = re.compile(
+    r'"specs"\s*:\s*\{[^}]*"friendly"\s*:\s*(\[[^\]]*\])',
 )
 
 # Brand-line BLACKLIST — model-specific атрибуты (зеркало других card-sources).
@@ -235,7 +256,17 @@ class YandexMarketSource(AttributeSource):
             return self._filter_for_targets(self._cache[cache_key], effective)
 
         try:
-            all_values = await self._do_extract(context, targets)
+            all_values = await asyncio.wait_for(
+                self._do_extract(context, targets),
+                timeout=_YM_TOTAL_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[YandexMarket] total timeout (%.0fs) for '%s' — skipping YandexMarket stage",
+                _YM_TOTAL_TIMEOUT,
+                context.product_name[:60],
+            )
+            return []
         except Exception as exc:
             logger.warning(
                 "[YandexMarket] unexpected error для '%s': %s",
@@ -352,31 +383,38 @@ class YandexMarketSource(AttributeSource):
         return out[:_MAX_CANDIDATES]
 
     async def _fetch_card_html(self, url: str) -> Optional[str]:
-        """Скачать HTML карточки market.yandex.ru.
+        """Скачать HTML карточки market.yandex.ru через Scrappey browser-bypass.
 
-        TODO(scrappey): market.yandex.ru за Yandex SmartCaptcha (IP+fingerprint
-        гейт, режет datacenter-IP). Прямой httpx с серверного IP вернёт
-        captcha/redirect, не товар. Реальный fetch требует Scrappey (как
-        OzonCardSource._scrappey_fetch) или аналогичного super-proxy с бюджетом.
+        market.yandex.ru за Yandex SmartCaptcha (IP+fingerprint гейт, режет
+        datacenter-IP). Прямой httpx с серверного IP вернёт captcha/redirect.
+        Scrappey запускает реальный браузер и обходит этот гейт (тот же путь,
+        что OzonCardSource для ozon.ru).
 
-        Пока Scrappey-путь не подключён здесь — возвращаем None (graceful: весь
-        источник деградирует к []). Когда SCRAPPEY_KEY и бюджет доступны, тут
-        нужно сделать POST к _SCRAPPEY_ENDPOINT с {"cmd":"request.get","url":url}
-        и вернуть solution.response (см. ozon_card_source._scrappey_fetch_once).
-        Парсинг (_parse_card) уже полностью готов к такому HTML.
+        Timeout: asyncio.wait_for(_SCRAPPEY_HTTP_TIMEOUT=60s) — один запрос.
+        Hard cap на весь _do_extract (_YM_TOTAL_TIMEOUT=90s) задан выше в extract().
+
+        Возвращает HTML response на success, None на любой ошибке (graceful).
+        Парсинг (_parse_card) полностью готов к такому HTML.
         """
         if not self._scrappey_key:
             logger.info(
-                "[YandexMarket] _fetch_card_html: SCRAPPEY_KEY не задан и прямой fetch "
-                "блокируется SmartCaptcha → None (см. TODO в коде)."
+                "[YandexMarket] _fetch_card_html: SCRAPPEY_KEY не задан → None (graceful)"
             )
             return None
-        # TODO: implement Scrappey fetch here (mirror OzonCardSource._scrappey_fetch_once).
-        logger.info(
-            "[YandexMarket] _fetch_card_html: Scrappey-путь не реализован (prototype) "
-            "для %s → None.", url[:80],
-        )
-        return None
+        try:
+            html = await asyncio.wait_for(
+                _scrappey_fetch_page(url, timeout=_SCRAPPEY_HTTP_TIMEOUT),
+                timeout=_SCRAPPEY_HTTP_TIMEOUT + 5,  # slight buffer above httpx timeout
+            )
+        except asyncio.TimeoutError:
+            logger.info("[YandexMarket] _fetch_card_html: asyncio timeout for %s → None", url[:80])
+            return None
+        except Exception as exc:
+            logger.info("[YandexMarket] _fetch_card_html: error for %s: %s → None", url[:80], exc)
+            return None
+        if html:
+            logger.info("[YandexMarket] _fetch_card_html: got %d chars for %s", len(html), url[:80])
+        return html
 
     # ------------------------------------------------------------------
     # HTML parsing
@@ -422,7 +460,15 @@ class YandexMarketSource(AttributeSource):
         # ---- Embedded state: characteristics ----
         chars = cls._parse_state_specs(html)
 
-        # title fallback from <title> tag if JSON-LD missing
+        # title fallback: og:title (more reliable than <title> on YM product pages
+        # which uses "Все товары" generic title) → then <title> as last resort.
+        if not title:
+            m = re.search(
+                r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+                html, re.IGNORECASE | re.DOTALL,
+            )
+            if m:
+                title = re.sub(r"\s+", " ", m.group(1)).strip()
         if not title:
             m = re.search(r"<title>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
             if m:
@@ -437,22 +483,39 @@ class YandexMarketSource(AttributeSource):
 
     @classmethod
     def _parse_state_specs(cls, html: str) -> list[dict]:
-        """Извлечь характеристики из __INITIAL_STATE__ / __NEXT_DATA__ blob.
+        """Извлечь характеристики из состояния страницы Яндекс Маркет.
 
-        Маркет рендерит specs в state-блобе в одном из вариантов формы. Мы:
-          1. Достаём JSON блоба (любой из regex-вариантов).
-          2. Рекурсивно ищем контейнеры под ключами _SPEC_CONTAINER_KEYS.
-          3. Из каждого контейнера (list of dicts / dict-of-lists) собираем пары
-             {name, value}, устойчиво к ключам name|key|title и value|values|text.
+        Поддерживаемые форматы (эволюция рендера Маркета):
+          1. __INITIAL_STATE__ / __NEXT_DATA__ (старый Next.js рендер) — {name, value} пары.
+          2. specs.friendly (актуальный рендер 2024-2026) — плоский список строк вида
+             "Цвет: Чёрный", "Пол: Мужской". Парсим split(': ', 1).
+
+        Формат 2 появляется в search-tile блобах на product-странице. Каждый тайл несёт
+        specs.friendly для одного товара; мы собираем ВСЕ тайлы и dedup по имени —
+        caller (_do_extract) применяет rapidfuzz-матч по заголовку и выбирает лучший тайл.
+        Уточнение: specs.friendly — сокращённый набор (5-8 атрибутов), не полная таблица.
+        Для generic-named apparel это достаточно (цвет, пол, тип, состав, сезон).
 
         Возвращает [{name, value, value_ids:[]}], deduped по lowercase name.
         """
+        out: list[dict] = []
+        seen: set[str] = set()
+
+        def _add(nm: str, val: str) -> None:
+            nm = nm.strip()
+            val = val.strip()
+            if not nm or not val:
+                return
+            low = nm.lower()
+            if low in seen:
+                return
+            seen.add(low)
+            out.append({"name": nm, "value": val, "value_ids": []})
+
+        # --- Format 1: __INITIAL_STATE__ / __NEXT_DATA__ (legacy Next.js rendering) ---
         blobs: list[str] = []
         blobs += _INITIAL_STATE_RE.findall(html)
         blobs += _NEXT_DATA_RE.findall(html)
-
-        out: list[dict] = []
-        seen: set[str] = set()
         for blob in blobs:
             sliced = cls._balanced_json_slice(blob)
             if sliced is None:
@@ -462,17 +525,23 @@ class YandexMarketSource(AttributeSource):
                 continue
             for container in cls._find_spec_containers(data):
                 for name, value in cls._pairs_from_container(container):
-                    nm = name.strip()
-                    if not nm:
-                        continue
-                    low = nm.lower()
-                    if low in seen:
-                        continue
-                    val = value.strip()
-                    if not val:
-                        continue
-                    seen.add(low)
-                    out.append({"name": nm, "value": val, "value_ids": []})
+                    _add(name, value)
+
+        # --- Format 2: specs.friendly (current 2024-2026 YM rendering) ---
+        # Each search-tile embeds a brief specs array as pre-formatted strings.
+        # We collect ALL tiles and merge — _do_extract selects best by title score.
+        for raw_list in _SPECS_FRIENDLY_RE.findall(html):
+            items = cls._safe_json(raw_list)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, str):
+                    continue
+                # Format: "Ключ: Значение"
+                if ": " in item:
+                    name_part, _, val_part = item.partition(": ")
+                    _add(name_part, val_part)
+
         return out
 
     @classmethod
