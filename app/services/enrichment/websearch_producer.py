@@ -497,3 +497,119 @@ class WebSearchProducer:
 
         logger.debug("WebSearchProducer: produced %d chars.", len(answer_text))
         return answer_text
+
+    # ------------------------------------------------------------------
+    # Composition mining: targeted Serper search → raw HTML → extractor
+    # ------------------------------------------------------------------
+    async def mine_composition(
+        self,
+        product_name: str,
+        brand: Optional[str] = None,
+        timeout: int = 30,
+    ) -> list[str]:
+        """Mine fabric/material composition from the web.
+
+        Runs a Serper search targeted at composition ("состав материала" / "fabric
+        composition"), fetches up to 3 HTTPS generic PDP pages, runs
+        extract_composition on the FULL raw HTML (bypassing the trafilatura cap),
+        applies brand-verification, deduplicates, and returns a list of normalised
+        composition strings like ["79% хлопок, 21% полиэстер"].
+
+        Returns [] on any failure (fail-closed — "пусто честнее мусора").
+        Only functional when self._use_serper is True; returns [] for the legacy
+        OpenAI path (no page fetching there).
+        """
+        if not self._use_serper or self._serper is None:
+            return []
+        if not product_name:
+            return []
+
+        from app.services.enrichment.composition_extractor import (
+            extract_composition,
+            page_matches_brand,
+        )
+        from app.services.url_fetcher import fetch_all_results
+
+        # Targeted query: brand + product name + composition keywords
+        parts = []
+        if brand:
+            parts.append(brand)
+        parts.append(product_name)
+        # Bilingual composition search keywords
+        query = " ".join(parts) + " состав материала fabric composition"
+
+        try:
+            sem = _get_serper_sem()
+            async with sem:
+                results = await asyncio.wait_for(
+                    self._serper.search(query, num_results=5),
+                    timeout=timeout,
+                )
+        except (asyncio.TimeoutError, Exception) as exc:
+            logger.warning("WebSearchProducer.mine_composition: search failed: %s", exc)
+            return []
+
+        top_urls = [
+            r.link
+            for r in (results.organic_results or [])[:5]
+            if getattr(r, "link", None) and str(r.link).startswith("https://")
+            # Skip known marketplace pages that we'd fetch via their APIs (no raw HTML)
+            and "wildberries.ru" not in str(r.link)
+            and "ozon.ru" not in str(r.link)
+            and "aliexpress" not in str(r.link)
+        ][:3]
+
+        if not top_urls:
+            logger.debug("WebSearchProducer.mine_composition: no HTTPS URLs for %r", product_name)
+            return []
+
+        try:
+            fetch_results = await asyncio.wait_for(
+                fetch_all_results(top_urls),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "WebSearchProducer.mine_composition: page fetch timed out for %r", product_name
+            )
+            return []
+        except Exception as exc:
+            logger.warning(
+                "WebSearchProducer.mine_composition: page fetch failed for %r: %s", product_name, exc
+            )
+            return []
+
+        all_compositions: list[str] = []
+        for fr in fetch_results:
+            # Use raw_html when available (full page, untruncated).
+            # Fall back to content (already trafilatura-extracted but may still work).
+            source_text = fr.raw_html if fr.raw_html else fr.content
+            if not source_text:
+                continue
+
+            # CRITICAL brand-verification gate: only accept composition from pages
+            # that plausibly describe OUR product.
+            if not page_matches_brand(source_text, fr.url, brand, product_name):
+                logger.debug(
+                    "WebSearchProducer.mine_composition: brand mismatch on %r — skipping", fr.url
+                )
+                continue
+
+            compositions = extract_composition(source_text)
+            if compositions:
+                logger.info(
+                    "WebSearchProducer.mine_composition: found %d composition(s) on %r: %s",
+                    len(compositions), fr.url, compositions,
+                )
+                all_compositions.extend(compositions)
+
+        # Deduplicate (keep first occurrence)
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for c in all_compositions:
+            key = c.lower()
+            if key not in seen:
+                seen.add(key)
+                deduped.append(c)
+
+        return deduped

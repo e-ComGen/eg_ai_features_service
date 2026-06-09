@@ -5,11 +5,18 @@ Steps:
 2. LLM summary → текст о товаре из найденных страниц
 3. Extraction LLM → AttributeValue list
 
+Step 0 (apparel): if targets include Ozon attr 4604 (Состав материала) or 4496
+(Материал), run domain-agnostic composition mining on fetched page HTML BEFORE
+the LLM step. This fills the "apparel data-desert" gap (WB/Ozon have no card but
+open shops like kixbox.ru do carry composition). Composition values are emitted
+directly — no LLM call needed for them.
+
 Самый дорогой source. Применять последним когда другие не дали достаточно
 информации. CostPredictor (отдельный класс) решает стоит ли запускать.
 
 Spec: docs/architecture/pipeline.md, section "Stage 4 / WebSearchSource".
 """
+import logging
 import os
 from typing import Optional
 from pydantic import BaseModel, Field, AliasChoices, model_validator
@@ -27,6 +34,16 @@ from app.services.enrichment.prompt_router import (
 )
 from app.services.enrichment.strategies.base import MarketplaceStrategy
 from app.services.enrichment.strategies.default_strategy import DefaultStrategy
+
+logger = logging.getLogger(__name__)
+
+# Ozon attribute IDs for fabric composition (hardcoded by Ozon spec, not by us)
+_ATTR_SOSTAV_MATERIALA = 4604   # free-text "Состав материала"
+_ATTR_MATERIAL = 4496           # enum "Материал"
+
+# Confidence cap for composition sourced from open shops (below WB/Ozon card
+# sources at 0.90, but meaningful signal — brand-verified page + two-signal rule)
+_COMPOSITION_CONFIDENCE = 0.72
 
 
 class _WebExtractedAttr(BaseModel):
@@ -94,6 +111,13 @@ class WebSearchSource(AttributeSource):
         effective_targets = filter_already_filled_targets(targets, already_filled or [])
         if not effective_targets:
             return []
+
+        # Step 0: composition mining (apparel data-desert).
+        # Run BEFORE the LLM path — no LLM call needed for composition.
+        # Only fires when 4604 or 4496 are among the unfilled targets.
+        composition_avs = await self._mine_composition_if_needed(
+            context, effective_targets, already_filled or []
+        )
 
         # Step 1+2: search + summary (cached per product).
         # MPN передаётся первым в search query — точный код производителя имеет
@@ -190,7 +214,7 @@ class WebSearchSource(AttributeSource):
             and not (a.attribute_id in _seen or _seen.add(a.attribute_id))
         ]
 
-        return [
+        llm_avs = [
             AttributeValue(
                 attribute_id=a.attribute_id,
                 value=a.value,
@@ -204,6 +228,108 @@ class WebSearchSource(AttributeSource):
             )
             for a in all_extracted
         ]
+
+        # Merge: composition_avs first (deterministic, no LLM), then LLM results.
+        # LLM results that overlap 4604/4496 are kept as well (merger will pick best).
+        return composition_avs + llm_avs
+
+    # ------------------------------------------------------------------
+    # Composition mining helper
+    # ------------------------------------------------------------------
+
+    async def _mine_composition_if_needed(
+        self,
+        context: ExtractionContext,
+        effective_targets: list[TargetAttribute],
+        already_filled: list[AttributeValue],
+    ) -> list[AttributeValue]:
+        """Mine fabric composition from raw pages and emit Состав/Материал AVs.
+
+        Returns [] when:
+        - Neither 4604 nor 4496 is in unfilled targets.
+        - The producer doesn't support composition mining (no Serper).
+        - Nothing passes the two-signal filter + brand-verification gate.
+        """
+        target_ids = {t.id for t in effective_targets}
+        wants_sostav = _ATTR_SOSTAV_MATERIALA in target_ids
+        wants_material = _ATTR_MATERIAL in target_ids
+        if not wants_sostav and not wants_material:
+            return []
+
+        # Already filled check (don't mine if already emitted by another source)
+        filled_ids = {av.attribute_id for av in already_filled}
+        if _ATTR_SOSTAV_MATERIALA in filled_ids and not wants_material:
+            return []
+        if _ATTR_MATERIAL in filled_ids and not wants_sostav:
+            return []
+
+        compositions = await self._search.mine_composition(
+            product_name=context.product_name,
+            brand=context.brand,
+        )
+        if not compositions:
+            return []
+
+        from app.services.enrichment.composition_extractor import (
+            normalize_material_en_ru,
+            primary_material,
+        )
+        from app.services.enrichment.strategies.dictionaries.ozon_loader import resolve_value_id
+
+        avs: list[AttributeValue] = []
+        composed_str = "; ".join(compositions)
+
+        # 4604 — free-text "Состав материала"
+        if wants_sostav and _ATTR_SOSTAV_MATERIALA not in filled_ids:
+            avs.append(AttributeValue(
+                attribute_id=_ATTR_SOSTAV_MATERIALA,
+                value=composed_str,
+                confidence=_COMPOSITION_CONFIDENCE,
+                source=Source.WEB_SEARCH,
+                evidence="composition_extractor: two-signal rule on fetched page HTML",
+            ))
+            logger.info(
+                "WebSearchSource: emitting Состав материала(4604)=%r (conf=%.2f)",
+                composed_str[:80], _COMPOSITION_CONFIDENCE,
+            )
+
+        # 4496 — enum "Материал": resolve dominant material to dict value_id
+        if wants_material and _ATTR_MATERIAL not in filled_ids:
+            dom_mat = primary_material(compositions)
+            if dom_mat:
+                # Attempt resolve; only emit if we get a value_id (fail-closed)
+                type_id = getattr(context, "ozon_type_id", None)
+                value_id = None
+                if type_id is not None:
+                    try:
+                        value_id = resolve_value_id(
+                            context.category_id, type_id, _ATTR_MATERIAL, dom_mat
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "WebSearchSource: resolve_value_id(4496, %r) failed: %s", dom_mat, exc
+                        )
+                if value_id is not None:
+                    av = AttributeValue(
+                        attribute_id=_ATTR_MATERIAL,
+                        value=dom_mat,
+                        confidence=_COMPOSITION_CONFIDENCE,
+                        source=Source.WEB_SEARCH,
+                        evidence=f"composition_extractor: dominant material={dom_mat}",
+                        value_id=value_id,
+                    )
+                    avs.append(av)
+                    logger.info(
+                        "WebSearchSource: emitting Материал(4496)=%r value_id=%d",
+                        dom_mat, value_id,
+                    )
+                else:
+                    logger.debug(
+                        "WebSearchSource: Материал(4496) %r could not be resolved — skipped",
+                        dom_mat,
+                    )
+
+        return avs
 
     def get_judge(self) -> LlmJudge:
         return self._judge
