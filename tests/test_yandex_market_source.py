@@ -144,6 +144,96 @@ def test_parse_state_specs_dedup_and_empty_safe():
     assert YandexMarketSource._parse_card("")["chars"] == []
 
 
+# ---------------------------------------------------------------------------
+# Format 3: data-auto="product-spec" (SSR spec table, 2024-2026 product pages)
+# ---------------------------------------------------------------------------
+
+SAMPLE_HTML_SSR_SPECS = """
+<!DOCTYPE html><html lang="ru"><head>
+<script type="application/ld+json">
+{"@type":"Product","name":"Джинсы Levi's 511 Slim","brand":{"@type":"Brand","name":"Levi's"}}
+</script>
+</head><body>
+<div data-zone-name="fullSpecs">
+  <div class="_2jsum">
+    <div class="j0C6X"><div class="_16c58">
+      <span data-auto="product-spec" class="ds-text">Состав материала</span>
+    </div></div>
+    <div class="_1_zPW"><div class="_19UG7">
+      <div class="ds-text"><span>Хлопок 98%, Эластан 2%</span></div>
+    </div></div>
+  </div>
+  <div class="_2jsum">
+    <div class="j0C6X"><div class="_16c58">
+      <span data-auto="product-spec" class="ds-text">Пол</span>
+    </div></div>
+    <div class="_1_zPW"><div class="_19UG7">
+      <div class="" data-zone-name="specLink" data-node-id="x1"
+           data-zone-data="{&quot;url&quot;:&quot;/catalog&quot;,&quot;urlTargetType&quot;:&quot;catalog_list&quot;,&quot;isUrlCanonical&quot;:false,&quot;text&quot;:&quot;мужской&quot;}"
+           data-baobab-name="specLink"><a href="/catalog">мужской</a></div>
+    </div></div>
+  </div>
+  <div class="_2jsum">
+    <div class="j0C6X"><div class="_16c58">
+      <span data-auto="product-spec" class="ds-text">Сезон</span>
+    </div></div>
+    <div class="_1_zPW"><div class="_19UG7">
+      <div class="ds-text"><span>всесезон</span></div>
+    </div></div>
+  </div>
+  <div class="_2jsum">
+    <div class="j0C6X"><div class="_16c58">
+      <span data-auto="product-spec" class="ds-text">Артикул Маркета</span>
+    </div></div>
+    <div class="_1_zPW"><div class="_19UG7">
+      <div class="ds-text"><span>103064272661</span></div>
+    </div></div>
+  </div>
+</div>
+</body></html>
+"""
+
+
+def test_parse_card_ssr_format3_spec_table():
+    """Format 3: data-auto=product-spec gives the full SSR spec table."""
+    parsed = YandexMarketSource._parse_card(SAMPLE_HTML_SSR_SPECS)
+    assert parsed["title"] == "Джинсы Levi's 511 Slim"
+    assert parsed["brand"] == "Levi's"
+    chars = {c["name"].lower(): c["value"] for c in parsed["chars"]}
+    # plain text span value
+    assert "хлопок 98%" in chars["состав материала"].lower()
+    assert "эластан 2%" in chars["состав материала"].lower()
+    # specLink text value
+    assert chars["пол"] == "мужской"
+    # numeric-value (artikul)
+    assert chars["артикул маркета"] == "103064272661"
+    # another plain value
+    assert chars["сезон"] == "всесезон"
+    # dedup: same name should appear only once
+    names = [c["name"].lower() for c in parsed["chars"]]
+    assert len(names) == len(set(names)), "No duplicates expected"
+
+
+def test_parse_state_specs_format3_dedup():
+    """Format 3 deduplication: same spec name from multiple zones appears once."""
+    # Spec appears twice (ProductSpecsList + fullSpecs both rendered server-side)
+    double_html = SAMPLE_HTML_SSR_SPECS + """
+    <div data-zone-name="ProductSpecsList">
+      <div class="_2jsum">
+        <div class="j0C6X"><div class="_16c58">
+          <span data-auto="product-spec" class="ds-text">Состав материала</span>
+        </div></div>
+        <div class="_1_zPW"><div class="_19UG7">
+          <div class="ds-text"><span>Хлопок 98%, Эластан 2%</span></div>
+        </div></div>
+      </div>
+    </div>
+    """
+    parsed = YandexMarketSource._parse_card(double_html)
+    names = [c["name"].lower() for c in parsed["chars"]]
+    assert names.count("состав материала") == 1, "Duplicate spec name must be deduped"
+
+
 def test_pairs_from_container_flat_dict():
     pairs = dict(YandexMarketSource._pairs_from_container(
         {"Цвет": "Синий", "Вес": "0.5"}

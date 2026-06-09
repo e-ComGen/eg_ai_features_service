@@ -147,6 +147,25 @@ _SPECS_FRIENDLY_RE = re.compile(
     r'"specs"\s*:\s*\{[^}]*"friendly"\s*:\s*(\[[^\]]*\])',
 )
 
+# YM 2024+ SSR: full spec table is rendered server-side into the product card HTML.
+# Each spec row uses:
+#   <span data-auto="product-spec" ...>SPEC NAME</span>
+#   ... sibling div ...
+#   EITHER: <... data-zone-name="specLink" data-zone-data="{...,\"text\":\"VALUE\"}">
+#   OR:     <span>VALUE TEXT</span>
+# We match spec-name spans and scope the value lookup to the region between
+# consecutive spec-name spans (tight scoping prevents cross-row value leakage).
+_SPEC_NAME_RE = re.compile(
+    r'data-auto=["\']product-spec["\'][^>]*>([^<]{1,120})</span>',
+    re.DOTALL,
+)
+# specLink zone carries the value as JSON text field
+_SPEC_LINK_RE = re.compile(
+    r'data-zone-name=["\']specLink["\'][^>]*data-zone-data=["\']([^"\']+)["\']',
+)
+# Fallback: plain text span within the value container (_1_zPW class is the value side)
+_SPEC_VALUE_SPAN_RE = re.compile(r'<span[^>]*>([^<]{1,300})</span>')
+
 # Brand-line BLACKLIST — model-specific атрибуты (зеркало других card-sources).
 _BRAND_LINE_BLACKLIST: frozenset[str] = frozenset(name.lower() for name in {
     "Артикул", "Код производителя", "MPN", "Партномер", "Серийный номер",
@@ -489,12 +508,16 @@ class YandexMarketSource(AttributeSource):
           1. __INITIAL_STATE__ / __NEXT_DATA__ (старый Next.js рендер) — {name, value} пары.
           2. specs.friendly (актуальный рендер 2024-2026) — плоский список строк вида
              "Цвет: Чёрный", "Пол: Мужской". Парсим split(': ', 1).
-
-        Формат 2 появляется в search-tile блобах на product-странице. Каждый тайл несёт
-        specs.friendly для одного товара; мы собираем ВСЕ тайлы и dedup по имени —
-        caller (_do_extract) применяет rapidfuzz-матч по заголовку и выбирает лучший тайл.
-        Уточнение: specs.friendly — сокращённый набор (5-8 атрибутов), не полная таблица.
-        Для generic-named apparel это достаточно (цвет, пол, тип, состав, сезон).
+          3. data-auto="product-spec" (основной рендер 2024-2026, SSR product card page) —
+             полная таблица характеристик rendered server-side. Каждая строка:
+               <span data-auto="product-spec">ИМЯ</span>
+               ... (sibling div) ...
+               ЛИБО: <... data-zone-name="specLink" data-zone-data='{"text":"ЗНАЧЕНИЕ"}'>
+               ЛИБО: <span>ЗНАЧЕНИЕ</span>
+             Сканируем все product-spec spans, ограничиваем поиск значения регионом до
+             следующего product-spec (tight scoping, предотвращает cross-row leakage).
+             Это даёт полную таблицу (~10-20 пар) включая Состав, Цвет, Пол, Сезон, Бренд,
+             Страна-изготовитель — в отличие от specs.friendly (5-8 пар).
 
         Возвращает [{name, value, value_ids:[]}], deduped по lowercase name.
         """
@@ -541,6 +564,48 @@ class YandexMarketSource(AttributeSource):
                 if ": " in item:
                     name_part, _, val_part = item.partition(": ")
                     _add(name_part, val_part)
+
+        # --- Format 3: data-auto="product-spec" (SSR full spec table, 2024-2026) ---
+        # Harvest before format-2 (or even if format-2 already filled some) — dedupe handles it.
+        # Collect all spec-name span positions first, then scope each value lookup.
+        spec_matches = list(_SPEC_NAME_RE.finditer(html))
+        for i, m in enumerate(spec_matches):
+            spec_name = m.group(1).strip()
+            if not spec_name:
+                continue
+            after_pos = m.end()
+            # Scope: region between this span end and start of next spec-name span.
+            # Cap at 1500 chars to stay well within a single spec row's HTML.
+            next_pos = spec_matches[i + 1].start() if i + 1 < len(spec_matches) else after_pos + 1500
+            region = html[after_pos:min(next_pos, after_pos + 1500)]
+
+            spec_value: Optional[str] = None
+
+            # First try: specLink zone (linked enum value)
+            sl_m = _SPEC_LINK_RE.search(region)
+            if sl_m:
+                try:
+                    zd = json.loads(sl_m.group(1).replace("&quot;", '"'))
+                    v = str(zd.get("text") or "").strip()
+                    if v:
+                        spec_value = v
+                except (ValueError, json.JSONDecodeError, KeyError):
+                    pass
+
+            if spec_value is None:
+                # Second try: first plain text span in the value region.
+                # The value container div (_1_zPW class) comes directly after the
+                # name container. We allow any non-empty span content, INCLUDING
+                # numeric-only values (article numbers, counts, etc.).
+                for sv_m in _SPEC_VALUE_SPAN_RE.finditer(region[:800]):
+                    sv = sv_m.group(1).strip()
+                    # Skip empty, identical to spec name, purely whitespace, or HTML entities
+                    if sv and sv != spec_name and "&" not in sv:
+                        spec_value = sv
+                        break
+
+            if spec_value:
+                _add(spec_name, spec_value)
 
         return out
 
