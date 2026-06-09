@@ -16,6 +16,10 @@ Design
 * Graceful failure — `fetch()` returns None on any error; never raises.
 * atexit cleanup — Chrome process is terminated and the temp user-data dir is
   removed when the Python process exits.
+* fetch_with_warmup() — navigates to a warmup URL first (e.g. homepage),
+  waits patiently for DataDome cookie to settle, then navigates to the real
+  product URL.  Mirrors the "homepage first, then product" manual flow that
+  DataDome accepts.
 
 Where a pool would go
 ---------------------
@@ -26,6 +30,7 @@ The single-instance prototype here is a drop-in: just wrap it in a pool manager.
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import logging
 import os
@@ -271,6 +276,201 @@ class BrowserFetcher:
 
         except Exception as exc:
             logger.warning("BrowserFetcher.fetch error for %r: %s", url, exc)
+            return None
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # DataDome warmup path
+    # ------------------------------------------------------------------
+
+    async def fetch_with_warmup(
+        self,
+        url: str,
+        warmup_url: str,
+        *,
+        warmup_timeout: float = 60.0,
+        product_timeout: float = 60.0,
+        warmup_real_selector: Optional[str] = None,
+        product_real_selector: Optional[str] = None,
+        warmup_block_marker: str = "Доступ ограничен",
+        product_block_marker: str = "Доступ ограничен",
+        warmup_retries: int = 3,
+        warmup_retry_delay: float = 5.0,
+    ) -> Optional[str]:
+        """Navigate to *warmup_url* first to let DataDome set its cookie,
+        then navigate to *url* with the warmed session.
+
+        DataDome challenge flow:
+          1. Hit the warmup URL (homepage).  DataDome may serve a JS/redirect
+             challenge page ("Доступ ограничен") on the first hit — wait and
+             retry up to *warmup_retries* times.  The cookie `datadome` is set
+             as challenges resolve (automatic in headless Chrome with JS enabled).
+          2. Once the warmup page shows real content (no block marker, or
+             *warmup_real_selector* found), navigate to the product URL.
+          3. Wait patiently for product content (selector or absence of block
+             marker) up to *product_timeout* seconds.
+
+        Args:
+            url:                    Product URL to fetch after warmup.
+            warmup_url:             Warmup URL (e.g. site homepage).
+            warmup_timeout:         Total seconds to wait for warmup to clear
+                                    DataDome (spread across retries).
+            product_timeout:        Seconds to wait for the product page to load.
+            warmup_real_selector:   Optional CSS selector that, when found,
+                                    confirms the warmup page is real content.
+            product_real_selector:  Optional CSS selector to wait for on the
+                                    product page.
+            warmup_block_marker:    Text that indicates the warmup page is still
+                                    a DataDome block stub.
+            product_block_marker:   Text that indicates the product page is still
+                                    a DataDome block stub.
+            warmup_retries:         Max retry attempts if warmup page stays blocked.
+            warmup_retry_delay:     Seconds to wait between warmup retries.
+
+        Returns:
+            Full product page HTML, or None on failure.  Never raises.
+        """
+        if self._closed:
+            logger.warning("BrowserFetcher.fetch_with_warmup called on a closed instance")
+            return None
+
+        if not await self._ensure_running():
+            return None
+
+        # ------------------------------------------------------------------
+        # Phase 1: warmup navigation with retries
+        # ------------------------------------------------------------------
+        warmup_cleared = False
+        warmup_html_len = 0
+        warmup_attempts = 0
+        per_attempt_timeout = max(warmup_timeout / max(warmup_retries, 1), 15.0)
+
+        page = None
+        try:
+            page = await self._context.new_page()
+        except Exception as exc:
+            logger.warning("BrowserFetcher.fetch_with_warmup: new_page failed: %s", exc)
+            return None
+
+        try:
+            for attempt in range(warmup_retries):
+                warmup_attempts = attempt + 1
+                timeout_ms = int(per_attempt_timeout * 1000)
+
+                try:
+                    logger.info(
+                        "BrowserFetcher.warmup: attempt %d/%d → %s",
+                        attempt + 1, warmup_retries, warmup_url,
+                    )
+                    await page.goto(warmup_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                except Exception as exc:
+                    logger.warning(
+                        "BrowserFetcher.warmup: goto failed on attempt %d: %s", attempt + 1, exc
+                    )
+                    if attempt < warmup_retries - 1:
+                        await asyncio.sleep(warmup_retry_delay)
+                    continue
+
+                # Wait for either real selector or networkidle, tolerating timeouts
+                if warmup_real_selector:
+                    try:
+                        await page.wait_for_selector(
+                            warmup_real_selector,
+                            timeout=min(timeout_ms, int(per_attempt_timeout * 800)),
+                        )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        await page.wait_for_load_state(
+                            "networkidle", timeout=min(timeout_ms, int(per_attempt_timeout * 800))
+                        )
+                    except Exception:
+                        pass
+
+                warmup_html = await page.content()
+                warmup_html_len = len(warmup_html)
+
+                if warmup_block_marker in warmup_html:
+                    logger.info(
+                        "BrowserFetcher.warmup: still blocked (%d chars) on attempt %d — retrying in %.1fs",
+                        warmup_html_len, attempt + 1, warmup_retry_delay,
+                    )
+                    if attempt < warmup_retries - 1:
+                        await asyncio.sleep(warmup_retry_delay)
+                    continue
+
+                # Real content detected
+                warmup_cleared = True
+                logger.info(
+                    "BrowserFetcher.warmup: CLEARED on attempt %d (%d chars)",
+                    attempt + 1, warmup_html_len,
+                )
+                break
+
+            if not warmup_cleared:
+                logger.warning(
+                    "BrowserFetcher.warmup: DataDome NOT cleared after %d attempts "
+                    "(last html len=%d) — still trying product URL with accumulated cookies",
+                    warmup_attempts, warmup_html_len,
+                )
+
+            # ------------------------------------------------------------------
+            # Phase 2: product URL fetch with accumulated DataDome cookies
+            # ------------------------------------------------------------------
+            product_timeout_ms = int(product_timeout * 1000)
+
+            logger.info("BrowserFetcher.warmup: navigating to product URL %s", url)
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=product_timeout_ms)
+            except Exception as exc:
+                logger.warning("BrowserFetcher.warmup: product goto failed: %s", exc)
+                return None
+
+            # Wait patiently for product content
+            if product_real_selector:
+                try:
+                    await page.wait_for_selector(
+                        product_real_selector,
+                        timeout=min(product_timeout_ms, 40_000),
+                    )
+                except Exception:
+                    logger.debug(
+                        "BrowserFetcher.warmup: product selector %r not found — using DOM as-is",
+                        product_real_selector,
+                    )
+            else:
+                try:
+                    await page.wait_for_load_state(
+                        "networkidle", timeout=min(product_timeout_ms, 40_000)
+                    )
+                except Exception:
+                    pass
+
+            product_html = await page.content()
+            product_html_len = len(product_html)
+
+            if product_block_marker in product_html:
+                logger.warning(
+                    "BrowserFetcher.warmup: product page still BLOCKED after warmup "
+                    "(%d chars) — IP may be rate-limited; returning None",
+                    product_html_len,
+                )
+                return None
+
+            logger.info(
+                "BrowserFetcher.warmup: product page OK (%d chars) warmup_cleared=%s",
+                product_html_len, warmup_cleared,
+            )
+            return product_html
+
+        except Exception as exc:
+            logger.warning("BrowserFetcher.fetch_with_warmup error: %s", exc)
             return None
         finally:
             if page is not None:

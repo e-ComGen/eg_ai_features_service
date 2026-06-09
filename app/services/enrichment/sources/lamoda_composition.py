@@ -3,7 +3,9 @@
 Pipeline
 --------
 1. Serper `site:lamoda.ru <brand> <product_name>` → top product URLs.
-2. BrowserFetcher.fetch() with real Chrome → fully-rendered DOM (DataDome beaten).
+2. BrowserFetcher.fetch_with_warmup() — hits Lamoda homepage first to let
+   DataDome cookie accumulate (mirrors the "lamoda.ru → then product" manual
+   flow the owner confirmed works), then navigates to the product URL.
 3. composition_extractor.extract_composition() → composition strings.
 4. page_matches_brand() gate → fail-closed brand verification.
 5. Return first hit: {composition, source_url, evidence}.
@@ -21,10 +23,20 @@ Real chrome.exe (--headless=new + real TLS fingerprint) defeats DataDome from
 this VPS.  Bundled Playwright Chromium would be blocked.  BrowserFetcher is
 responsible for ensuring the real binary is used.
 
+Warmup strategy (owner-confirmed):
+  The owner opened a Lamoda product page from THIS IP — it worked "со скрипом"
+  (slowly) ONLY after hitting the homepage first.  Cold product-URL hits trigger
+  the DataDome block stub ("Доступ ограничен").  We mirror that by:
+  1. Navigating to https://www.lamoda.ru/ and waiting up to 60 s / 3 retries
+     for the homepage to show real catalog content (DataDome cookie sets itself
+     automatically via JS challenge execution in real headless Chrome).
+  2. Once the cookie is set, navigating to the product URL in the SAME context.
+  Session reuse means subsequent product fetches skip the homepage warmup.
+
 Performance
 -----------
-Cold-start (first Lamoda fetch): ~8-15 s (Chrome launch + DataDome challenge).
-Warm (session reused, same BrowserFetcher instance): ~3-6 s per product page.
+Cold-start (first Lamoda fetch, with warmup): ~20-60 s depending on DataDome.
+Warm (session reused, same BrowserFetcher instance): ~5-10 s per product page.
 For production, keep ONE BrowserFetcher instance alive across requests (module-
 level singleton pattern shown below via `_get_fetcher()`).
 """
@@ -58,6 +70,33 @@ _LAMODA_PRODUCT_URL_RE = re.compile(
 # The rendered DOM has a <div> with class containing "x-product-characteristics"
 # or the generic product-description section.  We wait for whichever appears.
 _SPEC_SELECTOR = "[class*='x-product-characteristics'], [class*='product-characteristics']"
+
+# Lamoda homepage warmup URL — hit this BEFORE any product URL so DataDome can
+# set its cookie via JS challenge.
+_LAMODA_WARMUP_URL = "https://www.lamoda.ru/"
+
+# CSS selector that confirms the Lamoda homepage is showing real catalog content
+# (not a DataDome block).  A search/nav bar or catalog menu is always present.
+_LAMODA_WARMUP_REAL_SELECTOR = (
+    "[class*='header'], [class*='catalog'], [class*='navigation'], "
+    "nav, header"
+)
+
+# Marker string that appears in DataDome block pages (original pattern)
+_DATADOME_BLOCK_MARKER = "Доступ ограничен"
+
+# Lamoda's own IP/rate-limit block page marker.
+# When Lamoda's CDN blocks the IP it serves a custom ~4656-char page that:
+#   - Has <title>Ошибка доступа</title>
+#   - Has id="REQUEST-IP" / id="REQUEST-ID" debug metadata blocks
+#   - Does NOT contain catalog/product content
+# We detect it by the REQUEST-IP element which is unique to this error page.
+_LAMODA_BLOCK_MARKER = 'id="REQUEST-IP"'
+
+# Whether this session has already successfully cleared the DataDome warmup.
+# We only need one homepage warmup per BrowserFetcher session — after that the
+# datadome cookie persists for all subsequent product fetches.
+_session_warmed: set[int] = set()  # keyed by id(fetcher)
 
 
 def _is_lamoda_product_url(url: str) -> bool:
@@ -155,10 +194,44 @@ async def mine_lamoda_composition(
     _fetcher = fetcher or _get_fetcher()
     candidates = lamoda_urls[:max_urls]
 
+    # Determine whether this fetcher instance already has a warm DataDome session
+    # from a previous call.  On first use we run a homepage warmup; subsequent
+    # product fetches in the same session reuse the stored datadome cookie.
+    fetcher_id = id(_fetcher)
+    already_warmed = fetcher_id in _session_warmed
+
     for url in candidates:
-        logger.info("mine_lamoda_composition: fetching %s", url)
+        logger.info("mine_lamoda_composition: fetching %s (warmed=%s)", url, already_warmed)
         try:
-            html = await _fetcher.fetch(url, wait_selector=_SPEC_SELECTOR, timeout=fetch_timeout)
+            if not already_warmed:
+                # First product URL in a cold session — use homepage warmup path
+                logger.info(
+                    "mine_lamoda_composition: cold session — running warmup via %s",
+                    _LAMODA_WARMUP_URL,
+                )
+                html = await _fetcher.fetch_with_warmup(
+                    url,
+                    warmup_url=_LAMODA_WARMUP_URL,
+                    warmup_timeout=60.0,
+                    product_timeout=fetch_timeout,
+                    warmup_real_selector=_LAMODA_WARMUP_REAL_SELECTOR,
+                    product_real_selector=_SPEC_SELECTOR,
+                    warmup_block_marker=_LAMODA_BLOCK_MARKER,
+                    product_block_marker=_LAMODA_BLOCK_MARKER,
+                    warmup_retries=3,
+                    warmup_retry_delay=6.0,
+                )
+                # Mark the session warm regardless of result — the cookie is set
+                # after the homepage navigation even if the product URL failed.
+                _session_warmed.add(fetcher_id)
+                already_warmed = True
+            else:
+                # Subsequent URLs reuse the warm session — plain fetch
+                html = await _fetcher.fetch(
+                    url,
+                    wait_selector=_SPEC_SELECTOR,
+                    timeout=fetch_timeout,
+                )
         except Exception as exc:
             logger.warning("mine_lamoda_composition: fetch error for %s: %s", url, exc)
             continue
@@ -168,6 +241,17 @@ async def mine_lamoda_composition(
             continue
 
         html_len = len(html)
+
+        # Detect Lamoda's IP-block / rate-limit error page (distinct from DataDome).
+        # This custom ~4656-char page contains id="REQUEST-IP" metadata.
+        if _LAMODA_BLOCK_MARKER in html:
+            logger.warning(
+                "mine_lamoda_composition: Lamoda IP-block page detected for %s "
+                "(%d chars) — IP may be rate-limited; skipping URL",
+                url, html_len,
+            )
+            continue
+
         logger.info("mine_lamoda_composition: got %d chars from %s", html_len, url)
 
         # --- 3. Brand-gate --------------------------------------------------
