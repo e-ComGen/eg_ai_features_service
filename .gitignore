@@ -98,3 +98,6 @@ app/services/enrichment/strategies/dictionaries/data/ozon_rag.qdrant/
 app/services/enrichment/strategies/dictionaries/data/from_pod/
 scripts/qdrant.tar.gz
 .fetch_cache/
+
+# Runtime domain availability cache (generated on startup, not repo data)
+.domain_health.json
