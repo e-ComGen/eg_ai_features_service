@@ -21,6 +21,8 @@ python-multipart
 playwright>=1.40.0
 # WB dictionary builder — offline HuggingFace seed
 datasets
+# Process-tree cleanup for BrowserFetcher Chrome child processes
+psutil
 # Test dependencies
 pytest
 pytest-asyncio

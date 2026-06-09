@@ -29,7 +29,12 @@ from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
 
-from app.services.providers.browser_fetcher import BrowserFetcher, _find_chrome, _free_port
+from app.services.providers.browser_fetcher import (
+    BrowserFetcher,
+    _DEFAULT_USER_AGENT,
+    _find_chrome,
+    _free_port,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +175,7 @@ class TestBrowserFetcherLaunchFailure:
         fetcher._context = None
         fetcher._port = None
         fetcher._chrome_path = None
+        fetcher._user_agent = _DEFAULT_USER_AGENT
 
         with (
             patch("app.services.providers.browser_fetcher._find_chrome", return_value="/fake/chrome"),
@@ -241,11 +247,15 @@ class TestBrowserFetcherAtexitCleanup:
     """atexit handler terminates Chrome and removes temp profile dir."""
 
     def test_sync_cleanup_terminates_chrome_and_removes_dir(self):
+        import app.services.providers.browser_fetcher as bf_mod
+
         tmp_dir = tempfile.mkdtemp(prefix="bf_test_cleanup_")
 
         mock_proc = MagicMock()
+        mock_proc.pid = 5555
         mock_proc.terminate = MagicMock()
         mock_proc.wait = MagicMock()
+        mock_proc.kill = MagicMock()
 
         fetcher = BrowserFetcher.__new__(BrowserFetcher)
         fetcher._closed = False
@@ -256,8 +266,16 @@ class TestBrowserFetcherAtexitCleanup:
         fetcher._context = None
         fetcher._port = None
         fetcher._chrome_path = None
+        fetcher._user_agent = _DEFAULT_USER_AGENT
 
-        fetcher._sync_cleanup()
+        original_psutil = bf_mod._psutil
+        try:
+            # Force the POSIX fallback path so terminate() is called
+            bf_mod._psutil = None
+            with patch("platform.system", return_value="Linux"):
+                fetcher._sync_cleanup()
+        finally:
+            bf_mod._psutil = original_psutil
 
         mock_proc.terminate.assert_called_once()
         # Temp dir must be removed
@@ -910,3 +928,307 @@ class TestMineLamodoComposition:
         assert result is not None
         # Only first URL was fetched (stopped on hit)
         assert fetch_calls == [url1]
+
+
+# ---------------------------------------------------------------------------
+# FIX 1: user_agent parameter tests
+# ---------------------------------------------------------------------------
+
+
+class TestUserAgentParameter:
+    """BrowserFetcher user_agent is threaded into launch args and context creation."""
+
+    def test_default_user_agent_is_not_headless(self):
+        """Default UA must never contain 'HeadlessChrome'."""
+        assert "HeadlessChrome" not in _DEFAULT_USER_AGENT
+        assert "Chrome/" in _DEFAULT_USER_AGENT
+
+    def test_init_default_ua_is_desktop_chrome(self):
+        """BrowserFetcher() with no args uses the module-level default UA."""
+        fetcher = BrowserFetcher.__new__(BrowserFetcher)
+        fetcher._user_agent = _DEFAULT_USER_AGENT  # replicate __init__ logic
+        assert fetcher._user_agent == _DEFAULT_USER_AGENT
+        assert "HeadlessChrome" not in fetcher._user_agent
+
+    def test_init_custom_ua_is_stored(self):
+        """Custom UA passed to __init__ is stored verbatim."""
+        custom_ua = "Mozilla/5.0 (X11; Linux x86_64) CustomBrowser/99.0"
+        fetcher = BrowserFetcher(user_agent=custom_ua)
+        assert fetcher._user_agent == custom_ua
+
+    def test_init_none_ua_falls_back_to_default(self):
+        """None UA falls back to the module-level default."""
+        fetcher = BrowserFetcher(user_agent=None)
+        assert fetcher._user_agent == _DEFAULT_USER_AGENT
+
+    def test_ensure_running_passes_ua_in_launch_args(self):
+        """--user-agent=<ua> must appear in the Chrome subprocess launch args."""
+        custom_ua = "TestAgent/1.0"
+        fetcher = BrowserFetcher.__new__(BrowserFetcher)
+        fetcher._closed = False
+        fetcher._chrome_proc = None
+        fetcher._user_data_dir = None
+        fetcher._playwright = None
+        fetcher._browser = None
+        fetcher._context = None
+        fetcher._port = None
+        fetcher._chrome_path = None
+        fetcher._user_agent = custom_ua
+
+        captured_args: list[list] = []
+
+        class _FakePopen:
+            pid = 12345
+            def __init__(self, args, **kwargs):
+                captured_args.append(args)
+                # Raise immediately so we don't proceed to CDP wait
+                raise OSError("fake stop after capture")
+
+        with (
+            patch("app.services.providers.browser_fetcher._find_chrome", return_value="/fake/chrome"),
+            patch("app.services.providers.browser_fetcher._free_port", return_value=9299),
+            patch("tempfile.mkdtemp", return_value="/tmp/bf_ua_test"),
+            patch("subprocess.Popen", side_effect=_FakePopen),
+        ):
+            result = run(fetcher._ensure_running())
+
+        assert result is False
+        assert len(captured_args) == 1
+        assert f"--user-agent={custom_ua}" in captured_args[0]
+
+    def test_ensure_running_creates_context_with_ua(self):
+        """Playwright new_context is called with the configured user_agent."""
+        custom_ua = "SportmasterAgent/2.0"
+        fetcher = BrowserFetcher.__new__(BrowserFetcher)
+        fetcher._closed = False
+        fetcher._chrome_proc = None
+        fetcher._user_data_dir = None
+        fetcher._playwright = None
+        fetcher._browser = None
+        fetcher._context = None
+        fetcher._port = None
+        fetcher._chrome_path = None
+        fetcher._user_agent = custom_ua
+
+        mock_context = MagicMock()
+        mock_context.close = AsyncMock()
+
+        mock_browser = MagicMock()
+        mock_browser.new_context = AsyncMock(return_value=mock_context)
+
+        mock_pw = MagicMock()
+        mock_pw.chromium = MagicMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=mock_browser)
+        mock_pw.stop = AsyncMock()
+
+        mock_popen = MagicMock()
+        mock_popen.pid = 54321
+        mock_popen.poll = MagicMock(return_value=None)
+
+        # _ensure_running does: from playwright.async_api import async_playwright
+        # then: await async_playwright().start()
+        # Patch at the source module so the local import picks up our mock.
+        mock_apw_instance = MagicMock()
+        mock_apw_instance.start = AsyncMock(return_value=mock_pw)
+
+        with (
+            patch("app.services.providers.browser_fetcher._find_chrome", return_value="/fake/chrome"),
+            patch("app.services.providers.browser_fetcher._free_port", return_value=9300),
+            patch("tempfile.mkdtemp", return_value="/tmp/bf_ctx_test"),
+            patch("subprocess.Popen", return_value=mock_popen),
+            patch.object(BrowserFetcher, "_wait_for_cdp", return_value=True),
+            patch("playwright.async_api.async_playwright", return_value=mock_apw_instance),
+        ):
+            result = run(fetcher._ensure_running())
+
+        assert result is True
+        # new_context must have been called with user_agent=custom_ua
+        mock_browser.new_context.assert_called_once()
+        call_kwargs = mock_browser.new_context.call_args.kwargs
+        assert call_kwargs.get("user_agent") == custom_ua
+        assert call_kwargs.get("locale") == "ru-RU"
+        assert call_kwargs.get("timezone_id") == "Europe/Moscow"
+
+
+# ---------------------------------------------------------------------------
+# FIX 2: tree-kill cleanup tests
+# ---------------------------------------------------------------------------
+
+
+class TestTreeKillCleanup:
+    """_terminate_chrome uses psutil tree-kill / taskkill; close() is idempotent."""
+
+    def _make_fetcher_with_proc(self, pid: int = 9001) -> tuple[BrowserFetcher, MagicMock]:
+        fetcher = BrowserFetcher.__new__(BrowserFetcher)
+        fetcher._closed = False
+        fetcher._user_agent = _DEFAULT_USER_AGENT
+        fetcher._chrome_path = None
+        fetcher._port = None
+        fetcher._user_data_dir = None
+        fetcher._playwright = None
+        fetcher._browser = None
+        fetcher._context = None
+
+        mock_proc = MagicMock()
+        mock_proc.pid = pid
+        mock_proc.poll = MagicMock(return_value=None)
+        mock_proc.terminate = MagicMock()
+        mock_proc.wait = MagicMock()
+        mock_proc.kill = MagicMock()
+        fetcher._chrome_proc = mock_proc
+        return fetcher, mock_proc
+
+    def test_terminate_chrome_uses_psutil_tree_kill(self):
+        """When psutil is available, _terminate_chrome kills children then parent."""
+        import app.services.providers.browser_fetcher as bf_mod
+
+        fetcher, mock_proc = self._make_fetcher_with_proc(pid=7777)
+
+        mock_child1 = MagicMock()
+        mock_child2 = MagicMock()
+        mock_parent = MagicMock()
+        mock_parent.children = MagicMock(return_value=[mock_child1, mock_child2])
+        mock_parent.kill = MagicMock()
+
+        mock_psutil = MagicMock()
+        mock_psutil.Process = MagicMock(return_value=mock_parent)
+        mock_psutil.NoSuchProcess = ProcessLookupError
+        mock_psutil.AccessDenied = PermissionError
+
+        original_psutil = bf_mod._psutil
+        try:
+            bf_mod._psutil = mock_psutil
+            fetcher._terminate_chrome()
+        finally:
+            bf_mod._psutil = original_psutil
+
+        # All children killed, then parent killed
+        mock_child1.kill.assert_called_once()
+        mock_child2.kill.assert_called_once()
+        mock_parent.kill.assert_called_once()
+        # _chrome_proc cleared
+        assert fetcher._chrome_proc is None
+
+    def test_terminate_chrome_uses_taskkill_when_no_psutil_windows(self):
+        """On Windows with no psutil, falls back to taskkill /F /T /PID."""
+        import app.services.providers.browser_fetcher as bf_mod
+
+        fetcher, mock_proc = self._make_fetcher_with_proc(pid=8888)
+
+        original_psutil = bf_mod._psutil
+        try:
+            bf_mod._psutil = None  # simulate psutil absent
+
+            with (
+                patch("platform.system", return_value="Windows"),
+                patch("subprocess.run") as mock_run,
+            ):
+                fetcher._terminate_chrome()
+
+            mock_run.assert_called_once()
+            call_args = mock_run.call_args.args[0]
+            assert "taskkill" in call_args
+            assert "/F" in call_args
+            assert "/T" in call_args
+            assert str(8888) in call_args
+        finally:
+            bf_mod._psutil = original_psutil
+
+        assert fetcher._chrome_proc is None
+
+    def test_terminate_chrome_posix_fallback_when_no_psutil(self):
+        """On POSIX with no psutil, uses proc.terminate() + proc.kill()."""
+        import app.services.providers.browser_fetcher as bf_mod
+
+        fetcher, mock_proc = self._make_fetcher_with_proc(pid=9999)
+
+        original_psutil = bf_mod._psutil
+        try:
+            bf_mod._psutil = None
+
+            with patch("platform.system", return_value="Linux"):
+                fetcher._terminate_chrome()
+        finally:
+            bf_mod._psutil = original_psutil
+
+        mock_proc.terminate.assert_called_once()
+        assert fetcher._chrome_proc is None
+
+    def test_terminate_chrome_is_idempotent(self):
+        """Calling _terminate_chrome twice does not raise."""
+        import app.services.providers.browser_fetcher as bf_mod
+
+        fetcher, _ = self._make_fetcher_with_proc(pid=1111)
+
+        original_psutil = bf_mod._psutil
+        try:
+            bf_mod._psutil = None
+            with patch("platform.system", return_value="Linux"):
+                fetcher._terminate_chrome()
+                fetcher._terminate_chrome()  # second call — must be safe
+        finally:
+            bf_mod._psutil = original_psutil
+
+    def test_cleanup_user_data_dir_is_idempotent(self):
+        """_cleanup_user_data_dir clears _user_data_dir so second call is a no-op."""
+        tmp = tempfile.mkdtemp(prefix="bf_test_idem_")
+        fetcher = BrowserFetcher.__new__(BrowserFetcher)
+        fetcher._chrome_proc = None
+        fetcher._user_data_dir = tmp
+
+        fetcher._cleanup_user_data_dir()
+        assert not os.path.isdir(tmp)
+        assert fetcher._user_data_dir is None
+
+        # Second call — must not raise
+        fetcher._cleanup_user_data_dir()
+
+    def test_sync_cleanup_is_safe_after_close(self):
+        """atexit _sync_cleanup is safe even after close() already ran."""
+        tmp = tempfile.mkdtemp(prefix="bf_test_safe_")
+        fetcher = BrowserFetcher.__new__(BrowserFetcher)
+        fetcher._chrome_proc = None
+        fetcher._user_data_dir = tmp
+
+        fetcher._cleanup_user_data_dir()  # simulates close() having run
+        # atexit fires — must not raise or double-delete
+        fetcher._sync_cleanup()
+        assert fetcher._user_data_dir is None
+
+    def test_ensure_running_kills_stale_chrome_before_new_launch(self):
+        """If a stale chrome_proc is alive, _ensure_running kills it before launching."""
+        import app.services.providers.browser_fetcher as bf_mod
+
+        fetcher = BrowserFetcher.__new__(BrowserFetcher)
+        fetcher._closed = False
+        fetcher._user_agent = _DEFAULT_USER_AGENT
+        fetcher._chrome_path = None
+        fetcher._port = None
+        fetcher._user_data_dir = None
+        fetcher._playwright = None
+        fetcher._browser = None
+        fetcher._context = None
+
+        # Stale live process
+        stale_proc = MagicMock()
+        stale_proc.pid = 4242
+        stale_proc.poll = MagicMock(return_value=None)  # still alive
+        fetcher._chrome_proc = stale_proc
+
+        killed = []
+
+        original_terminate = fetcher._terminate_chrome.__func__ if hasattr(fetcher._terminate_chrome, "__func__") else None
+
+        def _mock_terminate(self_inner=None):
+            killed.append(True)
+            fetcher._chrome_proc = None  # replicate real behaviour
+
+        with (
+            patch.object(BrowserFetcher, "_terminate_chrome", _mock_terminate),
+            patch("app.services.providers.browser_fetcher._find_chrome", side_effect=RuntimeError("no chrome")),
+        ):
+            result = run(fetcher._ensure_running())
+
+        # Stale process was killed before _find_chrome was even attempted
+        assert len(killed) >= 1
+        assert result is False  # failed at _find_chrome — but stale kill happened

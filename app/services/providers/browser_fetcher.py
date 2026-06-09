@@ -15,11 +15,16 @@ Design
   instances run (future pool path: instantiate N BrowserFetchers on N ports).
 * Graceful failure — `fetch()` returns None on any error; never raises.
 * atexit cleanup — Chrome process is terminated and the temp user-data dir is
-  removed when the Python process exits.
+  removed when the Python process exits.  Uses psutil for process-tree kill
+  (Chrome spawns child renderers); falls back to taskkill /F /T on Windows or
+  proc.kill() on POSIX when psutil is absent.
 * fetch_with_warmup() — navigates to a warmup URL first (e.g. homepage),
   waits patiently for DataDome cookie to settle, then navigates to the real
   product URL.  Mirrors the "homepage first, then product" manual flow that
   DataDome accepts.
+* user_agent — pass a real desktop Chrome UA so Qrator/Sportmaster never see
+  "HeadlessChrome" in the User-Agent string.  Threaded into both --user-agent
+  launch arg and Playwright new_context(user_agent=...).
 
 Where a pool would go
 ---------------------
@@ -34,6 +39,7 @@ import asyncio
 import atexit
 import logging
 import os
+import platform
 import shutil
 import socket
 import subprocess
@@ -41,7 +47,24 @@ import tempfile
 import time
 from typing import Optional
 
+try:
+    import psutil as _psutil  # optional; used for process-tree kill
+except ImportError:  # pragma: no cover
+    _psutil = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Default User-Agent — desktop Chrome, never exposes "HeadlessChrome".
+# Sportmaster (Qrator) and similar anti-bot systems reject the default
+# headless UA; injecting a real desktop UA resolves the compat stub.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 # ---------------------------------------------------------------------------
 # Chrome auto-detect: Windows paths first, then Linux (for prod portability)
@@ -106,7 +129,10 @@ class BrowserFetcher:
             html = await fetcher.fetch(url)
     """
 
-    def __init__(self) -> None:
+    def __init__(self, user_agent: Optional[str] = None) -> None:
+        # None → use the module-level default desktop UA (never "HeadlessChrome")
+        self._user_agent: str = user_agent if user_agent is not None else _DEFAULT_USER_AGENT
+
         self._chrome_path: Optional[str] = None
         self._port: Optional[int] = None
         self._user_data_dir: Optional[str] = None
@@ -129,9 +155,28 @@ class BrowserFetcher:
 
         Returns True on success, False on any failure (caller treats as
         unavailable and returns None from fetch()).
+
+        Belt-and-suspenders UA injection strategy:
+          1. --user-agent=<ua> on the Chrome process level (affects all
+             contexts that inherit the process-level UA, including default ctx).
+          2. browser.new_context(user_agent=...) at the Playwright level so the
+             overriding UA is reliably set even if the default CDP context is
+             reused (connect_over_cdp hands back the existing default context
+             whose UA is already overridden at the process level, but we create
+             a fresh context to be explicit and avoid CDP context surprises).
         """
         if self._browser is not None:
             return True
+
+        # Safety: if a stale chrome proc is still alive from a previous partial
+        # init (e.g. _ensure_running failed mid-way), kill it before starting a
+        # new one so we don't orphan it.
+        if self._chrome_proc is not None and self._chrome_proc.poll() is None:
+            logger.warning(
+                "BrowserFetcher: stale Chrome process found (pid=%d), cleaning up",
+                self._chrome_proc.pid,
+            )
+            self._terminate_chrome()
 
         try:
             self._chrome_path = _find_chrome()
@@ -153,10 +198,14 @@ class BrowserFetcher:
             "--disable-gpu",
             "--window-size=1920,1080",
             "--disable-blink-features=AutomationControlled",
+            # Belt: override UA at the process level so all Chrome internals see it
+            f"--user-agent={self._user_agent}",
         ]
 
         logger.info(
-            "BrowserFetcher: launching Chrome on port %d (headless=new)", self._port
+            "BrowserFetcher: launching Chrome on port %d (headless=new, ua=%r)",
+            self._port,
+            self._user_agent[:40] + "..." if len(self._user_agent) > 40 else self._user_agent,
         )
         try:
             self._chrome_proc = subprocess.Popen(
@@ -184,11 +233,16 @@ class BrowserFetcher:
             self._playwright = await async_playwright().start()
             cdp_url = f"http://localhost:{self._port}"
             self._browser = await self._playwright.chromium.connect_over_cdp(cdp_url)
-            # Reuse the existing default context (has the real Chrome session / cookies)
-            contexts = self._browser.contexts
-            self._context = contexts[0] if contexts else await self._browser.new_context()
+            # Suspenders: create a fresh context with explicit UA, locale, timezone
+            # so navigator.userAgent is guaranteed to show the desktop UA string.
+            self._context = await self._browser.new_context(
+                user_agent=self._user_agent,
+                locale="ru-RU",
+                timezone_id="Europe/Moscow",
+            )
             logger.info(
-                "BrowserFetcher: Playwright connected to Chrome CDP at %s", cdp_url
+                "BrowserFetcher: Playwright connected to Chrome CDP at %s (ua injected)",
+                cdp_url,
             )
             return True
         except Exception as exc:
@@ -518,28 +572,81 @@ class BrowserFetcher:
     # ------------------------------------------------------------------
 
     def _terminate_chrome(self) -> None:
-        if self._chrome_proc is not None:
+        """Kill the Chrome process tree (parent + all child renderers).
+
+        Strategy (in priority order):
+          1. psutil — walks the full process tree recursively, kills each child
+             then the parent.  Most reliable on both Windows and POSIX.
+          2. taskkill /F /T /PID — Windows fallback when psutil is absent; /T
+             kills the entire process tree rooted at the given PID.
+          3. proc.terminate() + proc.kill() — last-resort POSIX fallback.
+
+        The method is idempotent: sets _chrome_proc to None after the first call.
+        All exceptions are swallowed so callers (atexit, close(), context exit)
+        are never interrupted.
+        """
+        proc = self._chrome_proc
+        if proc is None:
+            return
+        self._chrome_proc = None  # clear early so re-entrancy is safe
+
+        pid = proc.pid
+
+        if _psutil is not None:
+            # psutil path: kill whole tree
             try:
-                self._chrome_proc.terminate()
-                self._chrome_proc.wait(timeout=5)
+                parent = _psutil.Process(pid)
+                children = parent.children(recursive=True)
+                for child in children:
+                    try:
+                        child.kill()
+                    except (_psutil.NoSuchProcess, _psutil.AccessDenied):
+                        pass
+                try:
+                    parent.kill()
+                except (_psutil.NoSuchProcess, _psutil.AccessDenied):
+                    pass
+            except Exception:
+                pass
+        elif platform.system() == "Windows":
+            # taskkill /F /T /PID kills the process tree on Windows
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+            except Exception:
+                pass
+        else:
+            # POSIX fallback: terminate + kill
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
             except Exception:
                 try:
-                    self._chrome_proc.kill()
+                    proc.kill()
                 except Exception:
                     pass
-            self._chrome_proc = None
 
     def _cleanup_user_data_dir(self) -> None:
-        if self._user_data_dir and os.path.isdir(self._user_data_dir):
+        path = self._user_data_dir
+        if not path:
+            return
+        self._user_data_dir = None  # clear early — idempotent
+        if os.path.isdir(path):
             try:
-                shutil.rmtree(self._user_data_dir, ignore_errors=True)
-                logger.debug(
-                    "BrowserFetcher: removed temp dir %s", self._user_data_dir
-                )
+                shutil.rmtree(path, ignore_errors=True)
+                logger.debug("BrowserFetcher: removed temp dir %s", path)
             except Exception:
                 pass
 
     def _sync_cleanup(self) -> None:
-        """atexit handler — synchronous teardown of the Chrome process."""
+        """atexit handler — synchronous teardown of the Chrome process.
+
+        Idempotent: safe to call even after close() already ran (all state
+        fields are set to None by _terminate_chrome / _cleanup_user_data_dir).
+        """
         self._terminate_chrome()
         self._cleanup_user_data_dir()
