@@ -6,16 +6,19 @@ Steps:
 3. Extraction LLM → AttributeValue list
 
 Step 0 (apparel): if targets include Ozon attr 4604 (Состав материала) or 4496
-(Материал), run domain-agnostic composition mining on fetched page HTML BEFORE
-the LLM step. This fills the "apparel data-desert" gap (WB/Ozon have no card but
-open shops like kixbox.ru do carry composition). Composition values are emitted
-directly — no LLM call needed for them.
+(Материал), run the adaptive multi-site composition harvester (harvest_composition)
+BEFORE the LLM step. This fills the "apparel data-desert" gap using a curated pool
+of retail sites (kixbox/sneakerhead/basketshop/brandshop/street-beat/blankstyle via
+plain httpx; sportmaster/lamoda via real-Chrome BrowserFetcher). Falls back to the
+legacy WebSearchProducer.mine_composition if harvest_composition yields nothing.
+Composition values are emitted directly — no LLM call needed for them.
 
 Самый дорогой source. Применять последним когда другие не дали достаточно
 информации. CostPredictor (отдельный класс) решает стоит ли запускать.
 
 Spec: docs/architecture/pipeline.md, section "Stage 4 / WebSearchSource".
 """
+import atexit
 import logging
 import os
 from typing import Optional
@@ -81,6 +84,7 @@ class WebSearchSource(AttributeSource):
         websearch_producer: Optional[WebSearchProducer] = None,
         extraction_manager: Optional[StructuredLlmManager] = None,
         strategy: Optional[MarketplaceStrategy] = None,
+        browser_fetcher=None,  # injected BrowserFetcher for DI/testing; None → lazy-created
     ):
         self._search = websearch_producer or WebSearchProducer()
         self._extractor = extraction_manager or get_main_manager()
@@ -88,6 +92,17 @@ class WebSearchSource(AttributeSource):
         self._strategy: MarketplaceStrategy = strategy or DefaultStrategy()
         # Cache summary per product_id чтобы не повторять search
         self._summary_cache: dict[int, Optional[str]] = {}
+
+        # Shared BrowserFetcher for composition harvesting — one instance per
+        # WebSearchSource, lazily created on first browser-site need.
+        # Caller may inject one (testing / pipeline-level sharing).
+        # If WE created it, close it on GC / atexit.
+        self._browser_fetcher = browser_fetcher
+        self._browser_fetcher_owned = False  # True only when we created it
+
+        if browser_fetcher is not None:
+            # Injected from outside — caller owns lifecycle, we never close it
+            self._browser_fetcher_owned = False
 
     @property
     def source_type(self) -> Source:
@@ -234,6 +249,46 @@ class WebSearchSource(AttributeSource):
         return composition_avs + llm_avs
 
     # ------------------------------------------------------------------
+    # BrowserFetcher lifecycle helpers
+    # ------------------------------------------------------------------
+
+    def _get_browser_fetcher(self):
+        """Return the shared BrowserFetcher, lazily creating it once.
+
+        We own the instance only when we create it here (not when injected).
+        Registered with atexit to ensure cleanup on interpreter exit.
+        """
+        if self._browser_fetcher is None:
+            from app.services.providers.browser_fetcher import BrowserFetcher
+            self._browser_fetcher = BrowserFetcher()
+            self._browser_fetcher_owned = True
+            logger.info("WebSearchSource: created shared BrowserFetcher (owned)")
+
+            # Schedule cleanup on interpreter exit (fire-and-forget; best effort)
+            def _atexit_close():
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                    if not loop.is_closed():
+                        loop.run_until_complete(self._close_browser_fetcher())
+                except Exception:
+                    pass
+
+            atexit.register(_atexit_close)
+        return self._browser_fetcher
+
+    async def _close_browser_fetcher(self) -> None:
+        """Close the BrowserFetcher if we own it. Safe to call multiple times."""
+        if self._browser_fetcher_owned and self._browser_fetcher is not None:
+            try:
+                await self._browser_fetcher.close()
+            except Exception as exc:
+                logger.debug("WebSearchSource: BrowserFetcher close error: %s", exc)
+            finally:
+                self._browser_fetcher = None
+                self._browser_fetcher_owned = False
+
+    # ------------------------------------------------------------------
     # Composition mining helper
     # ------------------------------------------------------------------
 
@@ -244,6 +299,20 @@ class WebSearchSource(AttributeSource):
         already_filled: list[AttributeValue],
     ) -> list[AttributeValue]:
         """Mine fabric composition from raw pages and emit Состав/Материал AVs.
+
+        Integration point for the adaptive multi-site harvester:
+          1. harvest_composition (PREFERRED): tries curated pool of retail sites
+             (open httpx: kixbox/sneakerhead/basketshop/brandshop/street-beat/
+             blankstyle; real-Chrome: sportmaster/lamoda) with SPA auto-escalation.
+             Returns a rich dict {composition, material, source_url, site, evidence}.
+          2. mine_composition (FALLBACK): legacy Serper search + httpx + LLM recall.
+             Runs only when harvest_composition yields nothing.
+
+        Gating (cost-aware):
+          - Only fires when 4604 or 4496 are in the unfilled targets (apparel check).
+          - Respects already_filled (skips if both fields are already filled).
+          - BrowserFetcher (real-Chrome) is only created on first browser-site need
+            and shared across all calls on this WebSearchSource instance.
 
         Returns [] when:
         - Neither 4604 nor 4496 is in unfilled targets.
@@ -263,17 +332,76 @@ class WebSearchSource(AttributeSource):
         if _ATTR_MATERIAL in filled_ids and not wants_sostav:
             return []
 
-        # Pass LLM provider and budget so mine_composition can make ONE LLM call
-        # if regex found nothing. Budget: respect existing per-product cap.
-        # We count a potential LLM call inside mine_composition against the budget.
-        raw_provider = getattr(self._extractor, "_provider", self._extractor)
-        compositions = await self._search.mine_composition(
-            product_name=context.product_name,
-            brand=context.brand,
-            llm_provider=raw_provider,
-            llm_calls_budget=10,      # generous per-product cap
-            llm_calls_so_far=context.llm_calls_so_far,
-        )
+        # Brand is required by harvest_composition for the brand-verification gate.
+        # Without it the harvester accepts any page → false-positives. Fall through
+        # to mine_composition (which also works without brand, but uses LLM recall).
+        product_name = context.product_name or ""
+        brand = context.brand or ""
+
+        compositions: list[str] = []
+        harvest_source_url: Optional[str] = None
+        harvest_evidence: Optional[str] = None
+
+        # ------------------------------------------------------------------
+        # Path A: adaptive multi-site harvester (harvest_composition)
+        # Preferred: curated pool, SPA escalation, brand-gate, deterministic.
+        # Cost: open-httpx sites = cheap (<<$0.001); browser sites = ~$0.01-0.03
+        #       per product (Chrome launch + 2 pages). Only fires when open sites
+        #       fail AND Serper found a browser-site URL.
+        # ------------------------------------------------------------------
+        if product_name and brand:
+            try:
+                from app.services.enrichment.sources.multisite_composition import (
+                    harvest_composition,
+                )
+                # Inject the shared BrowserFetcher so Chrome is not relaunched
+                # per product — harvest_composition will NOT close it (we own it).
+                bf = self._browser_fetcher  # may be None; passed for reuse if exists
+                result = await harvest_composition(
+                    product_name=product_name,
+                    brand=brand,
+                    browser_fetcher=bf,
+                )
+                if result is not None:
+                    compositions = [result["composition"]]
+                    harvest_source_url = result.get("source_url")
+                    harvest_evidence = (
+                        f"[{result.get('site', '')}] {result.get('evidence', '')}"
+                        f" (route={result.get('route', 'open')})"
+                    )
+                    logger.info(
+                        "WebSearchSource: harvest_composition HIT site=%r "
+                        "composition=%r route=%s",
+                        result.get("site"), result["composition"][:80],
+                        result.get("route", "open"),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "WebSearchSource: harvest_composition raised: %s — falling back "
+                    "to mine_composition",
+                    exc,
+                )
+
+        # ------------------------------------------------------------------
+        # Path B: legacy mine_composition fallback
+        # Runs when: harvest_composition found nothing OR brand was empty.
+        # Cost: 2-3 Serper calls + httpx + optional 1 LLM call.
+        # ------------------------------------------------------------------
+        if not compositions:
+            raw_provider = getattr(self._extractor, "_provider", self._extractor)
+            compositions = await self._search.mine_composition(
+                product_name=product_name,
+                brand=brand or None,
+                llm_provider=raw_provider,
+                llm_calls_budget=10,      # generous per-product cap
+                llm_calls_so_far=context.llm_calls_so_far,
+            )
+            if compositions:
+                logger.info(
+                    "WebSearchSource: mine_composition fallback HIT: %r",
+                    compositions,
+                )
+
         if not compositions:
             return []
 
@@ -286,6 +414,16 @@ class WebSearchSource(AttributeSource):
         avs: list[AttributeValue] = []
         composed_str = "; ".join(compositions)
 
+        # Build evidence string: prefer rich harvester evidence, fall back to legacy tag.
+        av_evidence_sostav = (
+            harvest_evidence
+            if harvest_evidence
+            else "composition_extractor: two-signal rule on fetched page HTML"
+        )
+        av_evidence_material_suffix = (
+            f" via {harvest_source_url}" if harvest_source_url else ""
+        )
+
         # 4604 — free-text "Состав материала"
         if wants_sostav and _ATTR_SOSTAV_MATERIALA not in filled_ids:
             avs.append(AttributeValue(
@@ -293,7 +431,7 @@ class WebSearchSource(AttributeSource):
                 value=composed_str,
                 confidence=_COMPOSITION_CONFIDENCE,
                 source=Source.WEB_SEARCH,
-                evidence="composition_extractor: two-signal rule on fetched page HTML",
+                evidence=av_evidence_sostav,
             ))
             logger.info(
                 "WebSearchSource: emitting Состав материала(4604)=%r (conf=%.2f)",
@@ -322,7 +460,10 @@ class WebSearchSource(AttributeSource):
                         value=dom_mat,
                         confidence=_COMPOSITION_CONFIDENCE,
                         source=Source.WEB_SEARCH,
-                        evidence=f"composition_extractor: dominant material={dom_mat}",
+                        evidence=(
+                            f"composition_extractor: dominant material={dom_mat}"
+                            + av_evidence_material_suffix
+                        ),
                         value_id=value_id,
                     )
                     avs.append(av)
