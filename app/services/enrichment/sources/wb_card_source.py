@@ -77,6 +77,7 @@ from app.services.enrichment.strategies.dictionaries.ozon_loader import (
 from app.services.enrichment.strategies.dictionaries.eg_wb_ozon_field_map import (
     eg_get_field_map,
 )
+from app.services.enrichment.size_normalizer import extract_wb_sizes
 from app.services.providers.factory import get_web_search_client
 
 logger = logging.getLogger(__name__)
@@ -344,6 +345,114 @@ _BRAND_LINE_BLACKLIST: frozenset[str] = frozenset(name.lower() for name in {
     "ID товара",
     "ID карточки",
 })
+
+
+# Attr IDs for «Российский размер» (clothing) and «Российский размер» (footwear).
+# Used as fast-path before name-based detection.
+_RU_SIZE_ATTR_IDS: frozenset[int] = frozenset({4295, 4298})
+
+
+def _is_ru_size_target_name(name: str) -> bool:
+    """True if target name refers to «Российский размер» (attr 4295/4298).
+
+    Detects by name substring — works for any language variant in the Ozon dict.
+    Intentionally conservative: only triggers on the exact phrase «российский размер»
+    or «russian size» to avoid accidentally treating other size attributes (EU, INT…)
+    as RU size targets.
+    """
+    low = name.lower()
+    return "российский размер" in low or "russian size" in low
+
+
+def _emit_ru_size_from_card(
+    card: dict,
+    targets: list["TargetAttribute"],
+    results: list["AttributeValue"],
+    used_ids: set[int],
+    cat_id: Optional[int],
+    type_id: Optional[int],
+    evidence_short: str,
+) -> list["AttributeValue"]:
+    """Emit «Российский размер» AttributeValue from card's sizes_table.
+
+    Called ONLY for exact-match cards (not brand_line) since a different model
+    of the same brand may have a completely different size run.  Skipped when the
+    target was already filled by the normal characteristic pass (used_ids guard).
+
+    Drop-policy (fail-closed):
+      - expand_intl_to_ru returns [] → skip silently.
+      - resolve_value_id returns None for a candidate → drop that candidate only.
+      - If ALL candidates are unresolvable → emit nothing (empty > wrong required).
+      - This exactly mirrors the resolved_ids=[r for r in resolved if r is not None] pattern.
+    """
+    from app.services.enrichment.size_normalizer import extract_wb_sizes  # local re-import OK (already cached)
+
+    # Find size target(s) — typically 4295 for clothing, 4298 for footwear.
+    size_targets = [
+        t for t in targets
+        if t.id in _RU_SIZE_ATTR_IDS or _is_ru_size_target_name(t.name)
+    ]
+    if not size_targets:
+        return results
+
+    # Extract raw size tokens from the card's sizes_table.
+    size_tokens = extract_wb_sizes(card)
+    if not size_tokens:
+        logger.debug("[WbCard] sizes_table absent or empty → no размер emit")
+        return results
+
+    logger.info("[WbCard] sizes_table → raw tokens: %s", size_tokens)
+
+    out = list(results)
+    for target in size_targets:
+        if target.id in used_ids:
+            # Already filled by normal characteristic pass — don't overwrite.
+            continue
+
+        if not (cat_id and type_id):
+            # Can't resolve without category context — skip rather than emit wrong id.
+            logger.debug("[WbCard] no cat/type_id → skip размер emit for attr %s", target.id)
+            continue
+
+        resolved_ids: list[int] = []
+        for token in size_tokens:
+            vid = resolve_value_id(cat_id, type_id, target.id, token)
+            if vid is not None:
+                resolved_ids.append(vid)
+        # Dedup while preserving order
+        seen_ids: set[int] = set()
+        unique_ids: list[int] = []
+        for vid in resolved_ids:
+            if vid not in seen_ids:
+                seen_ids.add(vid)
+                unique_ids.append(vid)
+        resolved_ids = unique_ids
+
+        if not resolved_ids:
+            logger.info(
+                "[WbCard] sizes_table tokens %s → 0 resolved value_ids for attr %s "
+                "(all unresolvable — leaving empty, not emitting garbage)",
+                size_tokens, target.id,
+            )
+            continue
+
+        logger.info(
+            "[WbCard] sizes_table → attr %s: tokens=%s resolved_ids=%s",
+            target.id, size_tokens, resolved_ids,
+        )
+        used_ids.add(target.id)
+        out.append(AttributeValue(
+            attribute_id=target.id,
+            value=size_tokens,         # raw list (merged as collection)
+            confidence=_CONF_EXACT,    # exact mode only (see caller gate)
+            source=Source.WB_CARD,
+            evidence=evidence_short,
+            semantic_type=target.semantic_type,
+            is_collection=True,
+            value_id=None,
+            value_ids=resolved_ids,
+        ))
+    return out
 
 
 _MULTIVALUE_SPLIT_RE = re.compile(r"[;,]")
@@ -1368,6 +1477,26 @@ class WbCardSource(AttributeSource):
                 value_id=value_id,
                 value_ids=value_ids,
             ))
+
+        # ---- LEVER 1: emit «Российский размер» from sizes_table ----
+        # sizes_table lives OUTSIDE options/characteristics in card.json.
+        # The normal characteristic mapping above cannot reach it.
+        #
+        # Conservative mode gate: only extract sizes for EXACT-match cards.
+        # brand_line cards (different model of same brand) may carry a completely
+        # different size run (e.g. a Nike slim-fit tee vs an oversized tee), so
+        # emitting their sizes for our product would be wrong. Exact match = same
+        # product listing → same sizes.
+        if mode == "exact" and card is not None:
+            results = _emit_ru_size_from_card(
+                card=card,
+                targets=targets,
+                results=results,
+                used_ids=used_ids,
+                cat_id=cat_id,
+                type_id=type_id,
+                evidence_short=evidence_short,
+            )
 
         logger.info(
             "[WbCard] %s mode → %d характеристик скопировано (из %d candidate chars, %d targets)",

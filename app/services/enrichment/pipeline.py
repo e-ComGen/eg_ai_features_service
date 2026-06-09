@@ -43,6 +43,14 @@ from app.services.enrichment.sources.ozon_card_source import (
 from app.services.enrichment.sources.image_card_search import (
     find_matching_card as _image_find_matching_card,
 )
+from app.services.enrichment.size_normalizer import (
+    parse_explicit_size,
+    expand_intl_to_ru,
+)
+from app.services.enrichment.sources.wb_card_source import (
+    _is_ru_size_target_name,
+    _RU_SIZE_ATTR_IDS,
+)
 # Лемматизатор тип-слова (pymorphy3, морфология опциональна) — переиспользуем тот же
 # helper, что и wb_card_source._target_type_lemma/_card_subj_lemmas, чтобы
 # «Футболки»↔«Футболка» сходились без новой зависимости и без своей морфологии.
@@ -843,6 +851,118 @@ def _apply_type_from_category(
                 source=Source.DESCRIPTION,
                 evidence=_TYPE_FROM_CATEGORY_EVIDENCE,
             ))
+    return out
+
+
+_SIZE_FROM_NAME_EVIDENCE = "size_from_name"
+_SIZE_FROM_NAME_CONF = 0.80  # lower than card sources (0.93/0.85) — name is a weaker signal
+
+
+def _apply_size_from_name(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+    context: ExtractionContext,
+    value_id_fn: Optional[Callable[[int, str], Optional[int]]] = None,
+) -> list[AttributeValue]:
+    """LOW-PRIORITY FALLBACK: fill «Российский размер» from an explicit size token in the name.
+
+    Called ONLY when attr 4295/4298 is still EMPTY after all other sources
+    (Lever 1 WB sizes_table, card characteristics, IceCat, LLM, etc.).
+
+    Rules (fail-closed — «пусто честнее мусора»):
+      1. parse_explicit_size(name) must return a non-empty list of tokens.
+         Returns [] when unsure → we leave the field empty.
+      2. Each token is expanded via expand_intl_to_ru() (letter → list of RU candidates,
+         range "42-44" → ["42","44"], numeric "46" → ["46"]).
+         Ambiguous letter→RU mappings emit ALL candidates because is_collection=True —
+         the Ozon dict will validate each; only resolve_value_id hits survive.
+      3. resolve via value_id_fn; drop candidates where value_id_fn returns None.
+      4. If NO candidate resolves → emit nothing (empty).
+
+    NEVER overwrites an already-filled (value present) size attribute — fallback only.
+    """
+    # Find size target(s)
+    size_targets = [
+        t for t in targets
+        if t.id in _RU_SIZE_ATTR_IDS or _is_ru_size_target_name(t.name)
+    ]
+    if not size_targets:
+        return merged
+
+    # Check which size attrs are already filled
+    filled_attr_ids: set[int] = {
+        v.attribute_id for v in merged
+        if v.attribute_id in {t.id for t in size_targets}
+    }
+
+    # Parse size tokens from name
+    name = (context.product_name or "").strip()
+    if not name:
+        return merged
+
+    raw_tokens = parse_explicit_size(name)
+    if not raw_tokens:
+        return merged
+
+    # Expand all raw tokens into RU numeric candidates
+    all_candidates: list[str] = []
+    seen_c: set[str] = set()
+    for tok in raw_tokens:
+        for candidate in expand_intl_to_ru(tok):
+            if candidate not in seen_c:
+                seen_c.add(candidate)
+                all_candidates.append(candidate)
+    if not all_candidates:
+        return merged
+
+    out = list(merged)
+    for target in size_targets:
+        if target.id in filled_attr_ids:
+            continue  # already filled — fallback does not overwrite
+
+        if value_id_fn is None:
+            continue
+
+        resolved_ids: list[int] = []
+        for candidate in all_candidates:
+            try:
+                vid = value_id_fn(target.id, candidate)
+            except Exception:
+                vid = None
+            if vid is not None:
+                resolved_ids.append(vid)
+
+        # Dedup
+        seen_ids: set[int] = set()
+        unique_ids: list[int] = []
+        for vid in resolved_ids:
+            if vid not in seen_ids:
+                seen_ids.add(vid)
+                unique_ids.append(vid)
+        resolved_ids = unique_ids
+
+        if not resolved_ids:
+            logger.debug(
+                "[Pipeline] size-from-name: tokens=%s → 0 resolved value_ids for attr %s "
+                "(all unresolvable — leaving empty)",
+                all_candidates, target.id,
+            )
+            continue
+
+        logger.info(
+            "[Pipeline] size-from-name: attr %s ← name=%r tokens=%s resolved_ids=%s",
+            target.id, name[:60], all_candidates, resolved_ids,
+        )
+        out.append(AttributeValue(
+            attribute_id=target.id,
+            value=all_candidates,
+            confidence=_SIZE_FROM_NAME_CONF,
+            source=Source.DESCRIPTION,
+            evidence=_SIZE_FROM_NAME_EVIDENCE,
+            is_collection=True,
+            value_id=None,
+            value_ids=resolved_ids,
+        ))
     return out
 
 
@@ -1675,6 +1795,20 @@ class PipelineOrchestrator:
             value_id_fn=lambda attr_id, val: self._strategy.resolve_value_ids(
                 AttributeValue(
                     attribute_id=attr_id, value=val, confidence=0.9,
+                    source=Source.DESCRIPTION,
+                ),
+                context,
+            ).value_id,
+        )
+
+        # Size-from-name: LOW-PRIORITY FALLBACK for «Российский размер» (4295/4298).
+        # Fills ONLY when the attr is still empty after all earlier stages.
+        # parse_explicit_size is strict (empty > wrong) — safe to run unconditionally.
+        resolved = _apply_size_from_name(
+            resolved, targets, context,
+            value_id_fn=lambda attr_id, val: self._strategy.resolve_value_ids(
+                AttributeValue(
+                    attribute_id=attr_id, value=val, confidence=_SIZE_FROM_NAME_CONF,
                     source=Source.DESCRIPTION,
                 ),
                 context,
