@@ -67,6 +67,108 @@ _DEFAULT_USER_AGENT = (
 )
 
 # ---------------------------------------------------------------------------
+# Anti-bot JS-challenge handling (Qrator / DataDome interstitials)
+# ---------------------------------------------------------------------------
+#
+# Qrator and similar systems first serve a tiny JS-challenge "stub" page that
+# reloads itself once the browser solves a proof-of-work / sets a cookie.  Plain
+# `page.goto(wait_until="domcontentloaded")` returns on this stub BEFORE the
+# challenge resolves, so we'd grab the interstitial instead of the real page.
+#
+# The fix is to POLL the rendered text after navigation: while it still looks
+# like a challenge stub, wait (tolerating Qrator's automatic reload) up to
+# `BROWSER_FETCHER_CHALLENGE_WAIT` seconds before giving up.
+
+def _challenge_wait_seconds() -> float:
+    """Read the challenge-wait budget from env (default 30s)."""
+    raw = os.environ.get("BROWSER_FETCHER_CHALLENGE_WAIT", "30")
+    try:
+        val = float(raw)
+        return val if val >= 0 else 30.0
+    except (TypeError, ValueError):
+        return 30.0
+
+
+# Markers that identify an unresolved JS-challenge / access-block stub.
+# Case-insensitive substring match against the rendered page text/HTML.
+_CHALLENGE_MARKERS: tuple[str, ...] = (
+    "__qrator",
+    "qauth",
+    'id="request-id"',
+    'id="request-ip"',
+    "доступ ограничен",
+    "checking your browser",
+    "проверка браузера",
+    "ddos protection",
+)
+
+
+def _looks_like_challenge(html: Optional[str]) -> bool:
+    """True if *html* looks like an unresolved Qrator/DataDome challenge stub.
+
+    Heuristic: a challenge marker is present AND the page is small (stubs are
+    tiny — the real page is much larger).  We keep the size guard generous so a
+    real page that merely *mentions* a marker word isn't misclassified.
+    """
+    if not html:
+        return True
+    low = html.lower()
+    has_marker = any(m in low for m in _CHALLENGE_MARKERS)
+    if not has_marker:
+        return False
+    # Real pages are large; challenge stubs are tiny shells (~few KB).
+    return len(html) < 30_000
+
+
+async def _wait_out_challenge(
+    page,
+    url: str,
+    *,
+    challenge_wait: float,
+) -> Optional[str]:
+    """Poll *page* until it is no longer a challenge stub or the budget expires.
+
+    Returns the final page HTML (challenge-cleared if we got lucky, otherwise
+    whatever the last poll produced).  Never raises.
+    """
+    try:
+        html = await page.content()
+    except Exception:
+        return None
+
+    if not _looks_like_challenge(html):
+        return html
+
+    deadline = time.monotonic() + max(challenge_wait, 0.0)
+    poll_interval = 1.5
+    logger.info(
+        "BrowserFetcher: challenge stub detected on %s — waiting up to %.0fs for it to resolve",
+        url, challenge_wait,
+    )
+    while time.monotonic() < deadline:
+        # Qrator auto-reloads; give the network a chance to settle, tolerating
+        # the reload navigation that may be mid-flight.
+        try:
+            await page.wait_for_load_state("networkidle", timeout=4_000)
+        except Exception:
+            await asyncio.sleep(poll_interval)
+        try:
+            html = await page.content()
+        except Exception:
+            await asyncio.sleep(poll_interval)
+            continue
+        if not _looks_like_challenge(html):
+            logger.info("BrowserFetcher: challenge CLEARED on %s", url)
+            return html
+        await asyncio.sleep(poll_interval)
+
+    logger.warning(
+        "BrowserFetcher: challenge NOT cleared on %s within %.0fs — returning stub",
+        url, challenge_wait,
+    )
+    return html
+
+# ---------------------------------------------------------------------------
 # Chrome auto-detect: Windows paths first, then Linux (for prod portability)
 # ---------------------------------------------------------------------------
 
@@ -270,6 +372,7 @@ class BrowserFetcher:
         url: str,
         wait_selector: Optional[str] = None,
         timeout: float = 45.0,
+        challenge_wait: Optional[float] = None,
     ) -> Optional[str]:
         """Navigate to *url* with real Chrome and return the fully-rendered HTML.
 
@@ -323,6 +426,16 @@ class BrowserFetcher:
                     )
 
             html = await page.content()
+
+            # Patient anti-bot challenge wait: if Chrome returned the Qrator/
+            # DataDome JS-challenge stub, poll until it resolves (or budget ends)
+            # instead of handing back the interstitial.
+            cw = challenge_wait if challenge_wait is not None else _challenge_wait_seconds()
+            if cw > 0 and _looks_like_challenge(html):
+                resolved = await _wait_out_challenge(page, url, challenge_wait=cw)
+                if resolved is not None:
+                    html = resolved
+
             logger.info(
                 "BrowserFetcher: fetched %s (%d chars)", url, len(html)
             )
@@ -355,6 +468,7 @@ class BrowserFetcher:
         product_block_marker: str = "Доступ ограничен",
         warmup_retries: int = 3,
         warmup_retry_delay: float = 5.0,
+        challenge_wait: Optional[float] = None,
     ) -> Optional[str]:
         """Navigate to *warmup_url* first to let DataDome set its cookie,
         then navigate to *url* with the warmed session.
@@ -448,6 +562,15 @@ class BrowserFetcher:
                         pass
 
                 warmup_html = await page.content()
+
+                # Patient JS-challenge wait on the warmup page too: Qrator may
+                # serve its self-reloading stub here before the real homepage.
+                cw = challenge_wait if challenge_wait is not None else _challenge_wait_seconds()
+                if cw > 0 and _looks_like_challenge(warmup_html):
+                    resolved = await _wait_out_challenge(page, warmup_url, challenge_wait=cw)
+                    if resolved is not None:
+                        warmup_html = resolved
+
                 warmup_html_len = len(warmup_html)
 
                 if warmup_block_marker in warmup_html:
@@ -507,6 +630,15 @@ class BrowserFetcher:
                     pass
 
             product_html = await page.content()
+
+            # Patient JS-challenge wait on the product page: don't return the
+            # Qrator stub — poll until the real product DOM appears.
+            cw = challenge_wait if challenge_wait is not None else _challenge_wait_seconds()
+            if cw > 0 and _looks_like_challenge(product_html):
+                resolved = await _wait_out_challenge(page, url, challenge_wait=cw)
+                if resolved is not None:
+                    product_html = resolved
+
             product_html_len = len(product_html)
 
             if product_block_marker in product_html:

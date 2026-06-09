@@ -639,3 +639,236 @@ class TestRouting:
 
         assert bf_warmup_calls, "BrowserFetcher.fetch_with_warmup must be called for browser site"
         assert url_fetcher_calls == [], "url_fetcher must NOT be called for browser site"
+
+
+# ---------------------------------------------------------------------------
+# SPA auto-escalation: httpx shell → browser re-render → composition found
+# ---------------------------------------------------------------------------
+
+
+class TestSpaAutoEscalation:
+    """When httpx returns a JS-SPA shell with no composition, harvest_composition
+    must auto-escalate to BrowserFetcher.fetch on the SAME URL, then re-run
+    extract_composition on the fully-rendered DOM."""
+
+    def test_spa_escalation_uses_browser_when_httpx_empty_and_spa_shell(self):
+        """httpx returns an SPA shell (no composition) → BrowserFetcher.fetch called."""
+        # Minimal SPA shell: has an app-root marker, little visible text
+        spa_shell_html = (
+            "<html><head><title>Nike Sportswear Club Футболка - Street Beat</title></head>"
+            "<body><div id='app'></div>"
+            "<script>window.__initial_state__={}</script></body></html>"
+        )
+        # Browser-rendered page includes the spec block with composition
+        rendered_html = (
+            "<html><head><title>Nike Sportswear Club Футболка - Street Beat</title></head>"
+            "<body><div id='app'>"
+            "<div class='product-specs'><p>Состав: 100% хлопок</p></div>"
+            "</div></body></html>"
+        )
+
+        serper = MagicMock()
+        serper.search = AsyncMock(
+            return_value=_make_serper_results(["https://street-beat.ru/nike-tee/123/"])
+        )
+
+        # httpx returns the SPA shell
+        async def mock_fetch_url(url):
+            fr = MagicMock()
+            fr.raw_html = spa_shell_html
+            fr.content = spa_shell_html
+            return fr
+
+        # BrowserFetcher.fetch returns the rendered DOM
+        mock_bf = MagicMock()
+        mock_bf._closed = False
+        mock_bf.fetch = AsyncMock(return_value=rendered_html)
+        mock_bf.fetch_with_warmup = AsyncMock(return_value=None)
+        mock_bf.close = AsyncMock()
+
+        with (
+            patch(
+                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                return_value=False,
+            ),
+            patch(
+                "app.services.url_fetcher.fetch_url_content",
+                new=mock_fetch_url,
+            ),
+            patch(
+                "app.services.enrichment.sources.multisite_composition._INTER_REQUEST_DELAY",
+                0,
+            ),
+        ):
+            result = run(
+                harvest_composition(
+                    "Футболка мужская Nike Sportswear Club",
+                    "Nike",
+                    serper_client=serper,
+                    browser_fetcher=mock_bf,
+                )
+            )
+
+        assert result is not None, "SPA escalation must yield a composition"
+        assert "хлопок" in result["composition"]
+        assert result["site"] == "street-beat.ru"
+        # BrowserFetcher.fetch must have been invoked (SPA escalation path)
+        mock_bf.fetch.assert_called_once()
+
+    def test_spa_escalation_not_triggered_when_httpx_has_composition(self):
+        """If httpx already found composition, browser escalation is NOT triggered."""
+        good_html = (
+            "<html><head><title>Nike Tee</title></head>"
+            "<body><p>Состав: 80% хлопок, 20% полиэстер</p></body></html>"
+        )
+
+        serper = MagicMock()
+        serper.search = AsyncMock(
+            return_value=_make_serper_results(["https://kixbox.ru/nike-tee/"])
+        )
+
+        async def mock_fetch_url(url):
+            fr = MagicMock()
+            fr.raw_html = good_html
+            fr.content = good_html
+            return fr
+
+        mock_bf = MagicMock()
+        mock_bf._closed = False
+        mock_bf.fetch = AsyncMock(return_value=None)
+        mock_bf.fetch_with_warmup = AsyncMock(return_value=None)
+        mock_bf.close = AsyncMock()
+
+        with (
+            patch(
+                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                return_value=False,
+            ),
+            patch(
+                "app.services.url_fetcher.fetch_url_content",
+                new=mock_fetch_url,
+            ),
+            patch(
+                "app.services.enrichment.sources.multisite_composition._INTER_REQUEST_DELAY",
+                0,
+            ),
+        ):
+            result = run(
+                harvest_composition(
+                    "Футболка Nike",
+                    "Nike",
+                    serper_client=serper,
+                    browser_fetcher=mock_bf,
+                )
+            )
+
+        assert result is not None
+        # Browser fetch must NOT have been called (httpx was sufficient)
+        mock_bf.fetch.assert_not_called()
+
+    def test_spa_escalation_not_triggered_when_page_is_not_spa_shell(self):
+        """Plain page (no SPA markers, no composition) does NOT escalate to browser."""
+        plain_no_composition_html = (
+            "<html><head><title>Nike Tee Page</title></head>"
+            "<body><p>Купить футболку Nike по лучшей цене. Бесплатная доставка.</p>"
+            "<p>Скидки до 50% на все товары Nike. Оригинальная продукция.</p>"
+            "</body></html>"
+        )
+
+        serper = MagicMock()
+        serper.search = AsyncMock(
+            return_value=_make_serper_results(["https://kixbox.ru/nike-tee/"])
+        )
+
+        async def mock_fetch_url(url):
+            fr = MagicMock()
+            fr.raw_html = plain_no_composition_html
+            fr.content = plain_no_composition_html
+            return fr
+
+        mock_bf = MagicMock()
+        mock_bf._closed = False
+        mock_bf.fetch = AsyncMock(return_value=None)
+        mock_bf.close = AsyncMock()
+
+        with (
+            patch(
+                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                return_value=False,
+            ),
+            patch(
+                "app.services.url_fetcher.fetch_url_content",
+                new=mock_fetch_url,
+            ),
+            patch(
+                "app.services.enrichment.sources.multisite_composition._INTER_REQUEST_DELAY",
+                0,
+            ),
+        ):
+            result = run(
+                harvest_composition(
+                    "Футболка Nike",
+                    "Nike",
+                    serper_client=serper,
+                    browser_fetcher=mock_bf,
+                )
+            )
+
+        assert result is None
+        # No SPA markers → browser escalation must NOT fire
+        mock_bf.fetch.assert_not_called()
+
+    def test_spa_escalation_returns_none_gracefully_when_browser_also_misses(self):
+        """Browser re-render also finds no composition → returns None (no crash)."""
+        spa_shell_html = (
+            "<html><head><title>Nike Tee</title></head>"
+            "<body><div id='app'></div><script>window.__initial_state__={}</script></body></html>"
+        )
+        # Browser renders a page but still no composition block
+        rendered_no_comp = (
+            "<html><head><title>Nike Tee</title></head>"
+            "<body><div id='app'><p>Описание товара. Нет состава.</p></div></body></html>"
+        )
+
+        serper = MagicMock()
+        serper.search = AsyncMock(
+            return_value=_make_serper_results(["https://street-beat.ru/nike-tee/"])
+        )
+
+        async def mock_fetch_url(url):
+            fr = MagicMock()
+            fr.raw_html = spa_shell_html
+            fr.content = spa_shell_html
+            return fr
+
+        mock_bf = MagicMock()
+        mock_bf._closed = False
+        mock_bf.fetch = AsyncMock(return_value=rendered_no_comp)
+        mock_bf.close = AsyncMock()
+
+        with (
+            patch(
+                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                return_value=False,
+            ),
+            patch(
+                "app.services.url_fetcher.fetch_url_content",
+                new=mock_fetch_url,
+            ),
+            patch(
+                "app.services.enrichment.sources.multisite_composition._INTER_REQUEST_DELAY",
+                0,
+            ),
+        ):
+            result = run(
+                harvest_composition(
+                    "Футболка Nike",
+                    "Nike",
+                    serper_client=serper,
+                    browser_fetcher=mock_bf,
+                )
+            )
+
+        # Graceful None — no composition from either httpx or browser
+        assert result is None
+        mock_bf.fetch.assert_called_once()  # escalation DID fire, just found nothing

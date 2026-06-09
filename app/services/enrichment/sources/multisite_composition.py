@@ -129,6 +129,77 @@ def _is_dead(url: str) -> bool:
         return False
 
 
+# SPA app-root / hydration markers — presence with little visible text signals
+# an unrendered client-side-rendered shell (httpx got HTML, but the spec block
+# only appears after JS runs in a real browser).
+_SPA_MARKERS: tuple[str, ...] = (
+    'id="app"',
+    "id='app'",
+    "__next_data__",
+    "data-reactroot",
+    'id="root"',
+    "id='root'",
+    "data-server-rendered",
+    "window.__nuxt__",
+    "window.__initial_state__",
+)
+
+# Material words — if these appear ONLY inside <script>/JSON but not in visible
+# text, the page is an unrendered SPA whose data lives in a JS payload.
+_MATERIAL_HINT_WORDS: tuple[str, ...] = (
+    "хлопок", "хлопка", "полиэстер", "эластан", "вискоз", "состав",
+    "cotton", "polyester", "elastane", "material", "материал",
+)
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+
+
+def _visible_text_len(html: str) -> int:
+    """Approximate length of human-visible text (scripts/styles/tags stripped)."""
+    without_scripts = _SCRIPT_STYLE_RE.sub(" ", html)
+    text = _TAG_RE.sub(" ", without_scripts)
+    return len(re.sub(r"\s+", " ", text).strip())
+
+
+def _looks_like_spa_shell(html: Optional[str]) -> bool:
+    """Heuristic: True if *html* looks like an unrendered SPA shell.
+
+    Used ONLY after an open (httpx) fetch found NO composition, to decide
+    whether a browser re-render is worth the cost.  General (no per-site
+    hardcoding) — triggers when any of:
+      1. A known app-root / hydration marker is present AND visible text is
+         small relative to the raw HTML size (classic CSR shell).
+      2. Visible text is tiny in absolute terms (page is essentially empty).
+      3. Material/composition words exist in the raw HTML but NOT in the
+         visible text — i.e. the data is locked inside a script/JSON payload
+         that only a browser will hydrate into the DOM.
+    """
+    if not html:
+        return False
+
+    low = html.lower()
+    visible_len = _visible_text_len(html)
+    html_len = len(html)
+
+    has_marker = any(m in low for m in _SPA_MARKERS)
+
+    # 1 + 2: marker present with sparse visible text, or near-empty body.
+    if has_marker and (visible_len < 800 or (html_len > 0 and visible_len / html_len < 0.05)):
+        return True
+    if visible_len < 200 and html_len > 2_000:
+        return True
+
+    # 3: material words live only in scripts/JSON, not in visible text.
+    visible_low = _TAG_RE.sub(" ", _SCRIPT_STYLE_RE.sub(" ", html)).lower()
+    in_raw = any(w in low for w in _MATERIAL_HINT_WORDS)
+    in_visible = any(w in visible_low for w in _MATERIAL_HINT_WORDS)
+    if in_raw and not in_visible:
+        return True
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -199,8 +270,19 @@ async def harvest_composition(
 
     # --- 2. Fetch + extract loop ---------------------------------------------
     # Lazy BrowserFetcher: create ONE instance, shared across all browser-sites
+    # AND across SPA auto-escalations of open sites.
     _browser_fetcher_owned = False
     _browser_fetcher = browser_fetcher  # may be None initially
+
+    def _get_browser_fetcher():
+        """Return the shared BrowserFetcher, lazily creating it once."""
+        nonlocal _browser_fetcher, _browser_fetcher_owned
+        if _browser_fetcher is None:
+            from app.services.providers.browser_fetcher import BrowserFetcher
+            _browser_fetcher = BrowserFetcher()
+            _browser_fetcher_owned = True
+            logger.info("harvest_composition: created BrowserFetcher (shared)")
+        return _browser_fetcher
 
     tried = 0
     try:
@@ -235,12 +317,8 @@ async def harvest_composition(
 
             try:
                 if needs_browser:
-                    # Lazy-init the BrowserFetcher on first browser-site hit
-                    if _browser_fetcher is None:
-                        from app.services.providers.browser_fetcher import BrowserFetcher
-                        _browser_fetcher = BrowserFetcher()
-                        _browser_fetcher_owned = True
-                        logger.info("harvest_composition: created BrowserFetcher for browser-sites")
+                    # Lazy-init the shared BrowserFetcher on first browser-site hit
+                    bf = _get_browser_fetcher()
 
                     # Find warmup URL for this domain
                     warmup_url: Optional[str] = None
@@ -250,14 +328,14 @@ async def harvest_composition(
                             break
 
                     if warmup_url:
-                        html = await _browser_fetcher.fetch_with_warmup(
+                        html = await bf.fetch_with_warmup(
                             url,
                             warmup_url=warmup_url,
                             warmup_timeout=60.0,
                             product_timeout=60.0,
                         )
                     else:
-                        html = await _browser_fetcher.fetch(url)
+                        html = await bf.fetch(url)
 
                 else:
                     # Plain httpx via existing url_fetcher
@@ -295,6 +373,43 @@ async def harvest_composition(
 
             # --- Composition extraction ---
             compositions = extract_composition(html)
+
+            # --- SPA auto-escalation (open sites only) ---
+            # If httpx returned an unrendered SPA shell (spec block is in the JS
+            # payload, not visible HTML), escalate to a real browser render ONCE.
+            # No per-site hardcoding: the heuristic detects ANY SPA framework.
+            if not compositions and not needs_browser and _looks_like_spa_shell(html):
+                logger.info(
+                    "harvest_composition: SPA shell detected on %s — escalating to browser render",
+                    url,
+                )
+                try:
+                    bf = _get_browser_fetcher()
+                    spa_html = await bf.fetch(url)
+                    if spa_html:
+                        logger.info(
+                            "harvest_composition: browser-rendered %s (%d chars)",
+                            url, len(spa_html),
+                        )
+                        # Re-run composition extraction on the fully rendered DOM
+                        compositions = extract_composition(spa_html)
+                        if compositions:
+                            # Update html so return block uses the rendered version
+                            html = spa_html
+                            route = "open+browser-spa"
+                        else:
+                            logger.info(
+                                "harvest_composition: SPA escalation found no composition on %s", url
+                            )
+                    else:
+                        logger.info(
+                            "harvest_composition: SPA browser fetch returned empty for %s", url
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "harvest_composition: SPA escalation error for %s: %s", url, exc
+                    )
+
             if not compositions:
                 logger.info(
                     "harvest_composition: no composition extracted from %s", url

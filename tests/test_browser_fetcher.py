@@ -1232,3 +1232,133 @@ class TestTreeKillCleanup:
         # Stale process was killed before _find_chrome was even attempted
         assert len(killed) >= 1
         assert result is False  # failed at _find_chrome — but stale kill happened
+
+
+# ---------------------------------------------------------------------------
+# Challenge-wait poll tests: _looks_like_challenge + _wait_out_challenge
+# ---------------------------------------------------------------------------
+
+
+class TestChallengeWaitPoll:
+    """_wait_out_challenge polls until Qrator/DataDome stub clears or times out."""
+
+    def test_looks_like_challenge_detects_qrator_stub(self):
+        """Small page with __qrator marker is recognised as a challenge stub."""
+        from app.services.providers.browser_fetcher import _looks_like_challenge
+
+        stub = "<html><body><script>__qrator={}</script><p>Checking...</p></body></html>"
+        assert _looks_like_challenge(stub) is True
+
+    def test_looks_like_challenge_false_for_real_page(self):
+        """A large real page (no markers) is NOT flagged as a challenge."""
+        from app.services.providers.browser_fetcher import _looks_like_challenge
+
+        # Real page: big content, no challenge markers
+        real_page = "<html><body>" + "Товар хлопок состав " * 2000 + "</body></html>"
+        assert _looks_like_challenge(real_page) is False
+
+    def test_looks_like_challenge_false_for_none(self):
+        """None input is treated as a challenge (page not loaded at all)."""
+        from app.services.providers.browser_fetcher import _looks_like_challenge
+
+        # None → True (page is not usable)
+        assert _looks_like_challenge(None) is True
+
+    def test_wait_out_challenge_returns_real_content_after_poll(self):
+        """_wait_out_challenge polls and returns real HTML once challenge clears."""
+        import asyncio
+        from app.services.providers.browser_fetcher import _wait_out_challenge
+
+        stub_html = "<html><body><script>__qrator={}</script></body></html>"
+        real_html = "<html><body><h1>Sportmaster Product</h1><p>Состав: 100% хлопок</p></body></html>"
+
+        call_count = [0]
+
+        async def _seq_content():
+            idx = call_count[0]
+            call_count[0] += 1
+            # First call: stub; second call: real content
+            if idx == 0:
+                return stub_html
+            return real_html
+
+        mock_page = MagicMock()
+        mock_page.content = AsyncMock(side_effect=_seq_content)
+        # wait_for_load_state raises immediately to skip the sleep path
+        mock_page.wait_for_load_state = AsyncMock(side_effect=Exception("timeout"))
+
+        result = asyncio.get_event_loop().run_until_complete(
+            _wait_out_challenge(mock_page, "https://www.sportmaster.ru/product/123/", challenge_wait=5.0)
+        )
+
+        assert result is not None
+        assert "хлопок" in result
+        # content() called at least twice: initial check + at least one poll
+        assert call_count[0] >= 2
+
+    def test_wait_out_challenge_returns_stub_after_timeout(self):
+        """_wait_out_challenge returns the stub (last content) after budget expires."""
+        import asyncio
+        import time
+        from app.services.providers.browser_fetcher import _wait_out_challenge
+
+        stub_html = "<html><body><script>__qrator={}</script></body></html>"
+
+        mock_page = MagicMock()
+        mock_page.content = AsyncMock(return_value=stub_html)
+        mock_page.wait_for_load_state = AsyncMock(side_effect=Exception("timeout"))
+
+        # Very short budget so test runs fast
+        result = asyncio.get_event_loop().run_until_complete(
+            _wait_out_challenge(mock_page, "https://www.sportmaster.ru/", challenge_wait=0.1)
+        )
+
+        # Timed out: returns whatever was last read (the stub)
+        assert result == stub_html
+
+    def test_fetch_invokes_challenge_wait_when_stub_detected(self):
+        """fetch() calls _wait_out_challenge when page.content() returns a stub."""
+        stub_html = "<html><body><script>__qrator={}</script></body></html>"
+        real_html = "<html><body><p>Состав: 80% хлопок</p></body></html>"
+
+        # page.content() returns stub first, then real content on subsequent calls
+        content_calls = [0]
+
+        async def _seq_content():
+            idx = content_calls[0]
+            content_calls[0] += 1
+            if idx == 0:
+                return stub_html
+            return real_html
+
+        page = MagicMock()
+        page.goto = AsyncMock()
+        page.wait_for_load_state = AsyncMock(side_effect=Exception("networkidle timeout"))
+        page.content = AsyncMock(side_effect=_seq_content)
+        page.close = AsyncMock()
+
+        ctx = _make_mock_context(page)
+        browser = _make_mock_browser(ctx)
+
+        fetcher = BrowserFetcher.__new__(BrowserFetcher)
+        fetcher._closed = False
+        fetcher._browser = browser
+        fetcher._context = ctx
+        fetcher._chrome_proc = MagicMock(pid=1234)
+        fetcher._user_data_dir = "/tmp/bf_challenge_test"
+        fetcher._playwright = None
+
+        async def _already_running():
+            return True
+
+        fetcher._ensure_running = _already_running
+
+        # challenge_wait=5s so the poll loop fires at least once
+        result = run(fetcher.fetch(
+            "https://www.sportmaster.ru/product/999/",
+            challenge_wait=5.0,
+        ))
+
+        # Must have polled past the stub and returned real content
+        assert result is not None
+        assert "хлопок" in result
