@@ -97,7 +97,10 @@ async def scrappey_fetch(url: str, timeout: float = 120.0) -> Optional[str]:
         logger.info("[Scrappey] empty content (upstream=%s) for %s", upstream_status, url[:80])
         return None
 
-    if upstream_status != 200:
+    # Scrappey omits statusCode (returns None) for sites that don't echo it back
+    # but still deliver real HTML (verified=True).  Treat None as "don't know /
+    # likely 200" — only reject explicit non-200 codes (e.g. 301, 403, 407).
+    if upstream_status is not None and upstream_status != 200:
         logger.info("[Scrappey] upstream HTTP %s for %s — likely block", upstream_status, url[:80])
         return None
 

@@ -1065,7 +1065,9 @@ class OzonCardSource(AttributeSource):
             )
             return None
 
-        if upstream_status != 200:
+        # Scrappey omits statusCode (None) for some sites but still returns real
+        # HTML (verified=True). Only reject explicit non-200 upstream codes.
+        if upstream_status is not None and upstream_status != 200:
             logger.info(
                 "[OzonCard] upstream HTTP %s for %s — likely block",
                 upstream_status, target_url[:80],
