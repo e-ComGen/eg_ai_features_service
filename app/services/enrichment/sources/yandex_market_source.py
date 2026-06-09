@@ -95,8 +95,18 @@ _CONF_BRAND_LINE = 0.85
 _EXACT_THRESHOLD = 78.0
 _BRAND_LINE_THRESHOLD = 60.0
 
-# Skip-guard
+# Skip-guard: общий порог заполнения (generic). Если ≥80% всех targets уже
+# заполнены high-confidence — не тратим Scrappey. НО: порог обходится когда
+# высокоценные content-поля (Состав/Материал/Сезон) ещё пусты — это ключевые
+# apparel-атрибуты, ради которых YM и запускается (data-desert после WB/Ozon).
 _SKIP_FILL_RATIO = 0.80
+
+# Ключевые слова content-таргетов, которые ЗАПРЕЩАЮТ skip по _SKIP_FILL_RATIO.
+# Определяются по имени (lower, substring) — без хардкода attribute_id:
+# "состав" → "Состав материала", "Состав"; "материал" → "Материал", "Материал верха";
+# "сезон" → "Сезон". Если ХОТЬ ОДИН незаполненный target содержит любое из
+# этих слов — skip отменяется, YM запускается.
+_CONTENT_KEYWORDS: frozenset[str] = frozenset({"состав", "материал", "сезон"})
 
 # LRU
 _CACHE_MAX = 256
@@ -259,8 +269,23 @@ class YandexMarketSource(AttributeSource):
 
         filled_ids = {av.attribute_id for av in already_filled if av.confidence >= 0.85}
         if targets and len(filled_ids & {t.id for t in targets}) / len(targets) >= _SKIP_FILL_RATIO:
-            logger.debug("[YandexMarket] skip (≥%.0f%% targets filled)", _SKIP_FILL_RATIO * 100)
-            return []
+            # Don't skip when high-value content targets (Состав/Материал/Сезон) are
+            # still unfilled — these are the exact fields YM is meant to rescue in the
+            # apparel data-desert. A generic ≥80%-filled ratio must not silence YM when
+            # composition is still empty.
+            unfilled_ids = {t.id for t in targets} - filled_ids
+            content_unfilled = any(
+                any(kw in t.name.lower() for kw in _CONTENT_KEYWORDS)
+                for t in targets
+                if t.id in unfilled_ids
+            )
+            if not content_unfilled:
+                logger.debug("[YandexMarket] skip (≥%.0f%% targets filled)", _SKIP_FILL_RATIO * 100)
+                return []
+            logger.debug(
+                "[YandexMarket] fill_ratio≥%.0f%% but content targets still empty — running YM",
+                _SKIP_FILL_RATIO * 100,
+            )
 
         effective = filter_already_filled_targets(targets, already_filled)
         if not effective:

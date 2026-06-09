@@ -88,6 +88,7 @@ from app.services.enrichment.sources.pdf_datasheet_source import PdfDatasheetSou
 from app.services.enrichment.sources.ozon_card_source import OzonCardSource
 from app.services.enrichment.sources.wb_card_source import WbCardSource
 from app.services.enrichment.sources.tnved_source import TnvedSource
+from app.services.enrichment.sources.yandex_market_source import YandexMarketSource
 
 # ----------------------------------------------------------------------------
 # PRODUCT SET — 40 apparel products, each tagged with its REAL (cat_id, type_id).
@@ -455,6 +456,7 @@ async def main():
         pdf_datasheet_source=PdfDatasheetSource(),
         ozon_card_source=OzonCardSource(),
         wb_card_source=WbCardSource(),
+        yandex_market_source=YandexMarketSource(),
         tnved_source=TnvedSource(),
     )
 

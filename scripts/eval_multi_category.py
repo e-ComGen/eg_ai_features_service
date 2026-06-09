@@ -52,6 +52,7 @@ from app.services.enrichment.sources.pdf_datasheet_source import PdfDatasheetSou
 from app.services.enrichment.sources.ozon_card_source import OzonCardSource
 from app.services.enrichment.sources.wb_card_source import WbCardSource
 from app.services.enrichment.sources.tnved_source import TnvedSource
+from app.services.enrichment.sources.yandex_market_source import YandexMarketSource
 
 # 40 товаров — каждый в своей категории Ozon (cat_id, type_id, product_name)
 PRODUCTS = [
@@ -146,6 +147,7 @@ async def main():
     ozon_card = OzonCardSource()
     wb_card = WbCardSource()
     tnved = TnvedSource()
+    yandex_market = YandexMarketSource()
 
     orchestrator = PipelineOrchestrator(
         strategy=strategy,
@@ -154,6 +156,7 @@ async def main():
         pdf_datasheet_source=pdf_datasheet,
         ozon_card_source=ozon_card,
         wb_card_source=wb_card,
+        yandex_market_source=yandex_market,
         tnved_source=tnved,
     )
 
