@@ -146,6 +146,20 @@ def _scrappey_max() -> int:
         return 200
 
 
+def _scrappey_timeout_cap() -> float:
+    """Hard timeout cap (seconds) for a single Scrappey fallback call.
+
+    Configured via URL_FETCHER_SCRAPPEY_TIMEOUT (default 25s).
+    Rationale: the 4 known wall domains (lamoda/sportmaster/dns-shop/citilink)
+    NEVER succeed even with residential proxies, so killing them at 25s is pure
+    win; soft sites that Scrappey CAN beat usually respond well under 25s.
+    """
+    try:
+        return float(os.environ.get("URL_FETCHER_SCRAPPEY_TIMEOUT", "25"))
+    except ValueError:
+        return 25.0
+
+
 def _scrappey_fast_domains() -> set:
     """Optional set of domains that are always eligible for Scrappey fallback.
 
@@ -341,11 +355,28 @@ async def _try_scrappey_fallback(
 
     _scrappey_call_count += 1
 
+    # Hard timeout cap: never let a single Scrappey call block more than
+    # URL_FETCHER_SCRAPPEY_TIMEOUT seconds (default 25s).  asyncio.wait_for
+    # enforces the cap even if the underlying httpx client ignores its own
+    # timeout (e.g. stalled TLS handshake on a wall domain).
+    cap = _scrappey_timeout_cap()
+
     html: Optional[str] = None
     scrappey_exception: Optional[Exception] = None
+    timed_out = False
     try:
         from app.services.providers.scrappey_client import scrappey_fetch
-        html = await scrappey_fetch(url, timeout=max(timeout, 120))
+        html = await asyncio.wait_for(
+            scrappey_fetch(url, timeout=cap),
+            timeout=cap,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Scrappey fallback TIMED OUT after %.0fs for %r — recording TRANSIENT",
+            cap, url,
+        )
+        timed_out = True
+        scrappey_exception = asyncio.TimeoutError(f"Scrappey cap {cap}s exceeded")
     except Exception as exc:
         logger.warning("Scrappey fallback error for %r: %s", url, exc)
         scrappey_exception = exc
@@ -353,7 +384,11 @@ async def _try_scrappey_fallback(
     # Classify outcome and record into domain-health store.
     try:
         from app.services.providers.domain_health import record_scrappey_outcome as _record
-        if scrappey_exception is not None:
+        if timed_out:
+            # Timeout ≠ confirmed block: the server may just be slow right now.
+            # Record TRANSIENT so the death-counter is NOT incremented.
+            _record(host, url, "TRANSIENT")
+        elif scrappey_exception is not None:
             # Network/SSL/timeout from scrappey_fetch itself → TRANSIENT
             _record(host, url, "TRANSIENT")
         elif not html:
