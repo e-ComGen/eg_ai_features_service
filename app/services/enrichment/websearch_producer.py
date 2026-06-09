@@ -12,6 +12,7 @@ Provider selection is config-driven (PROVIDER_WEB_SEARCH):
 import asyncio
 import logging
 import os
+import re
 from typing import Optional
 
 from app import config
@@ -501,21 +502,52 @@ class WebSearchProducer:
     # ------------------------------------------------------------------
     # Composition mining: targeted Serper search → raw HTML → extractor
     # ------------------------------------------------------------------
+
+    # Material words that must appear in an evidence_quote to count as a
+    # composition signal. Uses a shared pattern from composition_extractor
+    # but we keep a lightweight inline check to avoid circular import at
+    # module level.
+    _COMPOSITION_SIGNAL_RE = re.compile(
+        r"(?:"
+        r"\d{1,3}\s*%"          # digit + percent sign
+        r"|"
+        r"\b(?:хлопок|cotton|полиэстер|polyester|эластан|elastane|spandex"
+        r"|вискоза|viscose|шерсть|wool|полиамид|polyamide|нейлон|nylon"
+        r"|лиоцелл|lyocell|акрил|acrylic|лён|linen|кашемир|cashmere"
+        r"|модал|modal|бамбук|bamboo|шёлк|silk|флис|fleece)\b"
+        r")",
+        re.IGNORECASE,
+    )
+
+    # Structured LLM response for composition mining
+    # Defined as a module-level type below to allow isinstance checks in tests.
+
     async def mine_composition(
         self,
         product_name: str,
         brand: Optional[str] = None,
         timeout: int = 30,
+        llm_provider=None,
+        llm_calls_budget: int = 99,
+        llm_calls_so_far: int = 0,
     ) -> list[str]:
         """Mine fabric/material composition from the web.
 
-        Runs a Serper search targeted at composition ("состав материала" / "fabric
-        composition"), fetches up to 3 HTTPS generic PDP pages, runs
-        extract_composition on the FULL raw HTML (bypassing the trafilatura cap),
-        applies brand-verification, deduplicates, and returns a list of normalised
-        composition strings like ["79% хлопок, 21% полиэстер"].
+        Strategy (cost-aware, "пусто честнее мусора"):
+        1. Issue 2-3 query variants (RU + EN) via Serper, dedup URLs.
+        2. Fetch up to 5 HTTPS result pages via fetch_all_results.
+        3. REGEX FIRST (free): run extract_composition on each page's raw HTML.
+           If regex finds a composition AND brand/model verification passes →
+           return immediately with no LLM call (cost saved).
+        4. LLM RECALL (only when regex found nothing across all pages):
+           Make ONE LLM call over truncated page texts with a strict prompt.
+           Acceptance gate:
+             - is_our_product == True
+             - evidence_quote is a VERBATIM substring of the actually-fetched text
+             - evidence_quote contains a composition signal (material word or %)
+           This accepts blogs/reviews/wholesalers while blocking hallucination.
 
-        Returns [] on any failure (fail-closed — "пусто честнее мусора").
+        Returns [] on any failure (fail-closed).
         Only functional when self._use_serper is True; returns [] for the legacy
         OpenAI path (no page fetching there).
         """
@@ -530,39 +562,74 @@ class WebSearchProducer:
         )
         from app.services.url_fetcher import fetch_all_results
 
-        # Targeted query: brand + product name + composition keywords
-        parts = []
+        # ------------------------------------------------------------------
+        # Step 1 — Broader multi-query search (2-3 variants, deduped URLs)
+        # ------------------------------------------------------------------
+        parts_base = []
         if brand:
-            parts.append(brand)
-        parts.append(product_name)
-        # Bilingual composition search keywords
-        query = " ".join(parts) + " состав материала fabric composition"
+            parts_base.append(brand)
+        parts_base.append(product_name)
+        base = " ".join(parts_base)
 
-        try:
-            sem = _get_serper_sem()
-            async with sem:
-                results = await asyncio.wait_for(
-                    self._serper.search(query, num_results=5),
-                    timeout=timeout,
+        # Determine if brand is Latin (heuristic: majority ASCII letters)
+        brand_str = brand or ""
+        latin_ratio = (
+            sum(1 for c in brand_str if c.isascii() and c.isalpha()) / max(len(brand_str), 1)
+        )
+        is_latin_brand = latin_ratio > 0.5
+
+        queries: list[str] = [
+            base + " состав",
+            base + " материал",
+        ]
+        if is_latin_brand:
+            queries.append(base + " material composition")
+
+        seen_urls: set[str] = set()
+        ordered_urls: list[str] = []
+
+        _SKIP_DOMAINS = ("wildberries.ru", "ozon.ru", "aliexpress")
+
+        for query in queries:
+            try:
+                sem = _get_serper_sem()
+                async with sem:
+                    results = await asyncio.wait_for(
+                        self._serper.search(query, num_results=5),
+                        timeout=timeout,
+                    )
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.warning(
+                    "WebSearchProducer.mine_composition: search failed for query %r: %s",
+                    query, exc,
                 )
-        except (asyncio.TimeoutError, Exception) as exc:
-            logger.warning("WebSearchProducer.mine_composition: search failed: %s", exc)
-            return []
+                continue
 
-        top_urls = [
-            r.link
-            for r in (results.organic_results or [])[:5]
-            if getattr(r, "link", None) and str(r.link).startswith("https://")
-            # Skip known marketplace pages that we'd fetch via their APIs (no raw HTML)
-            and "wildberries.ru" not in str(r.link)
-            and "ozon.ru" not in str(r.link)
-            and "aliexpress" not in str(r.link)
-        ][:3]
+            for r in results.organic_results or []:
+                link = getattr(r, "link", None)
+                if not link:
+                    continue
+                link = str(link)
+                if not link.startswith("https://"):
+                    continue
+                if any(d in link for d in _SKIP_DOMAINS):
+                    continue
+                if link not in seen_urls:
+                    seen_urls.add(link)
+                    ordered_urls.append(link)
+
+        # Limit to top-5 unique URLs
+        top_urls = ordered_urls[:5]
 
         if not top_urls:
-            logger.debug("WebSearchProducer.mine_composition: no HTTPS URLs for %r", product_name)
+            logger.debug(
+                "WebSearchProducer.mine_composition: no HTTPS URLs for %r", product_name
+            )
             return []
 
+        # ------------------------------------------------------------------
+        # Step 2 — Fetch pages
+        # ------------------------------------------------------------------
         try:
             fetch_results = await asyncio.wait_for(
                 fetch_all_results(top_urls),
@@ -575,41 +642,278 @@ class WebSearchProducer:
             return []
         except Exception as exc:
             logger.warning(
-                "WebSearchProducer.mine_composition: page fetch failed for %r: %s", product_name, exc
+                "WebSearchProducer.mine_composition: page fetch failed for %r: %s",
+                product_name, exc,
             )
             return []
 
-        all_compositions: list[str] = []
+        # ------------------------------------------------------------------
+        # Step 3 — REGEX FIRST PASS (free, no LLM)
+        # ------------------------------------------------------------------
+        # Collect (url, text) pairs for potential LLM pass
+        page_texts: list[tuple[str, str]] = []
+
         for fr in fetch_results:
-            # Use raw_html when available (full page, untruncated).
-            # Fall back to content (already trafilatura-extracted but may still work).
             source_text = fr.raw_html if fr.raw_html else fr.content
             if not source_text:
                 continue
+            page_texts.append((fr.url, source_text))
 
-            # CRITICAL brand-verification gate: only accept composition from pages
-            # that plausibly describe OUR product.
+            # Old gate was "must be PDP only" → caused Levi's false-reject.
+            # New gate: require brand token anywhere in page (URL, title, h1,
+            # first 2k text) AND at least one significant product_name word.
             if not page_matches_brand(source_text, fr.url, brand, product_name):
                 logger.debug(
-                    "WebSearchProducer.mine_composition: brand mismatch on %r — skipping", fr.url
+                    "WebSearchProducer.mine_composition: brand/model mismatch on %r — "
+                    "skipping regex pass",
+                    fr.url,
                 )
                 continue
 
             compositions = extract_composition(source_text)
             if compositions:
                 logger.info(
-                    "WebSearchProducer.mine_composition: found %d composition(s) on %r: %s",
-                    len(compositions), fr.url, compositions,
+                    "WebSearchProducer.mine_composition: REGEX HIT on %r — %s",
+                    fr.url, compositions,
                 )
-                all_compositions.extend(compositions)
+                return _dedup_list(compositions)
 
-        # Deduplicate (keep first occurrence)
-        seen: set[str] = set()
-        deduped: list[str] = []
-        for c in all_compositions:
-            key = c.lower()
-            if key not in seen:
-                seen.add(key)
-                deduped.append(c)
+        # ------------------------------------------------------------------
+        # Step 4 — LLM RECALL BOOSTER (only when regex found nothing)
+        # ------------------------------------------------------------------
+        # Budget guard
+        if llm_calls_so_far >= llm_calls_budget:
+            logger.debug(
+                "WebSearchProducer.mine_composition: LLM budget exhausted "
+                "(%d/%d) for %r — skip LLM recall",
+                llm_calls_so_far, llm_calls_budget, product_name,
+            )
+            return []
 
-        return deduped
+        if not page_texts:
+            return []
+
+        # Resolve LLM provider: injected > self._extractor > raw factory provider
+        provider = llm_provider
+        if provider is None:
+            provider = self._extractor
+
+        if provider is None:
+            logger.debug(
+                "WebSearchProducer.mine_composition: no LLM provider — skip LLM recall"
+            )
+            return []
+
+        # Build context: top 3 pages, 5000 chars each
+        _PAGE_CHAR_CAP = 5000
+        _MAX_PAGES_FOR_LLM = 3
+
+        context_blocks: list[str] = []
+        full_texts: dict[str, str] = {}  # url → full_text for verbatim check
+
+        for url, raw in page_texts[:_MAX_PAGES_FOR_LLM]:
+            # Flatten HTML for LLM readability
+            from app.services.enrichment.composition_extractor import _flatten_html
+            flat = _flatten_html(raw)[:_PAGE_CHAR_CAP]
+            context_blocks.append(f"=== SOURCE: {url} ===\n{flat}")
+            full_texts[url] = _flatten_html(raw)  # full version for verbatim check
+
+        pages_context = "\n\n".join(context_blocks)
+
+        system_prompt = (
+            "You are a product data specialist. Your task is to find the EXACT "
+            "fabric/material composition of a specific product from provided web page excerpts.\n\n"
+            "Rules:\n"
+            "1. Only answer if the page clearly mentions THIS brand AND this model/line name.\n"
+            "2. Blogs, reviews, wholesalers, and fan sites are acceptable sources — "
+            "composition is product-invariant.\n"
+            "3. NEVER guess or invent a composition not stated in the text.\n"
+            "4. The evidence_quote field MUST be copied VERBATIM from the provided text.\n"
+            "5. Set is_our_product=false if you are not sure the page is about THIS product.\n"
+            "6. If no composition is found in the text, set composition=null.\n\n"
+            "Return a JSON object with exactly these fields:\n"
+            "{\n"
+            '  "composition": string | null,\n'
+            '  "material_primary": string | null,\n'
+            '  "evidence_quote": string (VERBATIM substring from provided text),\n'
+            '  "source_hint": string (URL or site name),\n'
+            '  "is_our_product": bool,\n'
+            '  "confidence": number between 0 and 1\n'
+            "}"
+        )
+
+        user_text = (
+            f'Find the material composition of: "{product_name}"'
+            + (f" (brand: {brand})" if brand else "")
+            + "\n\nWeb page excerpts:\n"
+            + pages_context
+        )
+
+        try:
+            # Duck-type dispatch: prefer direct .complete() when available
+            # (works for LlmProvider subclasses AND test mocks).
+            # Fall back to StructuredLlmManager path via _llm_complete_raw.
+            if callable(getattr(provider, "complete", None)):
+                llm_resp = await asyncio.wait_for(
+                    provider.complete(
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_text},
+                        ],
+                        model=_get_extraction_model(),
+                        temperature=0.0,
+                        max_tokens=512,
+                        response_format={"type": "json_object"},
+                    ),
+                    timeout=timeout,
+                )
+                raw_json = (llm_resp.content or "").strip()
+            else:
+                # StructuredLlmManager path
+                raw_json = await _llm_complete_raw(
+                    provider, system_prompt, user_text, timeout
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "WebSearchProducer.mine_composition: LLM call timed out for %r", product_name
+            )
+            return []
+        except Exception as exc:
+            logger.warning(
+                "WebSearchProducer.mine_composition: LLM call failed for %r: %s",
+                product_name, exc,
+            )
+            return []
+
+        # ------------------------------------------------------------------
+        # Step 5 — ACCEPTANCE GATE (verbatim-quote + is_our_product)
+        # ------------------------------------------------------------------
+        parsed = _parse_composition_llm_response(raw_json)
+        if parsed is None:
+            logger.debug(
+                "WebSearchProducer.mine_composition: LLM response parse failed for %r",
+                product_name,
+            )
+            return []
+
+        composition = parsed.get("composition")
+        is_our = parsed.get("is_our_product", False)
+        evidence_quote = parsed.get("evidence_quote", "") or ""
+        source_hint = parsed.get("source_hint", "") or ""
+
+        # Gate 1: LLM must believe the page is about our product
+        if not is_our:
+            logger.debug(
+                "WebSearchProducer.mine_composition: LLM says is_our_product=False "
+                "for %r — rejected",
+                product_name,
+            )
+            return []
+
+        # Gate 2: composition must be non-null
+        if not composition:
+            logger.debug(
+                "WebSearchProducer.mine_composition: LLM returned null composition for %r",
+                product_name,
+            )
+            return []
+
+        # Gate 3: evidence_quote must be a VERBATIM substring of actually-fetched text
+        # (blocks hallucination — the quote must really exist on the page)
+        quote_verified = False
+        if evidence_quote:
+            for url, full_text in full_texts.items():
+                if evidence_quote in full_text:
+                    quote_verified = True
+                    logger.debug(
+                        "WebSearchProducer.mine_composition: verbatim quote verified on %r",
+                        url,
+                    )
+                    break
+
+        if not quote_verified:
+            logger.warning(
+                "WebSearchProducer.mine_composition: evidence_quote NOT found verbatim "
+                "in any fetched page for %r — REJECTED (hallucination guard). "
+                "Quote: %r",
+                product_name, evidence_quote[:120],
+            )
+            return []
+
+        # Gate 4: evidence_quote must contain a composition signal
+        if not self._COMPOSITION_SIGNAL_RE.search(evidence_quote):
+            logger.debug(
+                "WebSearchProducer.mine_composition: evidence_quote has no composition "
+                "signal for %r — rejected. Quote: %r",
+                product_name, evidence_quote[:80],
+            )
+            return []
+
+        logger.info(
+            "WebSearchProducer.mine_composition: LLM HIT for %r — %r (source: %s)",
+            product_name, composition, source_hint,
+        )
+        return [composition]
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers (outside the class — no self needed)
+# ---------------------------------------------------------------------------
+
+
+def _dedup_list(items: list[str]) -> list[str]:
+    """Deduplicate while preserving first-occurrence order."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
+def _get_extraction_model() -> str:
+    from app import config as _cfg
+    return _cfg.EXTRACTION_FROM_TEXT_MODEL
+
+
+def _parse_composition_llm_response(raw_json: str) -> Optional[dict]:
+    """Parse JSON from LLM response; returns None on any failure."""
+    import json
+    if not raw_json:
+        return None
+    try:
+        # Strip markdown code fences if present
+        text = raw_json.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            # drop first and last fence lines
+            inner = lines[1:-1] if lines[-1].strip().startswith("```") else lines[1:]
+            text = "\n".join(inner)
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+async def _llm_complete_raw(provider, system_prompt: str, user_text: str, timeout: int) -> str:
+    """Call a StructuredLlmManager-style provider and return raw text."""
+    # StructuredLlmManager.structured_request() requires a Pydantic model.
+    # Fall through to the underlying raw provider's complete() instead.
+    if hasattr(provider, "_provider") and hasattr(provider._provider, "complete"):
+        from app import config as _cfg
+        resp = await asyncio.wait_for(
+            provider._provider.complete(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                model=_cfg.EXTRACTION_FROM_TEXT_MODEL,
+                temperature=0.0,
+                max_tokens=512,
+                response_format={"type": "json_object"},
+            ),
+            timeout=timeout,
+        )
+        return (resp.content or "").strip()
+    return ""

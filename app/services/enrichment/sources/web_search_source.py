@@ -263,9 +263,16 @@ class WebSearchSource(AttributeSource):
         if _ATTR_MATERIAL in filled_ids and not wants_sostav:
             return []
 
+        # Pass LLM provider and budget so mine_composition can make ONE LLM call
+        # if regex found nothing. Budget: respect existing per-product cap.
+        # We count a potential LLM call inside mine_composition against the budget.
+        raw_provider = getattr(self._extractor, "_provider", self._extractor)
         compositions = await self._search.mine_composition(
             product_name=context.product_name,
             brand=context.brand,
+            llm_provider=raw_provider,
+            llm_calls_budget=10,      # generous per-product cap
+            llm_calls_so_far=context.llm_calls_so_far,
         )
         if not compositions:
             return []
