@@ -34,10 +34,14 @@ from app.services.enrichment.sources import (
     WbCardSource,
     UgcSource,
     TnvedSource,
+    YandexMarketSource,
 )
 from app.services.enrichment.sources.ozon_card_source import (
     _extract_gender_signal,
     _is_gender_target_name,
+)
+from app.services.enrichment.sources.image_card_search import (
+    find_matching_card as _image_find_matching_card,
 )
 # Лемматизатор тип-слова (pymorphy3, морфология опциональна) — переиспользуем тот же
 # helper, что и wb_card_source._target_type_lemma/_card_subj_lemmas, чтобы
@@ -1144,6 +1148,7 @@ class PipelineOrchestrator:
         pdf_datasheet_source: Optional[PdfDatasheetSource] = None,
         ozon_card_source: Optional[OzonCardSource] = None,
         wb_card_source: Optional[WbCardSource] = None,
+        yandex_market_source: Optional[YandexMarketSource] = None,
         ugc_source: Optional[UgcSource] = None,
         tnved_source: Optional[TnvedSource] = None,
         classifier: Optional[LlmClassifier] = None,
@@ -1191,6 +1196,10 @@ class PipelineOrchestrator:
         # WbCardSource: копия характеристик из WB basket-API (бесплатно, без anti-bot).
         # None → WB card stage пропускается.
         self._wb_card: Optional[WbCardSource] = wb_card_source
+        # YandexMarketSource: копия характеристик с live market.yandex.ru-карточки через Scrappey.
+        # Запускается ПОСЛЕ WbCard/OzonCard (card=N fallback для apparel и generic-named products).
+        # None → Yandex Market stage пропускается.
+        self._yandex_market: Optional[YandexMarketSource] = yandex_market_source
         # UgcSource: отзывы и Q&A с Ozon/WB для compat/physical attrs.
         # None → UGC stage пропускается.
         self._ugc: Optional[UgcSource] = ugc_source
@@ -1226,6 +1235,15 @@ class PipelineOrchestrator:
         if self._wb_card is not None:
             self._judges[Source.WB_CARD] = ConfidenceAwareJudgeWrapper(
                 self._wb_card.get_judge()
+            )
+        # Judge для YandexMarket (если source передан).
+        # YandexMarketSource эмитит Source.OZON_CARD — переиспользуем тот же judge
+        # (см. module docstring yandex_market_source.py).
+        # Важно: judge регистрируется только если OZON_CARD judge ещё не задан —
+        # чтобы не перезаписать OzonCardSource judge когда оба переданы.
+        if self._yandex_market is not None and Source.OZON_CARD not in self._judges:
+            self._judges[Source.OZON_CARD] = ConfidenceAwareJudgeWrapper(
+                self._yandex_market.get_judge()
             )
         # Judge для UGC (если source передан)
         if self._ugc is not None:
@@ -1289,6 +1307,40 @@ class PipelineOrchestrator:
         # потенциальных fills у других sources в предыдущей версии порядка.
         if self._ozon_card is not None and remaining:
             new_avs = await self._run_ozon_card_stage(
+                context, remaining, already_filled=filled_so_far,
+            )
+            all_values += new_avs
+            filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
+            remaining = self._remaining_targets(targets, all_values)
+            if not remaining:
+                all_values += await self._run_finishing(context, targets, all_values)
+                all_values += await self._generate_annotation(context, targets, all_values)
+                return await self._finalize_async(all_values, targets, context)
+
+        # Stage 0.52: YandexMarketSource — копия характеристик с live market.yandex.ru.
+        # Запускается ПОСЛЕ WbCard + OzonCard (card=N fallback): нет смысла тратить
+        # Scrappey-кредиты если WB/Ozon card уже закрыл нужные атрибуты. Особенно
+        # полезен для apparel (generic-named, без SKU) где WB/Ozon дают card=N.
+        # Cost-gated: только при remaining > 0 (т.е. когда предыдущие card-источники
+        # не закрыли все targets).
+        if self._yandex_market is not None and remaining:
+            new_avs = await self._run_yandex_market_stage(
+                context, remaining, already_filled=filled_so_far,
+            )
+            all_values += new_avs
+            filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
+            remaining = self._remaining_targets(targets, all_values)
+            if not remaining:
+                all_values += await self._run_finishing(context, targets, all_values)
+                all_values += await self._generate_annotation(context, targets, all_values)
+                return await self._finalize_async(all_values, targets, context)
+
+        # Stage 0.53: ImageCardSearch — reverse-image Serper /lens fallback.
+        # Runs ONLY when: image_urls present AND all text card-sources returned card=N
+        # (remaining still has unfilled targets). Cost: 1 Serper /lens call (~$0.005).
+        # Gating: image_urls[0] required; fail-closed gate inside find_matching_card.
+        if context.image_urls and remaining:
+            new_avs = await self._run_image_card_stage(
                 context, remaining, already_filled=filled_so_far,
             )
             all_values += new_avs
@@ -1883,6 +1935,101 @@ class PipelineOrchestrator:
                     value.attribute_id, e,
                 )
         return results
+
+    async def _run_yandex_market_stage(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: Optional[list[AttributeValue]] = None,
+    ) -> list[AttributeValue]:
+        """Запустить YandexMarketSource + его судью. Ошибки не прерывают pipeline."""
+        if self._yandex_market is None:
+            return []
+        # YandexMarketSource эмитит Source.OZON_CARD — используем тот же judge.
+        judge_wrapper = self._judges.get(Source.OZON_CARD)
+        try:
+            extracted = await self._yandex_market.extract(
+                context, targets, already_filled=already_filled
+            )
+        except Exception as e:
+            logger.warning("[Pipeline] yandex_market source failed: %s", e, exc_info=True)
+            return []
+        if judge_wrapper is None:
+            return extracted
+        results: list[AttributeValue] = []
+        for value in extracted:
+            try:
+                judged = await judge_wrapper.maybe_validate(value, context)
+                if judged is not None:
+                    results.append(judged)
+            except Exception as e:
+                logger.warning(
+                    "[Pipeline] yandex_market judge failed for attr %s: %s",
+                    value.attribute_id, e,
+                )
+        return results
+
+    async def _run_image_card_stage(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: Optional[list[AttributeValue]] = None,
+    ) -> list[AttributeValue]:
+        """Reverse-image card search via Serper /lens.
+
+        Only fires when context.image_urls is non-empty (gated at call site).
+        find_matching_card returns None if no candidate passes the gate → [].
+        On success: uses the found card's URL to run the appropriate card source
+        (ozon/wb/yandex_market) for full attr extraction — BUT we don't have a
+        card-fetch path here. Instead, we emit a minimal AttributeValue set using
+        the GateResult metadata (title, visual_score) as evidence, with confidence
+        capped by IMAGE_CARD_CONF_CAP. Full attr extraction from the image-found
+        card is left for a future iteration; this stage proves the integration
+        path end-to-end.
+
+        In practice: finds the best matching card URL by image; the URL is logged
+        as a strong signal for downstream use. Currently returns [] (the gate runs
+        but we don't yet emit fills) — this is intentionally conservative:
+        the gate-validated URL can be used to prime ozon/wb/ym sources in future.
+        The stage is wired and observable in logs now.
+        """
+        if not context.image_urls:
+            return []
+        image_url = context.image_urls[0]
+        try:
+            from app.services.enrichment.sources.wb_card_source import _target_type_lemma
+            target_type = _target_type_lemma(
+                context.product_name or "",
+                context.category_path[-1] if context.category_path else None,
+            )
+        except Exception:
+            target_type = None
+
+        try:
+            result = await _image_find_matching_card(
+                image_url,
+                context.product_name or "",
+                our_brand=context.brand,
+                target_type=target_type,
+            )
+        except Exception as exc:
+            logger.warning("[Pipeline] image_card_stage error: %s", exc, exc_info=True)
+            return []
+
+        if result is None:
+            logger.info("[Pipeline] image_card_stage: no gate-passing candidate for %s",
+                        image_url[:80])
+            return []
+
+        logger.info(
+            "[Pipeline] image_card_stage: gate-passed candidate url=%s conf=%.2f — "
+            "card URL validated; full attr-extraction from image-found card is a future step",
+            result.candidate.url[:80], result.match_confidence,
+        )
+        # Conservative: return [] — we've validated the card exists but don't emit fills yet.
+        # The URL is available in logs; wiring actual attribute extraction from the found URL
+        # (fetch + parse + map) is straightforward once this stage is proven in live testing.
+        return []
 
     async def _run_icecat_stage(
         self,

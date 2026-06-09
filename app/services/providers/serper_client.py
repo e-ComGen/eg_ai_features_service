@@ -21,6 +21,7 @@ from app import config
 logger = logging.getLogger(__name__)
 
 _SERPER_ENDPOINT = "https://google.serper.dev/search"
+_SERPER_LENS_ENDPOINT = "https://google.serper.dev/lens"
 
 # Transport-level retry tuning. Keep the total backoff budget short so it fits
 # inside the external asyncio.wait_for(timeout=...) used by websearch_producer.
@@ -155,6 +156,40 @@ class SerperClient:
             knowledge_graph=data.get("knowledgeGraph"),
             related_searches=related,
         )
+
+    async def lens(
+        self,
+        image_url: str,
+        timeout: int = 20,
+    ) -> list[dict[str, Any]]:
+        """POST to Serper /lens (Google Lens reverse-image search).
+
+        Accepts a public image URL and returns the ``organic`` results list from
+        Serper's response — each item has keys: title, link, source (domain), and
+        optionally imageUrl/thumbnail. Returns [] on any error (fail-closed).
+
+        Does NOT retry (unlike ``search``): Lens is only called when a product
+        image is available and we're already in a fallback path; a single attempt
+        is enough to decide whether the image yields marketplace candidates.
+        """
+        headers = {
+            "X-API-KEY": self._api_key,
+            "Content-Type": "application/json",
+        }
+        payload: dict[str, Any] = {"url": image_url}
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    _SERPER_LENS_ENDPOINT,
+                    json=payload,
+                    headers=headers,
+                )
+                response.raise_for_status()
+                data = response.json()
+        except Exception as exc:
+            logger.warning("Serper /lens error for %s: %s", image_url[:80], exc)
+            return []
+        return data.get("organic", []) or []
 
     async def _request_with_retry(
         self,

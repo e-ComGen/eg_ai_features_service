@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
 
@@ -206,7 +207,50 @@ def _lemmas_compatible(target_type: str, cand_lemmas: set[str]) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# STUB: reverse-image-search вызов (TODO — выбран SerpApi)
+# Marketplace domain → canonical name
+# ---------------------------------------------------------------------------
+
+_MARKETPLACE_DOMAINS: dict[str, str] = {
+    "ozon.ru": "ozon",
+    "wildberries.ru": "wb",
+    "wb.ru": "wb",
+    "market.yandex.ru": "yandex_market",
+}
+
+# Card-id extractors for each marketplace (cheap regex, no network).
+# Ozon: /product/<slug>-<digits>/ or /product/<digits>/
+_OZON_CARD_ID_RE = re.compile(r"/product/(?:[a-z0-9\-]+-)?(\d{5,})", re.IGNORECASE)
+# WB: /catalog/<nm_id>/  or /product/<nm_id>
+_WB_CARD_ID_RE = re.compile(r"(?:/catalog/|/product/)(\d{5,})", re.IGNORECASE)
+# Yandex Market: /product--<slug>/<id> or /product/<id>
+_YM_CARD_ID_RE = re.compile(r"/product(?:--[^/?#]+)?/(\d{4,})", re.IGNORECASE)
+
+_CARD_ID_RES: dict[str, re.Pattern[str]] = {
+    "ozon": _OZON_CARD_ID_RE,
+    "wb": _WB_CARD_ID_RE,
+    "yandex_market": _YM_CARD_ID_RE,
+}
+
+
+def _extract_marketplace(link: str) -> Optional[str]:
+    """Return canonical marketplace name from a URL, or None if not a target domain."""
+    for domain, name in _MARKETPLACE_DOMAINS.items():
+        if domain in link:
+            return name
+    return None
+
+
+def _extract_card_id(link: str, marketplace: str) -> Optional[str]:
+    """Extract a card identifier from a marketplace product URL. Returns None if not found."""
+    pattern = _CARD_ID_RES.get(marketplace)
+    if pattern is None:
+        return None
+    m = pattern.search(link)
+    return m.group(1) if m else None
+
+
+# ---------------------------------------------------------------------------
+# Serper /lens reverse-image-search implementation
 # ---------------------------------------------------------------------------
 
 async def _reverse_image_search(
@@ -214,33 +258,58 @@ async def _reverse_image_search(
     *,
     marketplaces: tuple[str, ...] = ("ozon", "wb", "yandex_market"),
 ) -> list[ImageCandidate]:
-    """⚠️ STUB. Реальный reverse-image-поиск НЕ реализован.
+    """Call Serper /lens (Google Lens) with image_url, return marketplace candidates.
 
-    ВЫБРАННЫЙ API (по research, см. docstring модуля):
-      • SerpApi engine=yandex_images (reverse) — ЛУЧШИЙ для RU-рынка: индекс
-        Яндекса покрывает карточки Ozon/WB/Yandex Market. Принимает image URL
-        (у нас он есть — context.image_urls[0]). Параметр image_url=<url>.
-        Отдаёт shopping_results / similar_images с ссылками на маркетплейсы.
-      • SerpApi engine=google_lens (type=products|visual_matches) — глобальный
-        fallback. Тоже по image URL.
-    Cost: ~$0.005–0.015 за запрос SerpApi. Marketplace-native «поиск по фото»
-    (Ozon/WB app) — внутренний, anti-bot, БЕЗ публичного endpoint → недостижим.
+    Uses the existing SerperClient.lens() method (same key, same httpx pattern).
+    Only links whose domain is ozon.ru / wildberries.ru / market.yandex.ru are kept.
+    visual_score is normalized from rank position: 1.0 - idx * 0.05, clamped to [0.1, 1.0].
 
-    TODO(impl):
-      1. httpx GET https://serpapi.com/search
-         params = {engine, image_url, api_key, ...}
-      2. распарсить shopping_results[]: link, title, source(=marketplace),
-         thumbnail; visual_score ← позиция/score движка (нормализовать в 0..1).
-      3. фильтр link по домену маркетплейса (ozon.ru / wildberries.ru /
-         market.yandex.ru); дедуп по card_id; merge движков в .engines.
-    Пока возвращаем [] — модуль безопасен к подключению (ничего не заполнит).
+    Returns [] on any error (fail-closed — the gate is fail-closed downstream).
     """
-    logger.warning(
-        "[ImageCardSearch] _reverse_image_search — STUB, returns []. "
-        "Wire SerpApi (yandex_images/google_lens) here. image_url=%s mkts=%s",
-        image_url, marketplaces,
+    try:
+        from app.services.providers.factory import get_web_search_client
+        client = get_web_search_client()
+    except Exception as exc:
+        logger.warning("[ImageCardSearch] SerperClient unavailable: %s → []", exc)
+        return []
+
+    try:
+        organic = await client.lens(image_url)
+    except Exception as exc:
+        logger.warning("[ImageCardSearch] /lens error for %s: %s → []", image_url[:80], exc)
+        return []
+
+    if not organic:
+        logger.info("[ImageCardSearch] /lens returned 0 results for %s", image_url[:80])
+        return []
+
+    candidates: list[ImageCandidate] = []
+    step = 0.05  # rank-based visual_score decay
+    for idx, item in enumerate(organic):
+        link = (item.get("link") or "").strip()
+        if not link:
+            continue
+        mp = _extract_marketplace(link)
+        if mp is None or mp not in marketplaces:
+            continue
+        visual_score = max(0.1, 1.0 - idx * step)
+        card_id = _extract_card_id(link, mp)
+        title = (item.get("title") or "").strip()
+        candidates.append(ImageCandidate(
+            url=link,
+            marketplace=mp,
+            title=title,
+            brand=None,  # Serper /lens doesn't expose brand separately
+            card_id=card_id,
+            visual_score=visual_score,
+            engines={"serper_lens"},
+        ))
+
+    logger.info(
+        "[ImageCardSearch] /lens → %d marketplace candidates (of %d total results) for %s",
+        len(candidates), len(organic), image_url[:80],
     )
-    return []
+    return candidates
 
 
 # ---------------------------------------------------------------------------
