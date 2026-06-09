@@ -296,8 +296,9 @@ async def _try_scrappey_fallback(
     """Attempt to bypass a block/unusable result via the Scrappey browser.
 
     Returns a synthetic httpx.Response(200) wrapping the bypassed HTML, or
-    None if Scrappey is disabled, the cap is hit, the host is denylisted, or
-    Scrappey itself fails / returns a block page.
+    None if Scrappey is disabled, the cap is hit, the host is denylisted,
+    the domain is in the dead-domain store, or Scrappey itself fails /
+    returns a block page.
 
     The ``reason`` string is logged for observability (e.g. "HTTP 403",
     "short body (120 chars)", "block marker in 200").
@@ -307,6 +308,32 @@ async def _try_scrappey_fallback(
     if not _eligible_for_scrappey(url):
         return None
 
+    # Dead-domain check: skip paid Scrappey call if this domain is known dead.
+    host = _extract_host(url)
+    try:
+        from app.services.providers.domain_health import (
+            should_skip_scrappey,
+            record_scrappey_outcome,
+        )
+        if should_skip_scrappey(host):
+            import time as _time
+            from app.services.providers import domain_health as _dh
+            _dh._load_store()
+            from app.services.providers.domain_health import _registrable_domain, _store
+            domain = _registrable_domain(host)
+            rec = _store.get(domain)
+            dead_until_ts = rec.dead_until if rec else None
+            logger.info(
+                "skip Scrappey: %s marked dead until %s",
+                host,
+                dead_until_ts,
+            )
+            return None
+    except Exception as _dh_exc:
+        logger.debug("domain_health check failed for %r: %s", host, _dh_exc)
+        # degrade gracefully — proceed with Scrappey normally
+        record_scrappey_outcome = None  # type: ignore[assignment]
+
     logger.info(
         "Scrappey fallback triggered for %r — reason: %s (call #%d)",
         url, reason, _scrappey_call_count + 1,
@@ -314,11 +341,34 @@ async def _try_scrappey_fallback(
 
     _scrappey_call_count += 1
 
+    html: Optional[str] = None
+    scrappey_exception: Optional[Exception] = None
     try:
         from app.services.providers.scrappey_client import scrappey_fetch
         html = await scrappey_fetch(url, timeout=max(timeout, 120))
     except Exception as exc:
         logger.warning("Scrappey fallback error for %r: %s", url, exc)
+        scrappey_exception = exc
+
+    # Classify outcome and record into domain-health store.
+    try:
+        from app.services.providers.domain_health import record_scrappey_outcome as _record
+        if scrappey_exception is not None:
+            # Network/SSL/timeout from scrappey_fetch itself → TRANSIENT
+            _record(host, url, "TRANSIENT")
+        elif not html:
+            # Scrappey returned None (upstream non-200, DataDome, empty) → BLOCKED
+            _record(host, url, "BLOCKED")
+        elif _looks_like_block(html):
+            # Scrappey returned a captcha shell → BLOCKED
+            _record(host, url, "BLOCKED")
+        else:
+            # Content looks real → USABLE
+            _record(host, url, "USABLE")
+    except Exception as _rec_exc:
+        logger.debug("domain_health record failed for %r: %s", host, _rec_exc)
+
+    if scrappey_exception is not None:
         return None
 
     if not html:
