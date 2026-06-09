@@ -297,7 +297,7 @@ async def test_scrappey_not_before_transient_retries_exhausted(scrappey_env):
     """On 429/503 Scrappey must NOT fire until all retry attempts are spent."""
     call_log = []
 
-    async def _fake_scrappey(url, timeout=120):
+    async def _fake_scrappey(url, timeout=120, browser=False):
         call_log.append("scrappey")
         return "Full product text. " * 60
 
@@ -406,7 +406,7 @@ async def test_at_most_one_scrappey_call_per_url(scrappey_env):
     """Scrappey must be called at most ONCE per URL (no retry on Scrappey)."""
     call_count = {"n": 0}
 
-    async def _fake_scrappey(url, timeout=120):
+    async def _fake_scrappey(url, timeout=120, browser=False):
         call_count["n"] += 1
         return None  # force failure each time
 
@@ -419,3 +419,58 @@ async def test_at_most_one_scrappey_call_per_url(scrappey_env):
 
     assert call_count["n"] == 1
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Browser mode: fallback always uses browser=True
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fallback_uses_browser_mode(scrappey_env):
+    """_try_scrappey_fallback must call scrappey_fetch with browser=True."""
+    received_kwargs: dict = {}
+
+    async def _capture_scrappey(url, timeout=40.0, browser=False):
+        received_kwargs["browser"] = browser
+        received_kwargs["timeout"] = timeout
+        return "X" * 1000
+
+    with patch("app.services.url_fetcher.httpx.AsyncClient") as mock_cls, \
+         patch("app.services.providers.scrappey_client.scrappey_fetch",
+               new=AsyncMock(side_effect=_capture_scrappey)):
+
+        mock_cls.return_value = _make_async_client([_make_resp(403)])
+        result = await uf.fetch_url_content("https://dns-shop.ru/product/browser-test/")
+
+    assert received_kwargs.get("browser") is True, (
+        "fallback must forward browser=True to scrappey_fetch"
+    )
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_fallback_uses_browser_timeout_cap(monkeypatch, tmp_path):
+    """Fallback must use URL_FETCHER_SCRAPPEY_BROWSER_TIMEOUT, not the bare cap."""
+    monkeypatch.setenv("URL_FETCHER_SCRAPPEY_FALLBACK", "1")
+    monkeypatch.setenv("URL_FETCHER_SCRAPPEY_MAX", "200")
+    monkeypatch.setenv("URL_FETCHER_SCRAPPEY_BROWSER_TIMEOUT", "55")
+    monkeypatch.setattr(uf, "_CACHE_DIR", str(tmp_path))
+    uf._scrappey_call_count = 0
+
+    received_kwargs: dict = {}
+
+    async def _capture_scrappey(url, timeout=40.0, browser=False):
+        received_kwargs["timeout"] = timeout
+        return "X" * 1000
+
+    with patch("app.services.url_fetcher.httpx.AsyncClient") as mock_cls, \
+         patch("app.services.providers.scrappey_client.scrappey_fetch",
+               new=AsyncMock(side_effect=_capture_scrappey)), \
+         patch("app.services.url_fetcher.asyncio.sleep", new=AsyncMock()):
+
+        mock_cls.return_value = _make_async_client([_make_resp(403)])
+        await uf.fetch_url_content("https://sportmaster.ru/product/timeout-test/")
+
+    assert received_kwargs.get("timeout") == 55.0, (
+        f"Expected browser timeout cap 55.0, got {received_kwargs.get('timeout')}"
+    )

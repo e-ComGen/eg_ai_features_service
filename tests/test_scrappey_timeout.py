@@ -26,6 +26,7 @@ import pytest
 import app.services.url_fetcher as uf
 from app.services.url_fetcher import (
     _scrappey_timeout_cap,
+    _scrappey_browser_timeout_cap,
     fetch_all_results,
     FetchResult,
 )
@@ -44,8 +45,14 @@ def reset_scrappey_counter():
 
 @pytest.fixture()
 def fast_cap(monkeypatch):
-    """Set a very short Scrappey cap (0.15s) for speed in tests."""
+    """Set a very short Scrappey cap (0.15s) for speed in tests.
+
+    Sets both URL_FETCHER_SCRAPPEY_TIMEOUT (bare mode) and
+    URL_FETCHER_SCRAPPEY_BROWSER_TIMEOUT (browser mode, now used by fallback)
+    to the same short value so tests run quickly.
+    """
     monkeypatch.setenv("URL_FETCHER_SCRAPPEY_TIMEOUT", "0.15")
+    monkeypatch.setenv("URL_FETCHER_SCRAPPEY_BROWSER_TIMEOUT", "0.15")
     monkeypatch.setenv("URL_FETCHER_SCRAPPEY_FALLBACK", "1")
     monkeypatch.setenv("URL_FETCHER_SCRAPPEY_MAX", "200")
 
@@ -90,10 +97,11 @@ async def test_hanging_scrappey_returns_none_within_cap(
       - domain_health records TRANSIENT, NOT BLOCKED (timeout ≠ confirmed dead)
     """
     monkeypatch.setattr(uf, "_CACHE_DIR", str(tmp_path / "cache"))
-    cap = _scrappey_timeout_cap()
+    # Fallback now uses _scrappey_browser_timeout_cap (set to 0.15s by fast_cap fixture)
+    cap = _scrappey_browser_timeout_cap()
     slack = 0.5  # generous scheduling slack
 
-    async def _slow_scrappey(url, timeout=25.0):
+    async def _slow_scrappey(url, timeout=25.0, browser=False):
         await asyncio.sleep(10.0)   # much longer than cap
         return "X" * 1000
 
@@ -138,7 +146,7 @@ async def test_fast_scrappey_success_returns_content(
 
     good_html = "Product description. " * 60  # > 500 chars, no block markers
 
-    async def _fast_scrappey(url, timeout=25.0):
+    async def _fast_scrappey(url, timeout=25.0, browser=False):
         return good_html
 
     with patch(
@@ -229,6 +237,21 @@ def test_scrappey_timeout_cap_invalid_env_falls_back(monkeypatch):
     assert _scrappey_timeout_cap() == 25.0
 
 
+def test_scrappey_browser_timeout_cap_reads_env(monkeypatch):
+    monkeypatch.setenv("URL_FETCHER_SCRAPPEY_BROWSER_TIMEOUT", "55")
+    assert _scrappey_browser_timeout_cap() == 55.0
+
+
+def test_scrappey_browser_timeout_cap_defaults_to_40(monkeypatch):
+    monkeypatch.delenv("URL_FETCHER_SCRAPPEY_BROWSER_TIMEOUT", raising=False)
+    assert _scrappey_browser_timeout_cap() == 40.0
+
+
+def test_scrappey_browser_timeout_cap_invalid_env_falls_back(monkeypatch):
+    monkeypatch.setenv("URL_FETCHER_SCRAPPEY_BROWSER_TIMEOUT", "bad-value")
+    assert _scrappey_browser_timeout_cap() == 40.0
+
+
 # ---------------------------------------------------------------------------
 # 5. Timeout is TRANSIENT — does NOT count as a death strike (5 timeouts ≠ dead)
 # ---------------------------------------------------------------------------
@@ -241,7 +264,7 @@ async def test_timeout_is_transient_not_death_strike(
     monkeypatch.setattr(uf, "_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("DEAD_DOMAIN_STRIKES", "3")
 
-    async def _slow_scrappey(url, timeout=25.0):
+    async def _slow_scrappey(url, timeout=25.0, browser=False):
         await asyncio.sleep(10.0)
         return None
 

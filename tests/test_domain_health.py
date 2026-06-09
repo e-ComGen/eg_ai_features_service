@@ -277,7 +277,7 @@ async def test_fetcher_skips_scrappey_on_dead_domain(tmp_path, monkeypatch):
 
     scrappey_called = {"n": 0}
 
-    async def _fake_scrappey(url, timeout=120):
+    async def _fake_scrappey(url, timeout=120, browser=False):
         scrappey_called["n"] += 1
         return "X" * 1000
 
@@ -314,7 +314,7 @@ async def test_fetcher_calls_scrappey_on_healthy_domain(tmp_path, monkeypatch):
 
     scrappey_called = {"n": 0}
 
-    async def _fake_scrappey(url, timeout=120):
+    async def _fake_scrappey(url, timeout=120, browser=False):
         scrappey_called["n"] += 1
         return "Good product content. " * 50
 

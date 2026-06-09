@@ -4,13 +4,13 @@ tests/test_scrappey_client.py
 Unit tests for app/services/providers/scrappey_client.scrappey_fetch.
 All HTTP calls are mocked — no live network traffic.
 
-Key regression covered:
-  Scrappey returns solution.statusCode = None (not 200) for many Russian
-  retail sites (lamoda.ru, dns-shop.ru, sportmaster.ru) even when it
-  successfully fetched real HTML.  The old guard `upstream_status != 200`
-  silently dropped real content because None != 200 is True.
-  After the fix, None is treated as "status unknown / likely OK" and
-  accepted so long as content is non-empty and not a DataDome block.
+Key regressions / features covered:
+  1. statusCode=None + real HTML → accepted (statusCode omitted by Scrappey
+     for many Russian retail sites even when content is valid).
+  2. browser=True → payload contains "requestType":"browser".
+  3. Relaxed status-code guard: non-200 upstream code is accepted when the body
+     is real content (not a block page).  We only reject empty or block bodies.
+  4. Block / DataDome content → rejected regardless of statusCode.
 """
 
 import json
@@ -61,7 +61,7 @@ def _patch_httpx(mock_resp: MagicMock):
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Bare mode — basic pass / fail
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -102,35 +102,120 @@ async def test_returns_html_when_upstream_status_none(monkeypatch):
     assert len(result) > 100
 
 
+# ---------------------------------------------------------------------------
+# Relaxed status-code guard: accept non-200 if body is real (not block)
+# ---------------------------------------------------------------------------
+
 @pytest.mark.asyncio
-async def test_rejects_explicit_upstream_407(monkeypatch):
-    """Explicit upstream 407 (proxy auth required) must still be rejected."""
+async def test_accepts_non200_status_when_body_is_real_content(monkeypatch):
+    """
+    Relaxed guard: upstream 407 with real HTML body → content is returned.
+    The old strict guard rejected ANY non-200; the new guard only rejects
+    when the body itself looks like a block page.
+    """
     monkeypatch.setenv("SCRAPPEY_KEY", "testkey")
-    mock_resp = _make_scrappey_response(upstream_status=407, body_html="proxy error body")
+    real_html = "<html><body>Характеристики товара: цвет синий, размер 42</body></html>"
+    mock_resp = _make_scrappey_response(upstream_status=407, body_html=real_html)
 
     with _patch_httpx(mock_resp):
         import importlib
         import app.services.providers.scrappey_client as mod
         importlib.reload(mod)
-        result = await mod.scrappey_fetch("https://www.sportmaster.ru")
+        result = await mod.scrappey_fetch("https://www.dns-shop.ru")
 
-    assert result is None
+    assert result is not None, (
+        "Non-200 upstream with real HTML body should be accepted under the relaxed guard"
+    )
+    assert "Характеристики" in result
 
 
 @pytest.mark.asyncio
-async def test_rejects_explicit_upstream_301(monkeypatch):
-    """Explicit upstream 301 (redirect) must still be rejected."""
+async def test_rejects_non200_status_when_body_is_block_page(monkeypatch):
+    """Non-200 + block body → still rejected (block content wins)."""
     monkeypatch.setenv("SCRAPPEY_KEY", "testkey")
-    mock_resp = _make_scrappey_response(upstream_status=301, body_html="<html>redirect</html>")
+    block_html = "<html><body>Just a moment... cloudflare checking your browser</body></html>"
+    mock_resp = _make_scrappey_response(upstream_status=407, body_html=block_html)
 
     with _patch_httpx(mock_resp):
         import importlib
         import app.services.providers.scrappey_client as mod
         importlib.reload(mod)
-        result = await mod.scrappey_fetch("https://market.yandex.ru")
+        result = await mod.scrappey_fetch("https://www.citilink.ru")
 
     assert result is None
 
+
+# ---------------------------------------------------------------------------
+# Browser mode — requestType injection
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_browser_mode_injects_request_type(monkeypatch):
+    """browser=True must add 'requestType':'browser' to the Scrappey payload."""
+    monkeypatch.setenv("SCRAPPEY_KEY", "testkey")
+    real_html = "<html><body>DNS-Shop product Характеристики ₽</body></html>"
+    mock_resp = _make_scrappey_response(upstream_status=None, body_html=real_html)
+
+    with _patch_httpx(mock_resp) as mock_client:
+        import importlib
+        import app.services.providers.scrappey_client as mod
+        importlib.reload(mod)
+        result = await mod.scrappey_fetch("https://www.dns-shop.ru", browser=True)
+
+    assert result is not None
+    # Verify the payload sent to Scrappey contained requestType=browser
+    call_args = mock_client.post.call_args
+    sent_payload = call_args.kwargs.get("json") or call_args.args[1] if call_args.args else {}
+    if not sent_payload and call_args.kwargs:
+        sent_payload = call_args.kwargs.get("json", {})
+    assert sent_payload.get("requestType") == "browser", (
+        f"Expected requestType='browser' in payload, got: {sent_payload}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bare_mode_does_not_inject_request_type(monkeypatch):
+    """browser=False (default) must NOT add requestType to the payload."""
+    monkeypatch.setenv("SCRAPPEY_KEY", "testkey")
+    mock_resp = _make_scrappey_response(upstream_status=200, body_html="<html>ok</html>")
+
+    with _patch_httpx(mock_resp) as mock_client:
+        import importlib
+        import app.services.providers.scrappey_client as mod
+        importlib.reload(mod)
+        result = await mod.scrappey_fetch("https://example.com", browser=False)
+
+    call_args = mock_client.post.call_args
+    sent_payload = call_args.kwargs.get("json") or {}
+    assert "requestType" not in sent_payload, (
+        f"bare mode must not include requestType, got: {sent_payload}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_browser_mode_accepts_real_html_with_none_status(monkeypatch):
+    """browser=True + statusCode=None + real HTML → returned (Qrator success scenario)."""
+    monkeypatch.setenv("SCRAPPEY_KEY", "testkey")
+    real_html = (
+        "<html><body>Смартфон Samsung Galaxy S24 "
+        "Характеристики: RAM 8 ГБ, ROM 256 ГБ, цена 89990 ₽"
+        "</body></html>"
+    )
+    mock_resp = _make_scrappey_response(upstream_status=None, body_html=real_html)
+
+    with _patch_httpx(mock_resp):
+        import importlib
+        import app.services.providers.scrappey_client as mod
+        importlib.reload(mod)
+        result = await mod.scrappey_fetch("https://www.dns-shop.ru/product/abc/", browser=True)
+
+    assert result is not None
+    assert "Характеристики" in result
+
+
+# ---------------------------------------------------------------------------
+# Common failure paths (both modes)
+# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_returns_none_without_key(monkeypatch):
@@ -174,6 +259,22 @@ async def test_datadome_block_returns_none(monkeypatch):
         import app.services.providers.scrappey_client as mod
         importlib.reload(mod)
         result = await mod.scrappey_fetch("https://www.dns-shop.ru")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_block_returns_none(monkeypatch):
+    """Generic Cloudflare block page → None regardless of mode."""
+    monkeypatch.setenv("SCRAPPEY_KEY", "testkey")
+    cf_html = "<html><head><title>Just a moment...</title></head><body>cloudflare</body></html>"
+    mock_resp = _make_scrappey_response(upstream_status=200, body_html=cf_html)
+
+    with _patch_httpx(mock_resp):
+        import importlib
+        import app.services.providers.scrappey_client as mod
+        importlib.reload(mod)
+        result = await mod.scrappey_fetch("https://www.citilink.ru", browser=True)
 
     assert result is None
 

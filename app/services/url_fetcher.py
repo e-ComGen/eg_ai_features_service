@@ -153,11 +153,28 @@ def _scrappey_timeout_cap() -> float:
     Rationale: the 4 known wall domains (lamoda/sportmaster/dns-shop/citilink)
     NEVER succeed even with residential proxies, so killing them at 25s is pure
     win; soft sites that Scrappey CAN beat usually respond well under 25s.
+
+    Note: for browser mode use _scrappey_browser_timeout_cap() instead — JS
+    rendering legitimately needs more time.
     """
     try:
         return float(os.environ.get("URL_FETCHER_SCRAPPEY_TIMEOUT", "25"))
     except ValueError:
         return 25.0
+
+
+def _scrappey_browser_timeout_cap() -> float:
+    """Hard timeout cap (seconds) for a Scrappey browser-mode fallback call.
+
+    Configured via URL_FETCHER_SCRAPPEY_BROWSER_TIMEOUT (default 40s).
+    Browser mode spins up a full Chromium instance and executes JS (including
+    Qrator/Cloudflare JS challenges), which takes 15–35 s on typical retail
+    pages.  40 s gives a comfortable margin while still bounding runaway calls.
+    """
+    try:
+        return float(os.environ.get("URL_FETCHER_SCRAPPEY_BROWSER_TIMEOUT", "40"))
+    except ValueError:
+        return 40.0
 
 
 def _scrappey_fast_domains() -> set:
@@ -355,11 +372,16 @@ async def _try_scrappey_fallback(
 
     _scrappey_call_count += 1
 
-    # Hard timeout cap: never let a single Scrappey call block more than
-    # URL_FETCHER_SCRAPPEY_TIMEOUT seconds (default 25s).  asyncio.wait_for
-    # enforces the cap even if the underlying httpx client ignores its own
-    # timeout (e.g. stalled TLS handshake on a wall domain).
-    cap = _scrappey_timeout_cap()
+    # Always use browser mode in the fallback: the fallback only fires after
+    # plain httpx already failed (anti-bot block / bad content), so bare
+    # Scrappey is pointless.  Browser mode (full Chromium + JS rendering) beats
+    # Qrator WAF and Cloudflare JS challenges that the bare mode cannot handle.
+    #
+    # Hard timeout cap: use the browser-mode cap (URL_FETCHER_SCRAPPEY_BROWSER_TIMEOUT,
+    # default 40s) because JS rendering legitimately needs more time than bare
+    # mode.  asyncio.wait_for enforces the cap even if the underlying httpx
+    # client stalls (e.g. stalled TLS handshake on a wall domain).
+    cap = _scrappey_browser_timeout_cap()
 
     html: Optional[str] = None
     scrappey_exception: Optional[Exception] = None
@@ -367,12 +389,12 @@ async def _try_scrappey_fallback(
     try:
         from app.services.providers.scrappey_client import scrappey_fetch
         html = await asyncio.wait_for(
-            scrappey_fetch(url, timeout=cap),
+            scrappey_fetch(url, timeout=cap, browser=True),
             timeout=cap,
         )
     except asyncio.TimeoutError:
         logger.warning(
-            "Scrappey fallback TIMED OUT after %.0fs for %r — recording TRANSIENT",
+            "Scrappey browser fallback TIMED OUT after %.0fs for %r — recording TRANSIENT",
             cap, url,
         )
         timed_out = True

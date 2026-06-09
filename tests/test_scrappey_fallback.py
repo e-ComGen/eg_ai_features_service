@@ -45,7 +45,7 @@ async def test_flag_off_403_no_scrappey(monkeypatch, banned_url):
 
     called = {"n": 0}
 
-    async def _spy(url, timeout=120.0):
+    async def _spy(url, timeout=120.0, browser=False):
         called["n"] += 1
         return "<html>should not be used</html>"
 
@@ -67,7 +67,7 @@ async def test_flag_on_domain_in_set_403_uses_scrappey(monkeypatch, banned_url):
 
     called = {"n": 0}
 
-    async def _spy(url, timeout=120.0):
+    async def _spy(url, timeout=120.0, browser=False):
         called["n"] += 1
         return "<html>bypassed content</html>"
 
@@ -98,7 +98,7 @@ async def test_flag_on_domain_not_in_fast_set_403_still_uses_scrappey(monkeypatc
 
     called = {"n": 0}
 
-    async def _spy(url, timeout=120.0):
+    async def _spy(url, timeout=120.0, browser=False):
         called["n"] += 1
         return "<html>real product content here with lots of text " + "x" * 600 + "</html>"
 
@@ -122,7 +122,7 @@ async def test_flag_on_404_no_scrappey(monkeypatch, banned_url):
 
     called = {"n": 0}
 
-    async def _spy(url, timeout=120.0):
+    async def _spy(url, timeout=120.0, browser=False):
         called["n"] += 1
         return "<html>nope</html>"
 
