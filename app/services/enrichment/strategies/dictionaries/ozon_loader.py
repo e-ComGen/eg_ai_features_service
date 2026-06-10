@@ -54,6 +54,15 @@ def _get_matcher():
     return _matcher_instance
 
 
+def get_matcher():
+    """Public accessor for the module-level MatcherService singleton.
+
+    Returns the same instance used by resolve_value_id so no second model is loaded.
+    Returns None when sentence-transformers is unavailable.
+    """
+    return _get_matcher()
+
+
 @lru_cache(maxsize=1)
 def load_ozon_dictionary() -> dict:
     """Load the Ozon dictionary from .json.gz (preferred) or plain .json. Cached."""
@@ -167,6 +176,134 @@ _TECH_ALIASES = [
     ("otp", "защита от перегрева"),
 ]
 
+# General EN→RU value-translation table.
+#
+# IceCat requests lang=ru but returns many values in English ("Black", "Yes",
+# "Aluminium", …).  WRatio ≥ 85 cannot bridge these because there is no
+# character overlap between Latin and Cyrillic forms.  This dict translates
+# whole-token exact matches BEFORE the fuzzy resolver runs, so common IceCat
+# values find their Ozon enum counterparts.
+#
+# Scope: generic across ALL categories — colors, materials, boolean, form-factor
+# terms that appear in Ozon enums in their Russian form.
+# NOT included: brand-neutral technical acronyms that stay Latin in RU enums
+# (Bluetooth, USB, Wi-Fi, HDMI, IP, etc.).
+# Conservatism: whole-token exact match only — no partial/fuzzy translation.
+#
+# Keys are lower-cased; lookup is case-insensitive (caller lower-cases input).
+_EN_TO_RU_VALUES: dict[str, str] = {
+    # ---- Boolean ----
+    "yes": "да",
+    "no": "нет",
+    "true": "да",
+    "false": "нет",
+    # ---- Colors ----
+    "black": "чёрный",
+    "white": "белый",
+    "silver": "серебристый",
+    "grey": "серый",
+    "gray": "серый",
+    "blue": "синий",
+    "red": "красный",
+    "green": "зелёный",
+    "yellow": "жёлтый",
+    "orange": "оранжевый",
+    "purple": "фиолетовый",
+    "violet": "фиолетовый",
+    "pink": "розовый",
+    "rose": "розовый",
+    "gold": "золотой",
+    "golden": "золотой",
+    "bronze": "бронзовый",
+    "brown": "коричневый",
+    "beige": "бежевый",
+    "ivory": "слоновая кость",
+    "cream": "кремовый",
+    "turquoise": "бирюзовый",
+    "cyan": "голубой",
+    "light blue": "голубой",
+    "navy": "тёмно-синий",
+    "navy blue": "тёмно-синий",
+    "dark blue": "тёмно-синий",
+    "dark green": "тёмно-зелёный",
+    "dark grey": "тёмно-серый",
+    "dark gray": "тёмно-серый",
+    "light grey": "светло-серый",
+    "light gray": "светло-серый",
+    "space grey": "серый космос",
+    "space gray": "серый космос",
+    "rose gold": "розовое золото",
+    "champagne": "шампань",
+    "transparent": "прозрачный",
+    "clear": "прозрачный",
+    "multicolor": "многоцветный",
+    "multi-color": "многоцветный",
+    "multicolour": "многоцветный",
+    "multi-colour": "многоцветный",
+    # ---- Materials ----
+    "aluminium": "алюминий",
+    "aluminum": "алюминий",
+    "plastic": "пластик",
+    "steel": "сталь",
+    "stainless steel": "нержавеющая сталь",
+    "glass": "стекло",
+    "tempered glass": "закалённое стекло",
+    "metal": "металл",
+    "leather": "кожа",
+    "genuine leather": "натуральная кожа",
+    "synthetic leather": "искусственная кожа",
+    "fabric": "ткань",
+    "textile": "текстиль",
+    "rubber": "резина",
+    "silicone": "силикон",
+    "nylon": "нейлон",
+    "polyester": "полиэстер",
+    "polycarbonate": "поликарбонат",
+    "carbon": "углепластик",
+    "carbon fiber": "углеродное волокно",
+    "carbon fibre": "углеродное волокно",
+    "wood": "дерево",
+    "bamboo": "бамбук",
+    "ceramic": "керамика",
+    "titanium": "титан",
+    "copper": "медь",
+    "brass": "латунь",
+    "zinc alloy": "цинковый сплав",
+    "magnesium alloy": "магниевый сплав",
+    # ---- Common form-factor / feature terms ----
+    "matte": "матовый",
+    "glossy": "глянцевый",
+    "gloss": "глянцевый",
+    "frosted": "матовый",
+    "textured": "текстурированный",
+    "portable": "портативный",
+    "wireless": "беспроводной",
+    "wired": "проводной",
+    "built-in": "встроенный",
+    "external": "внешний",
+    "internal": "внутренний",
+    "rechargeable": "перезаряжаемый",
+    "foldable": "складной",
+    "adjustable": "регулируемый",
+    "detachable": "съёмный",
+    "removable": "съёмный",
+    "waterproof": "водонепроницаемый",
+    "water resistant": "водостойкий",
+    "dustproof": "пылезащищённый",
+    "shockproof": "ударопрочный",
+}
+
+
+def _translate_en_to_ru(s: str) -> str:
+    """Translate whole-token EN value to RU if found in _EN_TO_RU_VALUES.
+
+    Conservatism: exact whole-token match only (after lowercasing).
+    If the token is not in the dict the input is returned unchanged.
+    This is intentionally NOT fuzzy — fuzzy translation would introduce mud.
+    """
+    key = s.strip().lower()
+    return _EN_TO_RU_VALUES.get(key, s)
+
 
 def _unwrap_array_repr(value: str) -> list[str]:
     """If value looks like a list repr e.g. "['a', 'b']", return ['a', 'b'].
@@ -193,13 +330,18 @@ def _strip_parens(value: str) -> str:
 def _normalize_token(s: str) -> str:
     """Strong normalization. Order matters:
     1. lower
-    2. tech aliases (Latin patterns → Cyrillic, e.g. fully-modular → полностью модульный)
-    3. Latin homoglyph → Cyrillic (catches stray Latin lookalikes after aliases)
-    4. ё → е
-    5. Collapse spaces/dashes, strip punct.
+    2. EN→RU value translation (whole-token exact, e.g. "Black" → "чёрный")
+    3. tech aliases (Latin patterns → Cyrillic, e.g. fully-modular → полностью модульный)
+    4. Latin homoglyph → Cyrillic (catches stray Latin lookalikes after aliases)
+    5. ё → е
+    6. Collapse spaces/dashes, strip punct.
     """
     import re
     s = s.lower()
+    # Step 2: EN→RU whole-token translation (no-op if token not in dict)
+    translated = _EN_TO_RU_VALUES.get(s.strip())
+    if translated is not None:
+        s = translated.lower()
     for src, dst in _TECH_ALIASES:
         s = re.sub(src, dst, s)
     s = s.translate(_LATIN_TO_CYRILLIC_HOMOGLYPHS)

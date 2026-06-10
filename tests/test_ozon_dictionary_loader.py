@@ -514,3 +514,228 @@ class TestResolveValueIdMatcherFallback:
             result = resolve_value_id(500, 100, 4180, "чёрного цвета")
         assert result == 1001, f"Expected 1001 (черный), got {result}"
         mock_matcher.find_best_match.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Tests: EN→RU value-translation table (_EN_TO_RU_VALUES / _translate_en_to_ru)
+# ---------------------------------------------------------------------------
+
+# Dictionary fixture for EN→RU translation tests.
+# Enum values are in Russian (as Ozon returns them); inputs will be English
+# (as IceCat delivers them even when lang=ru is requested).
+_DICT_EN_RU = {
+    "schema_version": 2,
+    "source": "ozon_seller_api",
+    "categories": {
+        "600:200": {
+            "description_category_id": 600,
+            "type_id": 200,
+            "name": "EN→RU тест",
+            "path": ["Тест"],
+            "characteristics": [
+                {
+                    "id": 9001,
+                    "name": "Цвет",
+                    "type": "Option",
+                    "is_required": False,
+                    "is_collection": False,
+                    "description": "Цвет товара",
+                    "values": [
+                        {"id": 2001, "value": "Чёрный"},
+                        {"id": 2002, "value": "Белый"},
+                        {"id": 2003, "value": "Серебристый"},
+                        {"id": 2004, "value": "Серый"},
+                        {"id": 2005, "value": "Синий"},
+                    ],
+                },
+                {
+                    "id": 9002,
+                    "name": "Материал",
+                    "type": "Option",
+                    "is_required": False,
+                    "is_collection": False,
+                    "description": "Материал корпуса",
+                    "values": [
+                        {"id": 3001, "value": "Алюминий"},
+                        {"id": 3002, "value": "Пластик"},
+                        {"id": 3003, "value": "Сталь"},
+                        {"id": 3004, "value": "Металл"},
+                    ],
+                },
+                {
+                    "id": 9003,
+                    "name": "NFC",
+                    "type": "Option",
+                    "is_required": False,
+                    "is_collection": False,
+                    "description": "Наличие NFC",
+                    "values": [
+                        {"id": 4001, "value": "Да"},
+                        {"id": 4002, "value": "Нет"},
+                    ],
+                },
+                {
+                    "id": 9004,
+                    "name": "Тип подключения",
+                    "type": "Option",
+                    "is_required": False,
+                    "is_collection": False,
+                    "description": "Способ подключения",
+                    "values": [
+                        {"id": 5001, "value": "Bluetooth"},
+                        {"id": 5002, "value": "USB"},
+                        {"id": 5003, "value": "Wi-Fi"},
+                    ],
+                },
+            ],
+        }
+    },
+}
+
+
+class TestEnToRuValueTranslation:
+    """Tests the EN→RU general value-translation table wired into _normalize_token.
+
+    All tests use a mock dictionary with Russian enum values (as Ozon returns
+    them) and English input values (as IceCat sends them even with lang=ru).
+    No real file I/O, no network calls.
+    """
+
+    def setup_method(self):
+        _reset_cache()
+        import app.services.enrichment.strategies.dictionaries.ozon_loader as mod
+        mod._matcher_instance = None
+        mod._matcher_attempted = True  # disable semantic matcher for unit tests
+
+    def _resolve(self, tmp_path, attr_id: int, value: str):
+        import json as _json
+        (tmp_path / "ozon_dictionary.json").write_text(
+            _json.dumps(_DICT_EN_RU), encoding="utf-8"
+        )
+        with patch(
+            "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+            tmp_path,
+        ):
+            _reset_cache()
+            import app.services.enrichment.strategies.dictionaries.ozon_loader as mod
+            mod._matcher_instance = None
+            mod._matcher_attempted = True
+            from app.services.enrichment.strategies.dictionaries.ozon_loader import resolve_value_id
+            return resolve_value_id(600, 200, attr_id, value)
+
+    # ---- Color tests ----
+
+    def test_black_resolves_to_chyorny(self, tmp_path):
+        """'Black' (IceCat EN) → Чёрный enum value_id 2001."""
+        result = self._resolve(tmp_path, 9001, "Black")
+        assert result == 2001, f"Expected 2001 (Чёрный), got {result}"
+
+    def test_black_lowercase_resolves(self, tmp_path):
+        """'black' (already lowercase) → Чёрный enum value_id 2001."""
+        result = self._resolve(tmp_path, 9001, "black")
+        assert result == 2001
+
+    def test_white_resolves_to_bely(self, tmp_path):
+        """'White' → Белый enum value_id 2002."""
+        result = self._resolve(tmp_path, 9001, "White")
+        assert result == 2002
+
+    def test_silver_resolves(self, tmp_path):
+        """'Silver' → Серебристый enum value_id 2003."""
+        result = self._resolve(tmp_path, 9001, "Silver")
+        assert result == 2003
+
+    def test_grey_and_gray_resolve(self, tmp_path):
+        """Both 'Grey' and 'Gray' → Серый enum value_id 2004."""
+        assert self._resolve(tmp_path, 9001, "Grey") == 2004
+        assert self._resolve(tmp_path, 9001, "Gray") == 2004
+
+    def test_blue_resolves(self, tmp_path):
+        """'Blue' → Синий enum value_id 2005."""
+        result = self._resolve(tmp_path, 9001, "Blue")
+        assert result == 2005
+
+    # ---- Material tests ----
+
+    def test_aluminium_resolves(self, tmp_path):
+        """'Aluminium' (IceCat British) → Алюминий enum value_id 3001."""
+        result = self._resolve(tmp_path, 9002, "Aluminium")
+        assert result == 3001
+
+    def test_aluminum_resolves(self, tmp_path):
+        """'Aluminum' (US spelling) → Алюминий enum value_id 3001."""
+        result = self._resolve(tmp_path, 9002, "Aluminum")
+        assert result == 3001
+
+    def test_plastic_resolves(self, tmp_path):
+        """'Plastic' → Пластик enum value_id 3002."""
+        result = self._resolve(tmp_path, 9002, "Plastic")
+        assert result == 3002
+
+    def test_steel_resolves(self, tmp_path):
+        """'Steel' → Сталь enum value_id 3003."""
+        result = self._resolve(tmp_path, 9002, "Steel")
+        assert result == 3003
+
+    def test_metal_resolves(self, tmp_path):
+        """'Metal' → Металл enum value_id 3004."""
+        result = self._resolve(tmp_path, 9002, "Metal")
+        assert result == 3004
+
+    # ---- Boolean tests ----
+
+    def test_yes_resolves_to_da(self, tmp_path):
+        """'Yes' → Да enum value_id 4001."""
+        result = self._resolve(tmp_path, 9003, "Yes")
+        assert result == 4001
+
+    def test_no_resolves_to_net(self, tmp_path):
+        """'No' → Нет enum value_id 4002."""
+        result = self._resolve(tmp_path, 9003, "No")
+        assert result == 4002
+
+    def test_yes_mixed_case_resolves(self, tmp_path):
+        """'YES' (all caps) → Да via case-insensitive lookup."""
+        result = self._resolve(tmp_path, 9003, "YES")
+        assert result == 4001
+
+    # ---- Terms that stay Latin in RU enums (no translation) ----
+
+    def test_bluetooth_stays_latin(self, tmp_path):
+        """'Bluetooth' is NOT translated — it stays Latin in RU enums; resolves via exact match."""
+        result = self._resolve(tmp_path, 9004, "Bluetooth")
+        assert result == 5001
+
+    def test_usb_stays_latin(self, tmp_path):
+        """'USB' is NOT translated — resolves via exact case-insensitive match."""
+        result = self._resolve(tmp_path, 9004, "USB")
+        assert result == 5002
+
+    def test_wifi_stays_latin(self, tmp_path):
+        """'Wi-Fi' is NOT translated — resolves via normalization (dash collapse)."""
+        result = self._resolve(tmp_path, 9004, "Wi-Fi")
+        assert result == 5003
+
+    # ---- Unknown term: no mud guarantee ----
+
+    def test_unknown_term_returns_none(self, tmp_path):
+        """A term absent from the dict and from the enum returns None — no fabricated id."""
+        result = self._resolve(tmp_path, 9001, "Chartreuse")
+        assert result is None
+
+    def test_unknown_term_does_not_affect_known_attr(self, tmp_path):
+        """Unknown color does not accidentally resolve to an unrelated value."""
+        result = self._resolve(tmp_path, 9002, "Chartreuse")
+        assert result is None
+
+    # ---- _translate_en_to_ru unit test ----
+
+    def test_translate_en_to_ru_direct(self):
+        """_translate_en_to_ru returns RU for known terms, unchanged for unknown."""
+        from app.services.enrichment.strategies.dictionaries.ozon_loader import _translate_en_to_ru
+        assert _translate_en_to_ru("Black") == "чёрный"
+        assert _translate_en_to_ru("black") == "чёрный"
+        assert _translate_en_to_ru("Yes") == "да"
+        assert _translate_en_to_ru("Aluminium") == "алюминий"
+        assert _translate_en_to_ru("Bluetooth") == "Bluetooth"   # unchanged
+        assert _translate_en_to_ru("SomeWeirdTerm") == "SomeWeirdTerm"  # unchanged
