@@ -51,6 +51,17 @@ TRUSTED_PDF_DOMAINS = frozenset({
     "chieftec.com", "nzxt.com", "lian-li.com",
     "silverstonetek.com", "xpg.com", "zalman.com",
     "aerocool.io",
+    # Broader electronics / appliance OEM datasheet domains (OEM only, no
+    # aggregators — aggregators risk unofficial PDFs). The PSU-only whitelist
+    # above was the sole reason pdf_datasheet contributed nothing on the
+    # cross-category eval (laptops/monitors/phones/appliances).
+    "lg.com", "sony.com", "samsung.com", "apple.com",
+    "intel.com", "amd.com", "nvidia.com",
+    "logitech.com", "hyperx.com", "steelseries.com", "razer.com",
+    "dell.com", "lenovo.com", "hp.com", "acer.com", "huawei.com",
+    "philips.com", "braun.com", "delonghi.com",
+    "bosch-home.com", "siemens-home.bsh-group.com",
+    "dji.com", "pocketbook.ch", "garmin.com", "jbl.com", "bose.com",
 })
 
 _GENERIC_PREFIXES = (
