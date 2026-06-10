@@ -150,16 +150,18 @@ async def scrapfly_fetch(
         )
 
     if r.status_code >= 400:
+        # Log the full body (up to 500 chars) so the exact Scrapfly error code
+        # (e.g. ERR::SCRAPE::WAIT_FOR_SELECTOR_TIMEOUT) is visible in logs.
         logger.warning(
-            "[Scrapfly] API HTTP %s for %s — body[:200]=%s",
-            r.status_code, url[:80], r.text[:200],
+            "[Scrapfly] API HTTP %s for %s — body[:500]=%s",
+            r.status_code, url[:80], r.text[:500],
         )
         return ScrapflyResult(
             success=False,
             content=None,
             status_code=r.status_code,
             credits_used=0,
-            error=f"Scrapfly API HTTP {r.status_code}",
+            error=f"Scrapfly API HTTP {r.status_code}: {r.text[:200]}",
         )
 
     try:

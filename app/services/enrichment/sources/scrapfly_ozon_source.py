@@ -384,15 +384,17 @@ class ScrapflyOzonSource(AttributeSource):
         )
 
         # ---- Step 3: Features page fetch ----
-        # wait_for_selector ensures Scrapfly captures the page AFTER the
-        # webCharacteristics widget has fully rendered in the DOM. Without it,
-        # Ozon's lazy-loading SPA may not have hydrated the characteristics section
-        # yet when the snapshot is taken, causing both parsers to return 0 results.
+        # Do NOT use wait_for_selector — Scrapfly returns 422 when the selector
+        # is not found within its internal timeout (this is NOT a free error:
+        # Scrapfly treats it as a scrape failure and the 422 propagates up).
+        # Live testing confirms the webCharacteristics widget renders reliably
+        # with plain render_js=True + the default Scrapfly rendering_wait (1s).
+        # If the widget is still missing, parse_dl_characteristics falls back
+        # to scanning all <dl> blocks in the full HTML.
         features_url = f"{_OZON_PRODUCT_BASE}{slug}-{pid}/features/"
         features_result = await scrapfly_fetch(
             features_url,
             render_js=True,
-            wait_for_selector="[data-widget='webCharacteristics']",
         )
         if not features_result.success or not features_result.content:
             logger.info(
