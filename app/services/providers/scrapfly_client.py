@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import ssl
+import urllib.parse
 from dataclasses import dataclass
 from typing import Optional
 
@@ -106,6 +107,12 @@ async def scrapfly_fetch(
             error="SCRAPFLY_API_KEY not configured",
         )
 
+    # Build the Scrapfly request URL manually to avoid httpx double-encoding the
+    # target `url` param.  httpx's params= encodes values with quote_plus(), turning
+    # spaces into `+`.  Scrapfly strictly validates the target URL and rejects any URL
+    # that contains `+` (decoded as space) — returning HTTP 422 "invalid URL".
+    # Using urllib.parse.urlencode with quote_via=quote produces %20 for spaces and
+    # does NOT re-encode already-percent-encoded characters.
     params: dict = {
         "key": api_key,
         "url": url,
@@ -118,9 +125,13 @@ async def scrapfly_fetch(
     if wait_for_selector:
         params["wait_for_selector"] = wait_for_selector
 
+    # Encode all params with %XX (not +) so the nested url value stays a valid URL.
+    query_string = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+    request_url = f"{_SCRAPFLY_ENDPOINT}?{query_string}"
+
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.get(_SCRAPFLY_ENDPOINT, params=params)
+            r = await client.get(request_url)
     except (
         ssl.SSLError,
         httpx.ConnectError,
