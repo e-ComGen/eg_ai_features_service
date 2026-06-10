@@ -96,13 +96,16 @@ class _ProposedFill(BaseModel):
         validation_alias=AliasChoices("value", "attribute_value", "extracted_value"),
         description="One of the allowed values, exactly as listed.",
     )
-    reasoning: Optional[str] = Field(None, max_length=200)
+    reasoning: Optional[str] = Field(None)
 
     @model_validator(mode="before")
     @classmethod
-    def _drop_null_value(cls, data):
-        if isinstance(data, dict) and data.get("value") is None:
-            raise ValueError("null value — skip")
+    def _sanitize(cls, data):
+        if isinstance(data, dict):
+            if data.get("value") is None:
+                raise ValueError("null value — skip")
+            if isinstance(data.get("reasoning"), str):
+                data["reasoning"] = data["reasoning"][:200]
         return data
 
 
@@ -111,9 +114,29 @@ class _ProposalResponse(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _coerce_empty(cls, data):
+    def _coerce_and_filter(cls, data):
+        """Default fills to [] and drop individual items that fail validation.
+
+        Pydantic propagates per-item errors upward and fails the whole response.
+        We pre-filter here so a null value or over-long reasoning in ONE item
+        does not silently discard ALL valid proposals.
+        Only normalises dict items; already-constructed _ProposedFill objects
+        (e.g. from tests) are passed through as-is.
+        """
         if isinstance(data, dict):
-            data.setdefault("fills", [])
+            raw_fills = data.get("fills") or []
+            good = []
+            for item in raw_fills:
+                if not isinstance(item, dict):
+                    # Already a model instance (e.g. from tests) — pass through
+                    good.append(item)
+                    continue
+                if item.get("value") is None:
+                    continue
+                if isinstance(item.get("reasoning"), str):
+                    item = {**item, "reasoning": item["reasoning"][:200]}
+                good.append(item)
+            data["fills"] = good
         return data
 
 
@@ -395,14 +418,30 @@ class SafeEnumFillSource(AttributeSource):
 
         system_prompt = (
             "You are a product attribute expert. For each target attribute below, "
-            "propose the SINGLE best-matching value from its allowed_values list. "
-            "Propose a value when it is PLAUSIBLY SUPPORTED by the product title, brand, "
-            "category, or product type — an obvious default for the product type counts as "
-            "confident (e.g. a running shoe → Тип пронации=Нейтральная, a summer dress → "
-            "Сезон=Лето). "
-            "Skip only when GENUINELY UNCERTAIN — do not skip just because the value is "
-            "not explicitly stated in the title. Never invent values not in the allowed_values "
-            "list. Return 'fills' list with {attribute_id, value, reasoning}."
+            "propose the SINGLE best-matching value from its allowed_values list.\n\n"
+            "CORE RULE: Propose whenever the product TYPE, NAME, CATEGORY, or BRAND makes "
+            "a value obvious or strongly likely — even if the value is not explicitly stated "
+            "word-for-word in the title. Proposing is cheap: the downstream gates will filter "
+            "incorrect proposals. Your job is to surface plausible candidates, not to be "
+            "overly conservative.\n\n"
+            "TYPE-LEVEL DEFAULTS (always propose for these when the product type clearly applies):\n"
+            "• Apparel season (Сезон): летнее платье/сарафан → Лето; зимняя куртка/пуховик → Зима; "
+            "демисезонная куртка/ветровка → Демисезон; футболка/шорты → Лето or Демисезон.\n"
+            "• Apparel style (Стиль): футболка/джинсы → Повседневный; спортивный костюм/кроссовки → "
+            "Спортивный; деловой пиджак/блуза → Деловой; платье вечернее → Нарядный.\n"
+            "• Apparel purpose (Назначение): футболка/джинсы/платье → Повседневный (не 'для дома'); "
+            "спортивная одежда → Спорт; верхняя одежда → Для улицы; пижама/халат → Для дома.\n"
+            "• Apparel cut (Покрой): футболка/майка → Прямой; платье A-line → Расклешённый.\n"
+            "• Sleeve type (Тип рукава): футболка → Короткий рукав; платье без рукавов/сарафан → "
+            "Без рукавов; толстовка/худи → Длинный рукав.\n"
+            "• Running shoes (Тип пронации): general running shoe → Нейтральная.\n"
+            "• Adult products (Целевая аудитория): explicit adult product → Взрослая.\n\n"
+            "SKIP only when the product type gives NO signal at all for the attribute "
+            "(e.g. a generic sock → Покрой is truly unknowable). "
+            "Do NOT skip just because the value is not explicitly written in the title. "
+            "Never invent values outside the allowed_values list. "
+            "Never propose a brand value. "
+            "Return 'fills' list with {attribute_id, value, reasoning}."
             + build_meta_guidance()
             + already_rule
         )
@@ -423,7 +462,8 @@ class SafeEnumFillSource(AttributeSource):
             f"Category: {' / '.join(context.category_path) or 'n/a'}\n\n"
             + already_preamble
             + f"Target attributes to fill:\n{targets_block}\n\n"
-            "Return only attributes you CONFIDENTLY know. Field: 'fills'."
+            "Return fills for ALL attributes where the product type, name, "
+            "or category provides a signal — the gates will verify. Field: 'fills'."
         )
 
         try:
