@@ -42,7 +42,11 @@ from app.services.enrichment.strategies.dictionaries.ozon_loader import (
     get_ozon_characteristics_for_type,
     load_ozon_dictionary,
 )
-from app.services.enrichment.strategies.dictionaries.ozon_field_classifier import is_platform_field
+from app.services.enrichment.strategies.dictionaries.ozon_field_classifier import (
+    is_platform_field,
+    is_not_applicable,
+    ProductContext,
+)
 from app.services.enrichment.base import ExtractionContext, TargetAttribute
 from app.services.enrichment.pipeline import PipelineOrchestrator
 from app.services.enrichment.strategies.factory import get_strategy
@@ -254,11 +258,40 @@ async def main():
                 if not char_by_id.get(av.attribute_id, {}).get("is_required")
             )
 
-            # Extractable optional — без платформенных полей
-            extractable_opt_ids = {
-                c["id"] for c in chars
-                if not c.get("is_required") and not is_platform_field(c)
-            }
+            # Build product context for N/A detection: filled attr name→value mapping
+            filled_attr_map: dict[str, str] = {}
+            for av in avs:
+                c_name = char_by_id.get(av.attribute_id, {}).get("name", "")
+                if c_name:
+                    val = av.value
+                    filled_attr_map[c_name.strip().lower()] = str(val) if val is not None else ""
+
+            prod_ctx = ProductContext(
+                product_name=prod_name,
+                category_path=category_path,
+                filled_attrs=filled_attr_map,
+            )
+
+            # Extractable optional — без платформенных полей и N/A полей
+            na_excluded: list[str] = []
+            extractable_opt_ids = set()
+            for c in chars:
+                if c.get("is_required"):
+                    continue
+                if is_platform_field(c):
+                    continue
+                if is_not_applicable(c, prod_ctx):
+                    na_excluded.append(c["name"])
+                    continue
+                extractable_opt_ids.add(c["id"])
+
+            if na_excluded:
+                print(
+                    f"  [{idx:2d}/{len(products_to_run)}] N/A excluded ({len(na_excluded)}): "
+                    + ", ".join(na_excluded),
+                    flush=True,
+                )
+
             n_opt_extractable = len(extractable_opt_ids)
             filled_opt_extractable = sum(
                 1 for av in avs
@@ -299,6 +332,7 @@ async def main():
                     filled_opt_extractable / n_opt_extractable
                     if n_opt_extractable else None
                 ),
+                "na_excluded_attrs": na_excluded,
                 "filled": [{
                     "attribute_id": av.attribute_id,
                     "name": char_by_id.get(av.attribute_id, {}).get("name"),
