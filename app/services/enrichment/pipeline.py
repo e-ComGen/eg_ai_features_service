@@ -64,6 +64,11 @@ from app.services.enrichment.finishing import FinishingExtractor
 
 logger = logging.getLogger(__name__)
 
+# YandexMarket is dead via Scrappey (captcha/301 on every URL, no residential proxy
+# available) — contributes ZERO data and burns up to 80s/product in timeouts.
+# Disable by default; set YANDEX_MARKET_ENABLED=1 to re-enable for testing.
+YANDEX_MARKET_ENABLED: bool = os.environ.get("YANDEX_MARKET_ENABLED", "0") == "1"
+
 # Card-protection в финальном _merge: карточные источники (копия из live-карточки
 # того же товара) не должны перетираться инференсом (LLM-знания / web-поиск), если
 # их confidence лишь незначительно ниже. Band = допустимый зазор.
@@ -1443,7 +1448,9 @@ class PipelineOrchestrator:
         # полезен для apparel (generic-named, без SKU) где WB/Ozon дают card=N.
         # Cost-gated: только при remaining > 0 (т.е. когда предыдущие card-источники
         # не закрыли все targets).
-        if self._yandex_market is not None and remaining:
+        # DISABLED: YANDEX_MARKET_ENABLED=False — dead via Scrappey (captcha/301 every
+        # URL, no residential), zero data contribution, burns up to 80s/product.
+        if YANDEX_MARKET_ENABLED and self._yandex_market is not None and remaining:
             new_avs = await self._run_yandex_market_stage(
                 context, remaining, already_filled=filled_so_far,
             )

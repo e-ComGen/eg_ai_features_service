@@ -111,12 +111,17 @@ _CONTENT_KEYWORDS: frozenset[str] = frozenset({"состав", "материал
 # LRU
 _CACHE_MAX = 256
 
-# Timeout constants — mirror OzonCardSource to prevent hangs.
-# 60s matches the httpx-level timeout floor in OzonCard/_HTTP_TIMEOUT.
-# 90s is the hard asyncio.wait_for cap (_OZON_CARD_TOTAL_TIMEOUT) — cloned here
-# so YandexMarket can't stall the pipeline on N-retry × 60s Scrappey slowness.
-_SCRAPPEY_HTTP_TIMEOUT = 60.0
-_YM_TOTAL_TIMEOUT = 90.0
+# Timeout constants — mirror OzonCardSource fail-fast retry strategy.
+# _SCRAPPEY_PER_ATTEMPT_TIMEOUT: 30s asyncio.wait_for cap per Scrappey call.
+# A hung proxy is transient; a retry typically succeeds. 30s is empirically enough
+# for successful calls (8-20s typical, up to ~28s observed) while failing fast on hangs.
+# _SCRAPPEY_MAX_ATTEMPTS=2: 1 attempt + 1 retry. Worst-case: 2×30s + 2s backoff = 62s.
+# _YM_TOTAL_TIMEOUT=80s: 2×30s Scrappey + 2s backoff + Serper overhead = ~62s typical
+# worst-case. 80s cap avoids the old 90s full-hang behaviour.
+_SCRAPPEY_HTTP_TIMEOUT = 30.0         # httpx-level fallback (belt-and-suspenders)
+_SCRAPPEY_PER_ATTEMPT_TIMEOUT = 30.0  # asyncio.wait_for per Scrappey call
+_SCRAPPEY_MAX_ATTEMPTS = 2            # 1 attempt + 1 retry on timeout
+_YM_TOTAL_TIMEOUT = 80.0
 
 # Извлечение product-id/slug из URL карточки Маркета. Покрывает форматы:
 #   https://market.yandex.ru/product--<slug>/<digits>
@@ -434,10 +439,11 @@ class YandexMarketSource(AttributeSource):
         Scrappey запускает реальный браузер и обходит этот гейт (тот же путь,
         что OzonCardSource для ozon.ru).
 
-        Timeout: asyncio.wait_for(_SCRAPPEY_HTTP_TIMEOUT=60s) — один запрос.
-        Hard cap на весь _do_extract (_YM_TOTAL_TIMEOUT=90s) задан выше в extract().
+        Fail-fast retry: per-attempt asyncio.wait_for cap = _SCRAPPEY_PER_ATTEMPT_TIMEOUT
+        (30s). On timeout, retries up to _SCRAPPEY_MAX_ATTEMPTS=2 total. Worst-case:
+        2×30s + 2s backoff = 62s, well within the 80s total cap (_YM_TOTAL_TIMEOUT).
 
-        Возвращает HTML response на success, None на любой ошибке (graceful).
+        Возвращает HTML response на success, None если все попытки провалились.
         Парсинг (_parse_card) полностью готов к такому HTML.
         """
         if not self._scrappey_key:
@@ -445,20 +451,52 @@ class YandexMarketSource(AttributeSource):
                 "[YandexMarket] _fetch_card_html: SCRAPPEY_KEY не задан → None (graceful)"
             )
             return None
-        try:
-            html = await asyncio.wait_for(
-                _scrappey_fetch_page(url, timeout=_SCRAPPEY_HTTP_TIMEOUT),
-                timeout=_SCRAPPEY_HTTP_TIMEOUT + 5,  # slight buffer above httpx timeout
-            )
-        except asyncio.TimeoutError:
-            logger.info("[YandexMarket] _fetch_card_html: asyncio timeout for %s → None", url[:80])
+
+        for attempt in range(_SCRAPPEY_MAX_ATTEMPTS):
+            try:
+                html = await asyncio.wait_for(
+                    _scrappey_fetch_page(url, timeout=_SCRAPPEY_HTTP_TIMEOUT),
+                    timeout=_SCRAPPEY_PER_ATTEMPT_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[YandexMarket] scrappey-attempt-%d-timeout (%.0fs) for %s",
+                    attempt + 1, _SCRAPPEY_PER_ATTEMPT_TIMEOUT, url[:80],
+                )
+                if attempt + 1 < _SCRAPPEY_MAX_ATTEMPTS:
+                    logger.info(
+                        "[YandexMarket] scrappey-retry attempt %d/%d for %s",
+                        attempt + 2, _SCRAPPEY_MAX_ATTEMPTS, url[:80],
+                    )
+                    await asyncio.sleep(2.0)
+                    continue
+                logger.warning(
+                    "[YandexMarket] all-failed-empty: all %d Scrappey attempts timed out for %s",
+                    _SCRAPPEY_MAX_ATTEMPTS, url[:80],
+                )
+                return None
+            except Exception as exc:
+                logger.info(
+                    "[YandexMarket] _fetch_card_html: error for %s: %s → None", url[:80], exc
+                )
+                return None
+            if html:
+                logger.info(
+                    "[YandexMarket] _fetch_card_html: got %d chars for %s", len(html), url[:80]
+                )
+                return html
+            # Empty response — treat as soft fail, retry
+            if attempt + 1 < _SCRAPPEY_MAX_ATTEMPTS:
+                logger.info(
+                    "[YandexMarket] scrappey-retry attempt %d/%d (empty response) for %s",
+                    attempt + 2, _SCRAPPEY_MAX_ATTEMPTS, url[:80],
+                )
+                await asyncio.sleep(2.0)
+                continue
+            logger.info("[YandexMarket] all-failed-empty: empty response after %d attempts for %s",
+                        _SCRAPPEY_MAX_ATTEMPTS, url[:80])
             return None
-        except Exception as exc:
-            logger.info("[YandexMarket] _fetch_card_html: error for %s: %s → None", url[:80], exc)
-            return None
-        if html:
-            logger.info("[YandexMarket] _fetch_card_html: got %d chars for %s", len(html), url[:80])
-        return html
+        return None
 
     # ------------------------------------------------------------------
     # HTML parsing

@@ -338,9 +338,14 @@ async def harvest_composition(
                         html = await bf.fetch(url)
 
                 else:
-                    # Plain httpx via existing url_fetcher
+                    # Open site: httpx-direct → Scrappey (IP-shield) → BrowserFetcher.
+                    # force_scrappey=True activates the Scrappey proxy tier inside
+                    # fetch_url_content regardless of the global env flag, so our VPS
+                    # IP is only exposed to open sites as a last resort (SPA escalation
+                    # below).  Walled browser-strategy sites bypass this path entirely
+                    # and go straight to BrowserFetcher above.
                     from app.services.url_fetcher import fetch_url_content
-                    result = await fetch_url_content(url)
+                    result = await fetch_url_content(url, force_scrappey=True)
                     if result is not None:
                         # Use raw_html when available (preserves spec blocks)
                         html = result.raw_html or result.content

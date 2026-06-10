@@ -78,11 +78,21 @@ _MAX_SEARCH_TILES = 8
 # small buffer above the typical jitter window (the exact card has been observed
 # ranking up to ~6th) while staying cheap (scoring is pure-CPU rapidfuzz, no I/O).
 _MATCH_TOP_N = 8
-_HTTP_TIMEOUT = 60.0   # Scrappey browser bypass обычно 8-20s, иногда до 60s.
-                       # 60s matches the timeout floor used across all other network
-                       # callers (LLM providers, WbCard, ozon_runtime_lookup).
-_OZON_CARD_TOTAL_TIMEOUT = 90.0  # Hard cap on the entire _do_extract (all retries).
-                                  # Prevents N-retry × 60s stalls when Scrappey is slow.
+_HTTP_TIMEOUT = 30.0   # httpx-level fallback cap (belt-and-suspenders).
+                       # The real per-call limit is _SCRAPPEY_PER_ATTEMPT_TIMEOUT via
+                       # asyncio.wait_for, so 30s keeps both layers consistent.
+
+# Fail-fast retry constants for Scrappey proxy calls.
+# Scrappey hangs are transient: a single stuck proxy absorbs the full old 60s budget.
+# With 30s per attempt + 1 retry we still get two fair shots while limiting worst-case
+# to ~62s (30 + 2s backoff + 30), well inside the 80s total cap.
+_SCRAPPEY_PER_ATTEMPT_TIMEOUT = 30.0  # asyncio.wait_for per Scrappey call
+_SCRAPPEY_MAX_ATTEMPTS = 2            # 1 attempt + 1 retry on timeout/empty-block
+
+_OZON_CARD_TOTAL_TIMEOUT = 80.0  # Hard cap on the entire _do_extract (Scrappey path
+                                  # + Serper fallback). 2×30s Scrappey + 2s backoff +
+                                  # up to 15s Serper = ~47s typical worst-case, 80s cap
+                                  # leaves comfortable headroom without the old 90s hang.
 
 # Regex для парсинга
 _PRODUCT_LINK_RE = re.compile(
@@ -931,9 +941,11 @@ class OzonCardSource(AttributeSource):
             # тоже должны дойти до merger-а — он выберет лучшее через consensus.
             return self._filter_for_targets(self._cache[cache_key], targets)
 
-        # Network calls — bounded by hard total timeout to prevent stalls when
-        # Scrappey is slow or retrying multiple times (N retries × _HTTP_TIMEOUT
-        # could otherwise block the pipeline for minutes).
+        # Network calls — bounded by hard total timeout to prevent stalls.
+        # Per-attempt Scrappey timeout (_SCRAPPEY_PER_ATTEMPT_TIMEOUT=30s) + retry
+        # keeps worst-case Scrappey path to ~62s, leaving room for Serper fallback
+        # within the 80s cap. If the total cap still fires (extreme degradation), fall
+        # through to the Serper-snippet fallback instead of surrendering the product.
         try:
             all_values = await asyncio.wait_for(
                 self._do_extract(context, targets),
@@ -941,12 +953,20 @@ class OzonCardSource(AttributeSource):
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "[OzonCard] total timeout (%.0fs) for '%s' — skipping OzonCard stage",
+                "[OzonCard] total timeout (%.0fs) for '%s' — Scrappey path failed; "
+                "trying serper-fallback",
                 _OZON_CARD_TOTAL_TIMEOUT,
                 context.product_name[:60],
             )
-            self._cache_put(cache_key, [])
-            return []
+            # Serper fallback does not touch Scrappey and has its own 15s timeout
+            # — safe to call even after the Scrappey path timed out.
+            snippet_values = await self._serper_snippet_fallback(context, targets)
+            logger.info(
+                "[OzonCard] serper-fallback-used after total-timeout: %d values for '%s'",
+                len(snippet_values), context.product_name[:60],
+            )
+            self._cache_put(cache_key, snippet_values)
+            return self._filter_for_targets(snippet_values, targets)
         except Exception as exc:
             logger.warning(
                 "[OzonCard] unexpected error для '%s': %s",
@@ -978,12 +998,40 @@ class OzonCardSource(AttributeSource):
         Ozon иногда отдаёт обрезанную SPA-страницу (10KB без SSR data),
         особенно при долгих запросах. Retry 1 раз если content слишком короткий.
 
+        Fail-fast per-attempt timeout (_SCRAPPEY_PER_ATTEMPT_TIMEOUT): a hung
+        Scrappey proxy call is capped at 30s per attempt. On asyncio.TimeoutError
+        we retry once (total _SCRAPPEY_MAX_ATTEMPTS=2). This prevents a single
+        proxy hang from consuming the whole 80s budget and surrendering the product.
+
         Возвращает None если все попытки fail.
         """
-        _RETRY_DELAYS = (1.0, 2.0, 4.0)  # backoff seconds для попыток 1, 2, 3
+        _RETRY_DELAYS = (2.0, 2.0, 4.0)  # backoff seconds для попыток 1, 2, 3
+        timeout_attempts = 0  # track how many times we hit asyncio.TimeoutError
 
         for attempt in range(_MAX_RETRIES + 1):
-            content = await self._scrappey_fetch_once(client, target_url)
+            try:
+                content = await asyncio.wait_for(
+                    self._scrappey_fetch_once(client, target_url),
+                    timeout=_SCRAPPEY_PER_ATTEMPT_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                timeout_attempts += 1
+                logger.warning(
+                    "[OzonCard] scrappey-attempt-%d-timeout (%.0fs) for %s",
+                    attempt + 1, _SCRAPPEY_PER_ATTEMPT_TIMEOUT, target_url[:80],
+                )
+                if timeout_attempts < _SCRAPPEY_MAX_ATTEMPTS:
+                    logger.info(
+                        "[OzonCard] scrappey-retry attempt %d/%d for %s",
+                        timeout_attempts + 1, _SCRAPPEY_MAX_ATTEMPTS, target_url[:80],
+                    )
+                    await asyncio.sleep(2.0)
+                    continue
+                logger.warning(
+                    "[OzonCard] all-scrappey-attempts-timed-out (%d/%d) for %s — giving up",
+                    timeout_attempts, _SCRAPPEY_MAX_ATTEMPTS, target_url[:80],
+                )
+                return None
             if content is None:
                 # Hard fail (network/SSL, HTTP4xx, DataDome) — retry с backoff
                 if attempt < _MAX_RETRIES:

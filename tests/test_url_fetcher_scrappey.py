@@ -474,3 +474,86 @@ async def test_fallback_uses_browser_timeout_cap(monkeypatch, tmp_path):
     assert received_kwargs.get("timeout") == 55.0, (
         f"Expected browser timeout cap 55.0, got {received_kwargs.get('timeout')}"
     )
+
+
+# ---------------------------------------------------------------------------
+# force_scrappey=True bypasses the global env flag
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_force_scrappey_fires_when_global_flag_is_off(scrappey_disabled, tmp_path):
+    """force_scrappey=True must activate Scrappey even if global flag is OFF."""
+    scrappey_html = "Product composition details. " * 40
+
+    with patch("app.services.url_fetcher.httpx.AsyncClient") as mock_cls, \
+         patch("app.services.providers.scrappey_client.scrappey_fetch",
+               new=AsyncMock(return_value=scrappey_html)) as mock_sf:
+
+        mock_cls.return_value = _make_async_client([_make_resp(403)])
+        result = await uf.fetch_url_content(
+            "https://kixbox.ru/product/force-test/",
+            force_scrappey=True,
+        )
+
+    # Scrappey must fire despite global flag being OFF
+    mock_sf.assert_awaited_once()
+    assert uf._scrappey_call_count == 1
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_force_scrappey_off_respects_global_flag(scrappey_disabled):
+    """Without force_scrappey, global flag OFF means Scrappey is NOT called."""
+    with patch("app.services.url_fetcher.httpx.AsyncClient") as mock_cls, \
+         patch("app.services.providers.scrappey_client.scrappey_fetch",
+               new=AsyncMock()) as mock_sf:
+
+        mock_cls.return_value = _make_async_client([_make_resp(403)])
+        result = await uf.fetch_url_content(
+            "https://kixbox.ru/product/no-force-test/",
+            force_scrappey=False,
+        )
+
+    mock_sf.assert_not_awaited()
+    assert uf._scrappey_call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_force_scrappey_still_respects_per_process_cap(monkeypatch, tmp_path):
+    """force_scrappey=True must still be stopped by the per-process cap."""
+    monkeypatch.setenv("URL_FETCHER_SCRAPPEY_FALLBACK", "0")  # global flag OFF
+    monkeypatch.setenv("URL_FETCHER_SCRAPPEY_MAX", "2")
+    monkeypatch.setattr(uf, "_CACHE_DIR", str(tmp_path))
+    uf._scrappey_call_count = 2  # already at cap
+
+    with patch("app.services.url_fetcher.httpx.AsyncClient") as mock_cls, \
+         patch("app.services.providers.scrappey_client.scrappey_fetch",
+               new=AsyncMock(return_value="html")) as mock_sf, \
+         patch("app.services.url_fetcher.asyncio.sleep", new=AsyncMock()):
+
+        mock_cls.return_value = _make_async_client([_make_resp(403)])
+        result = await uf.fetch_url_content(
+            "https://kixbox.ru/product/cap-test/",
+            force_scrappey=True,
+        )
+
+    # Cap must stop Scrappey even with force flag
+    mock_sf.assert_not_awaited()
+    assert uf._scrappey_call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_force_scrappey_still_blocks_nontext_host(scrappey_disabled):
+    """force_scrappey=True must NOT call Scrappey for non-text (CDN/tracker) hosts."""
+    with patch("app.services.url_fetcher.httpx.AsyncClient") as mock_cls, \
+         patch("app.services.providers.scrappey_client.scrappey_fetch",
+               new=AsyncMock()) as mock_sf:
+
+        mock_cls.return_value = _make_async_client([_make_resp(403)])
+        result = await uf.fetch_url_content(
+            "https://cdn.example.com/asset.js",
+            force_scrappey=True,
+        )
+
+    mock_sf.assert_not_awaited()
+    assert uf._scrappey_call_count == 0

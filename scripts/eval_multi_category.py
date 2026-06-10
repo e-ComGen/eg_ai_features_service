@@ -53,6 +53,7 @@ from app.services.enrichment.sources.ozon_card_source import OzonCardSource
 from app.services.enrichment.sources.wb_card_source import WbCardSource
 from app.services.enrichment.sources.tnved_source import TnvedSource
 from app.services.enrichment.sources.yandex_market_source import YandexMarketSource
+from app.services.enrichment.pipeline import YANDEX_MARKET_ENABLED
 
 # 40 товаров — каждый в своей категории Ozon (cat_id, type_id, product_name)
 PRODUCTS = [
@@ -147,7 +148,10 @@ async def main():
     ozon_card = OzonCardSource()
     wb_card = WbCardSource()
     tnved = TnvedSource()
-    yandex_market = YandexMarketSource()
+    # YandexMarket is disabled (dead via Scrappey captcha/301) — honour the pipeline flag.
+    yandex_market = YandexMarketSource() if YANDEX_MARKET_ENABLED else None
+    if not YANDEX_MARKET_ENABLED:
+        print("[Eval] YANDEX_MARKET_ENABLED=False -> YandexMarketSource disabled", flush=True)
 
     orchestrator = PipelineOrchestrator(
         strategy=strategy,

@@ -173,7 +173,7 @@ class TestDeadDomainSkip:
 
         fetch_called: list[bool] = []
 
-        async def mock_fetch_url(url):
+        async def mock_fetch_url(url, **kwargs):
             fetch_called.append(True)
             return None  # no content — fallthrough
 
@@ -223,7 +223,7 @@ class TestFirstHitStopsLoop:
 
         fetch_call_urls: list[str] = []
 
-        async def mock_fetch_url(url):
+        async def mock_fetch_url(url, **kwargs):
             fetch_call_urls.append(url)
             fr = MagicMock()
             fr.raw_html = page_html
@@ -273,7 +273,7 @@ class TestFirstHitStopsLoop:
             return_value=_make_serper_results(["https://kixbox.ru/nike-tee/"])
         )
 
-        async def mock_fetch_url(url):
+        async def mock_fetch_url(url, **kwargs):
             fr = MagicMock()
             fr.raw_html = page_html
             fr.content = page_html
@@ -322,7 +322,7 @@ class TestGracefulFallthrough:
             ])
         )
 
-        async def mock_fetch_url(url):
+        async def mock_fetch_url(url, **kwargs):
             return None  # every site fails to return content
 
         with (
@@ -361,7 +361,7 @@ class TestGracefulFallthrough:
             return_value=_make_serper_results(["https://kixbox.ru/adidas/"])
         )
 
-        async def mock_fetch_url(url):
+        async def mock_fetch_url(url, **kwargs):
             fr = MagicMock()
             fr.raw_html = wrong_brand_html
             fr.content = wrong_brand_html
@@ -512,7 +512,7 @@ class TestSerperDedup:
 
         fetch_call_urls: list[str] = []
 
-        async def mock_fetch_url(url):
+        async def mock_fetch_url(url, **kwargs):
             fetch_call_urls.append(url)
             return None
 
@@ -560,7 +560,7 @@ class TestRouting:
         url_fetcher_calls: list[str] = []
         bf_calls: list[str] = []
 
-        async def mock_url_fetcher(url):
+        async def mock_url_fetcher(url, **kwargs):
             url_fetcher_calls.append(url)
             return None
 
@@ -594,6 +594,90 @@ class TestRouting:
         assert url_fetcher_calls, "url_fetcher must be called for open site"
         assert bf_calls == [], "BrowserFetcher must NOT be called for open site"
 
+    def test_open_url_passes_force_scrappey_to_url_fetcher(self):
+        """harvest_composition must pass force_scrappey=True when fetching open sites."""
+        serper = MagicMock()
+        serper.search = AsyncMock(
+            return_value=_make_serper_results(["https://kixbox.ru/nike-tee/"])
+        )
+
+        captured_kwargs: list[dict] = []
+
+        async def mock_url_fetcher(url, **kwargs):
+            captured_kwargs.append(kwargs)
+            return None
+
+        with (
+            patch(
+                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                return_value=False,
+            ),
+            patch(
+                "app.services.url_fetcher.fetch_url_content",
+                new=mock_url_fetcher,
+            ),
+            patch(
+                "app.services.enrichment.sources.multisite_composition._INTER_REQUEST_DELAY",
+                0,
+            ),
+        ):
+            run(
+                harvest_composition(
+                    "Nike Tee",
+                    "Nike",
+                    serper_client=serper,
+                )
+            )
+
+        assert captured_kwargs, "fetch_url_content must have been called"
+        assert captured_kwargs[0].get("force_scrappey") is True, (
+            "harvest_composition must pass force_scrappey=True for open sites"
+        )
+
+    def test_browser_url_does_not_call_url_fetcher(self):
+        """lamoda.ru (browser) must use BrowserFetcher, url_fetcher NOT called."""
+        serper = MagicMock()
+        serper.search = AsyncMock(
+            return_value=_make_serper_results(["https://lamoda.ru/p/abc/brand-slug/"])
+        )
+
+        url_fetcher_calls: list[str] = []
+
+        async def mock_url_fetcher(url, **kwargs):
+            url_fetcher_calls.append(url)
+            return None
+
+        mock_bf = MagicMock()
+        mock_bf._closed = False
+        mock_bf.fetch_with_warmup = AsyncMock(return_value=None)
+
+        with (
+            patch(
+                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                return_value=False,
+            ),
+            patch(
+                "app.services.url_fetcher.fetch_url_content",
+                new=mock_url_fetcher,
+            ),
+            patch(
+                "app.services.enrichment.sources.multisite_composition._INTER_REQUEST_DELAY",
+                0,
+            ),
+        ):
+            run(
+                harvest_composition(
+                    "Толстовка Nike",
+                    "Nike",
+                    serper_client=serper,
+                    browser_fetcher=mock_bf,
+                )
+            )
+
+        assert url_fetcher_calls == [], (
+            "url_fetcher (and thus Scrappey) must NOT be called for browser-strategy sites"
+        )
+
     def test_browser_url_uses_browser_fetcher(self):
         """lamoda.ru (browser) must use BrowserFetcher.fetch_with_warmup."""
         serper = MagicMock()
@@ -604,7 +688,7 @@ class TestRouting:
         url_fetcher_calls: list[str] = []
         bf_warmup_calls: list[str] = []
 
-        async def mock_url_fetcher(url):
+        async def mock_url_fetcher(url, **kwargs):
             url_fetcher_calls.append(url)
             return None
 
@@ -673,7 +757,7 @@ class TestSpaAutoEscalation:
         )
 
         # httpx returns the SPA shell
-        async def mock_fetch_url(url):
+        async def mock_fetch_url(url, **kwargs):
             fr = MagicMock()
             fr.raw_html = spa_shell_html
             fr.content = spa_shell_html
@@ -727,7 +811,7 @@ class TestSpaAutoEscalation:
             return_value=_make_serper_results(["https://kixbox.ru/nike-tee/"])
         )
 
-        async def mock_fetch_url(url):
+        async def mock_fetch_url(url, **kwargs):
             fr = MagicMock()
             fr.raw_html = good_html
             fr.content = good_html
@@ -780,7 +864,7 @@ class TestSpaAutoEscalation:
             return_value=_make_serper_results(["https://kixbox.ru/nike-tee/"])
         )
 
-        async def mock_fetch_url(url):
+        async def mock_fetch_url(url, **kwargs):
             fr = MagicMock()
             fr.raw_html = plain_no_composition_html
             fr.content = plain_no_composition_html
@@ -835,7 +919,7 @@ class TestSpaAutoEscalation:
             return_value=_make_serper_results(["https://street-beat.ru/nike-tee/"])
         )
 
-        async def mock_fetch_url(url):
+        async def mock_fetch_url(url, **kwargs):
             fr = MagicMock()
             fr.raw_html = spa_shell_html
             fr.content = spa_shell_html

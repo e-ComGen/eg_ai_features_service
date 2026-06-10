@@ -241,17 +241,21 @@ def _host_is_fast_domain(url: str) -> bool:
     return False
 
 
-def _eligible_for_scrappey(url: str) -> bool:
+def _eligible_for_scrappey(url: str, force: bool = False) -> bool:
     """Return True if this URL should be attempted via Scrappey fallback.
 
     Rules:
-      1. Global flag must be ON.
+      1. Global flag must be ON *or* ``force=True`` (per-call override).
       2. Per-process cap must not be exceeded.
       3. Host must NOT be in the non-content denylist.
       4. Any host that passes rules 1-3 is eligible (no allowlist restriction).
+
+    The ``force`` flag lets callers (e.g. the composition harvester) enable
+    Scrappey for a specific request without flipping the global env default,
+    keeping other callers' behaviour unchanged.
     """
     global _scrappey_call_count
-    if not _scrappey_fallback_enabled():
+    if not force and not _scrappey_fallback_enabled():
         return False
     cap = _scrappey_max()
     if _scrappey_call_count >= cap:
@@ -323,6 +327,7 @@ async def _try_scrappey_fallback(
     url: str,
     reason: str,
     timeout: int,
+    force: bool = False,
 ) -> Optional[httpx.Response]:
     """Attempt to bypass a block/unusable result via the Scrappey browser.
 
@@ -333,10 +338,14 @@ async def _try_scrappey_fallback(
 
     The ``reason`` string is logged for observability (e.g. "HTTP 403",
     "short body (120 chars)", "block marker in 200").
+
+    ``force=True`` bypasses the global ``URL_FETCHER_SCRAPPEY_FALLBACK`` env
+    flag so per-call callers (e.g. the composition harvester) can opt-in
+    without changing the global default.
     """
     global _scrappey_call_count
 
-    if not _eligible_for_scrappey(url):
+    if not _eligible_for_scrappey(url, force=force):
         return None
 
     # Dead-domain check: skip paid Scrappey call if this domain is known dead.
@@ -455,6 +464,7 @@ async def _get_with_retry(
     url: str,
     timeout: int = DEFAULT_TIMEOUT,
     extra_headers: Optional[dict] = None,
+    force_scrappey: bool = False,
 ) -> Optional[httpx.Response]:
     """
     Perform an HTTP GET with retry + exponential backoff on transient errors.
@@ -470,6 +480,10 @@ async def _get_with_retry(
 
     Returns the Response on success, None on final failure.
     Respects Retry-After header on 429.
+
+    ``force_scrappey=True`` activates the Scrappey tier even when the global
+    ``URL_FETCHER_SCRAPPEY_FALLBACK`` env flag is OFF.  This allows per-call
+    opt-in (e.g. the composition harvester) without affecting other callers.
     """
     headers = dict(_HEADERS)
     if extra_headers:
@@ -494,7 +508,7 @@ async def _get_with_retry(
                     resp.status_code, url,
                 )
                 fb = await _try_scrappey_fallback(
-                    url, f"HTTP {resp.status_code}", timeout
+                    url, f"HTTP {resp.status_code}", timeout, force=force_scrappey
                 )
                 if fb is not None:
                     return fb
@@ -530,7 +544,7 @@ async def _get_with_retry(
                     "fetch 200 with block marker for %r — trying Scrappey", url
                 )
                 fb = await _try_scrappey_fallback(
-                    url, "block marker in 200", timeout
+                    url, "block marker in 200", timeout, force=force_scrappey
                 )
                 return fb  # None is fine (fail-closed)
 
@@ -540,7 +554,7 @@ async def _get_with_retry(
                     len(body), url,
                 )
                 fb = await _try_scrappey_fallback(
-                    url, f"short body ({len(body)} chars)", timeout
+                    url, f"short body ({len(body)} chars)", timeout, force=force_scrappey
                 )
                 if fb is not None:
                     return fb
@@ -578,7 +592,7 @@ async def _get_with_retry(
             _RETRY_ATTEMPTS, url, err_desc,
         )
         fb = await _try_scrappey_fallback(
-            url, f"exhausted retries ({err_desc})", timeout
+            url, f"exhausted retries ({err_desc})", timeout, force=force_scrappey
         )
         if fb is not None:
             return fb
@@ -832,11 +846,20 @@ def _extract_ozon_props(obj: dict, parts: list[str], depth: int = 0) -> None:
 # Generic
 # ---------------------------------------------------------------------------
 
-async def fetch_url_content(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optional[FetchResult]:
+async def fetch_url_content(
+    url: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    force_scrappey: bool = False,
+) -> Optional[FetchResult]:
     """
     Generic HTTPS-only fetch with main-content extraction.
     Uses trafilatura if available, otherwise falls back to basic HTML stripping.
     Retries on transient errors; returns cached result on repeated calls.
+
+    ``force_scrappey=True`` enables the Scrappey proxy tier for this specific
+    call even when the global ``URL_FETCHER_SCRAPPEY_FALLBACK`` env flag is
+    OFF.  Other callers are unaffected.  Intended for the composition harvester
+    which needs Scrappey as an IP-shielding layer on open (non-walled) sites.
     """
     if not url.startswith("https://"):
         logger.warning("fetch_url_content: rejected non-HTTPS URL %r", url)
@@ -848,7 +871,7 @@ async def fetch_url_content(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optiona
         return FetchResult(url=url, content=cached, source_type="generic")
 
     try:
-        resp = await _get_with_retry(url, timeout=timeout)
+        resp = await _get_with_retry(url, timeout=timeout, force_scrappey=force_scrappey)
         if resp is None:
             return None
         html = resp.text
