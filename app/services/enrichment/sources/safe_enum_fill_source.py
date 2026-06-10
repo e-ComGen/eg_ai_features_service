@@ -396,11 +396,13 @@ class SafeEnumFillSource(AttributeSource):
         system_prompt = (
             "You are a product attribute expert. For each target attribute below, "
             "propose the SINGLE best-matching value from its allowed_values list. "
-            "Only propose a value when you are CONFIDENT it is correct for THIS specific "
-            "product (given the title, brand, and category). "
-            "If you are uncertain → DO NOT include that attribute in your response. "
-            "Better to skip than guess. Never invent values not in the allowed_values list. "
-            "Return 'fills' list with {attribute_id, value, reasoning}."
+            "Propose a value when it is PLAUSIBLY SUPPORTED by the product title, brand, "
+            "category, or product type — an obvious default for the product type counts as "
+            "confident (e.g. a running shoe → Тип пронации=Нейтральная, a summer dress → "
+            "Сезон=Лето). "
+            "Skip only when GENUINELY UNCERTAIN — do not skip just because the value is "
+            "not explicitly stated in the title. Never invent values not in the allowed_values "
+            "list. Return 'fills' list with {attribute_id, value, reasoning}."
             + build_meta_guidance()
             + already_rule
         )
@@ -483,16 +485,20 @@ class SafeEnumFillSource(AttributeSource):
 
         system_prompt = (
             "You are a strict product-data auditor. For each proposed attribute fill, "
-            "decide: is this value CLEARLY CORRECT for THIS specific product given its "
-            "title and brand? Your default answer is NOT_CONFIRMED — only confirm when "
-            "the value is obviously and specifically true for this product.\n\n"
+            "decide: is this value correct for this product? Your default answer is "
+            "NOT_CONFIRMED — only confirm when the value is clearly correct or strongly "
+            "implied for this product.\n\n"
             "Rules:\n"
-            "- If the value is a generic/household guess not specific to this product → NOT_CONFIRMED.\n"
-            "- If the value could apply to many products of this category but is not "
-            "specifically evidenced for this one → NOT_CONFIRMED.\n"
-            "- If the value contradicts the product's identity (e.g. a fabric type that "
-            "conflicts with what this brand/model is known for) → NOT_CONFIRMED.\n"
-            "- Only CONFIRMED when the value is unambiguously characteristic of THIS product.\n"
+            "- CONFIRM when the value is clearly correct for this product, OR is a "
+            "well-known default for this product TYPE (e.g. Нейтральная pronation for "
+            "a general running shoe, Взрослая audience for an adult product) — "
+            "well-known product-type defaults are fine to confirm.\n"
+            "- NOT_CONFIRMED when the value is WRONG or contradicted by product knowledge "
+            "(e.g. Бязь fabric for denim jeans, для дома purpose for outdoor jeans).\n"
+            "- NOT_CONFIRMED when the value is a baseless random guess with no connection "
+            "to the product type, brand, or category.\n"
+            "- Default to NOT_CONFIRMED only when genuinely uncertain — do not retract "
+            "values that are sensible defaults for the product type.\n"
             "Return 'verifications' list: {attribute_id, verdict: 'CONFIRMED'|'NOT_CONFIRMED'}."
         )
 

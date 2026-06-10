@@ -378,3 +378,136 @@ class TestSafeEnumFillSource:
 
         # Adversarial failed → nothing confirmed → empty (fail-closed)
         assert results == []
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # New tests for loosened prompts (Gate B now confirms product-type defaults)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_b_mud_still_retracted_after_loosening(self):
+        """SAFETY: Лevi's 501 Материал=Бязь / Назначение=для дома still RETRACTED.
+
+        This is the critical mud-gate test. The loosened Gate B prompt must NOT
+        let obviously-wrong fabric/purpose values through for denim jeans.
+        """
+        material_target = _target(4496, "Материал", ["Бязь", "Деним", "Вельвет", "Хлопок"])
+        purpose_target = _target(5001, "Назначение", [
+            "для дома", "для улицы", "для спорта", "для работы"
+        ])
+        ctx = _ctx("Джинсы мужские Levi's 501 Original прямые", brand="Levi's")
+
+        proposal = _proposal_response([
+            {"attribute_id": 4496, "value": "Бязь", "reasoning": "fabric"},
+            {"attribute_id": 5001, "value": "для дома", "reasoning": "casual use"},
+        ])
+        # Adversarial must retract both — wrong values for denim jeans
+        adversarial = _adversarial_response([
+            {"attribute_id": 4496, "verdict": "NOT_CONFIRMED"},
+            {"attribute_id": 5001, "verdict": "NOT_CONFIRMED"},
+        ])
+        llm_mock = _mock_llm([proposal, adversarial])
+
+        source = SafeEnumFillSource(llm_manager=llm_mock)
+        results = await source.extract(
+            ctx, [material_target, purpose_target], source_text=None
+        )
+
+        assert results == [], f"MUD leaked through Gate B: {results}"
+        assert llm_mock.structured_request.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_adidas_ultraboost_pronation_confirmed(self):
+        """Adidas Ultraboost 22: Тип пронации=Нейтральная → CONFIRMED via Gate B.
+
+        A well-known product-type default for a neutral running shoe must be
+        accepted by the loosened adversarial prompt.
+        """
+        pronation_target = _target(9001, "Тип пронации", [
+            "Нейтральная", "Гиперпронация", "Супинация"
+        ])
+        ctx = _ctx(
+            "Кроссовки Adidas Ultraboost 22 беговые мужские",
+            brand="Adidas",
+            product_id=200,
+        )
+        ctx.category_path = ["Обувь", "Кроссовки", "Беговые кроссовки"]
+
+        proposal = _proposal_response([
+            {"attribute_id": 9001, "value": "Нейтральная",
+             "reasoning": "standard running shoe default pronation type"}
+        ])
+        # Adversarial CONFIRMS — Нейтральная is the correct/default for this shoe
+        adversarial = _adversarial_response([
+            {"attribute_id": 9001, "verdict": "CONFIRMED"},
+        ])
+        llm_mock = _mock_llm([proposal, adversarial])
+
+        source = SafeEnumFillSource(llm_manager=llm_mock)
+        results = await source.extract(ctx, [pronation_target], source_text=None)
+
+        assert len(results) == 1
+        av = results[0]
+        assert av.attribute_id == 9001
+        assert av.value == "Нейтральная"
+        assert _EVIDENCE_PREFIX_ADVERSARIAL in (av.evidence or "")
+
+    @pytest.mark.asyncio
+    async def test_adidas_ultraboost_audience_confirmed(self):
+        """Adidas Ultraboost 22: Целевая аудитория=Взрослая → CONFIRMED via Gate B."""
+        audience_target = _target(9002, "Целевая аудитория", [
+            "Взрослая", "Детская", "Подростковая"
+        ])
+        ctx = _ctx(
+            "Кроссовки Adidas Ultraboost 22 беговые мужские",
+            brand="Adidas",
+            product_id=201,
+        )
+
+        proposal = _proposal_response([
+            {"attribute_id": 9002, "value": "Взрослая",
+             "reasoning": "adult running shoe"}
+        ])
+        adversarial = _adversarial_response([
+            {"attribute_id": 9002, "verdict": "CONFIRMED"},
+        ])
+        llm_mock = _mock_llm([proposal, adversarial])
+
+        source = SafeEnumFillSource(llm_manager=llm_mock)
+        results = await source.extract(ctx, [audience_target], source_text=None)
+
+        assert len(results) == 1
+        assert results[0].value == "Взрослая"
+        assert _EVIDENCE_PREFIX_ADVERSARIAL in (results[0].evidence or "")
+
+    @pytest.mark.asyncio
+    async def test_summer_dress_season_proposed_and_confirmed(self):
+        """Summer dress: Сезон=Лето → proposed + confirmed via Gate B.
+
+        The proposal LLM should propose Лето (obvious product-type default)
+        and Gate B should confirm it.
+        """
+        season_target = _target(3001, "Сезон", ["Весна", "Лето", "Осень", "Зима", "Демисезон"])
+        ctx = _ctx(
+            "Платье летнее женское лёгкое сарафан",
+            brand="Zara",
+            product_id=300,
+        )
+        ctx.category_path = ["Одежда", "Платья"]
+
+        proposal = _proposal_response([
+            {"attribute_id": 3001, "value": "Лето",
+             "reasoning": "летнее платье — obvious season"}
+        ])
+        adversarial = _adversarial_response([
+            {"attribute_id": 3001, "verdict": "CONFIRMED"},
+        ])
+        llm_mock = _mock_llm([proposal, adversarial])
+
+        source = SafeEnumFillSource(llm_manager=llm_mock)
+        results = await source.extract(ctx, [season_target], source_text=None)
+
+        assert len(results) == 1
+        av = results[0]
+        assert av.attribute_id == 3001
+        assert av.value == "Лето"
+        assert _EVIDENCE_PREFIX_ADVERSARIAL in (av.evidence or "")
