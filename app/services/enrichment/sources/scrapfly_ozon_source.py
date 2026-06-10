@@ -326,6 +326,9 @@ class ScrapflyOzonSource(AttributeSource):
         logger.info("[ScrapflyOzon] search query: '%s' (product: '%s')", query, full_name[:60])
 
         # ---- Step 1: Search ----
+        # Pass the raw query string (with spaces); scrapfly_client.py encodes the entire
+        # target URL via urllib.parse.urlencode(..., quote_via=quote), producing %20 for
+        # spaces in the url= param. Pre-encoding here would cause double-encoding (%2520).
         search_result = await scrapfly_fetch(
             f"{_OZON_SEARCH_URL}?text={query}",
             render_js=True,
@@ -381,10 +384,15 @@ class ScrapflyOzonSource(AttributeSource):
         )
 
         # ---- Step 3: Features page fetch ----
+        # wait_for_selector ensures Scrapfly captures the page AFTER the
+        # webCharacteristics widget has fully rendered in the DOM. Without it,
+        # Ozon's lazy-loading SPA may not have hydrated the characteristics section
+        # yet when the snapshot is taken, causing both parsers to return 0 results.
         features_url = f"{_OZON_PRODUCT_BASE}{slug}-{pid}/features/"
         features_result = await scrapfly_fetch(
             features_url,
             render_js=True,
+            wait_for_selector="[data-widget='webCharacteristics']",
         )
         if not features_result.success or not features_result.content:
             logger.info(
