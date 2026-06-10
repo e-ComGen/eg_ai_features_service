@@ -489,6 +489,28 @@ def _basket_nn_from_table(nm_id: int) -> str:
     return _BASKET_DEFAULT
 
 
+def _build_wb_article_query(article: str, brand: Optional[str]) -> str:
+    """Строит Serper-запрос, ПРИВЯЗАННЫЙ к артикулу производителя.
+
+    Когда у товара известен артикул (vendor code), поиск по артикулу
+    значительно точнее поиска по названию: артикул — уникальный код модели,
+    которому соответствует ровно одна WB-карточка (или ни одной).
+
+    Запрос: ``"<article>" <brand> wildberries``  (бренд — опционально, если
+    известен). Кавычки вокруг артикула обязательны — без них Serper разбивает
+    код на токены и находит посторонние карточки.
+
+    Пример:
+      article="501-0065", brand="Levi's"
+      → ``"501-0065" Levi's wildberries``
+    """
+    parts: list[str] = [f'"{article.strip()}"']
+    if brand and brand.strip():
+        parts.append(brand.strip())
+    parts.append("wildberries")
+    return " ".join(parts)
+
+
 def _build_wb_query(
     full_name: str,
     brand: Optional[str],
@@ -680,11 +702,92 @@ class WbCardSource(AttributeSource):
         context: ExtractionContext,
         targets: list[TargetAttribute],
     ) -> list[AttributeValue]:
-        """Полный flow: compress → Serper(nm_id) → CDN card.json → pick → map → AVs."""
+        """Полный flow: compress → Serper(nm_id) → CDN card.json → pick → map → AVs.
+
+        Когда ``context.article`` задан (артикул производителя), сначала
+        пробуем article-anchored поиск (``_build_wb_article_query``) — он
+        значительно точнее поиска по названию. Если article-запрос даёт nm_id
+        И карточка проходит тип-гейт и матч-порог → используем её. Если нет
+        (нет nm_id, 404 CDN, карточка не прошла гейт/порог) → падаем на
+        существующий title-based flow. Поведение при отсутствии article —
+        НЕИЗМЕННО (title search только).
+        """
         full_name = context.product_name.strip()
         cat_leaf = context.category_path[-1] if context.category_path else None
         # Целевой тип товара (лемма) — для query-builder и тип-гейта при выборе.
         target_type = _target_type_lemma(full_name, cat_leaf)
+
+        # ---- ARTICLE-ANCHORED PATH (только если article задан) ----
+        article = (context.article or "").strip()
+        if article:
+            article_query = _build_wb_article_query(article, context.brand)
+            logger.info(
+                "[WbCard] article='%s' → article-anchored query: '%s'",
+                article, article_query,
+            )
+            article_nm_ids = await self._search(article_query)
+            if article_nm_ids:
+                async with httpx.AsyncClient(
+                    timeout=_HTTP_TIMEOUT,
+                    follow_redirects=True,
+                    headers={"User-Agent": _CHROME_UA},
+                ) as client:
+                    article_cards: list[tuple[int, dict]] = []
+                    for nm_id in article_nm_ids:
+                        card = await self._fetch_card(client, nm_id)
+                        if card:
+                            article_cards.append((nm_id, card))
+                            if len(article_cards) >= _MAX_FETCHED_CARDS:
+                                break
+
+                if article_cards:
+                    best = self._pick_best_card(
+                        article_query, cat_leaf, target_type, article_cards
+                    )
+                    if best is not None:
+                        nm_id, card, title, score = best
+                        mode = self._classify_match(score)
+                        if mode != "skip":
+                            logger.info(
+                                "[WbCard] article-path: match=%s score=%.1f "
+                                "title='%s' nm=%s",
+                                mode, score, title[:80], nm_id,
+                            )
+                            chars = self._extract_options(card)
+                            if chars:
+                                new_image_urls = self._extract_image_urls(card, nm_id)
+                                if new_image_urls:
+                                    existing = set(context.image_urls or [])
+                                    added = [u for u in new_image_urls if u not in existing]
+                                    if added:
+                                        context.image_urls = list(context.image_urls or []) + added
+                                return self._map_characteristics(
+                                    chars, targets, context, mode, title, score, card,
+                                )
+                        else:
+                            logger.info(
+                                "[WbCard] article-path: best score=%.1f < %.0f — "
+                                "falling back to title search",
+                                score, _BRAND_LINE_THRESHOLD,
+                            )
+                    else:
+                        logger.info(
+                            "[WbCard] article-path: тип-гейт отбраковал все карточки "
+                            "— falling back to title search"
+                        )
+                else:
+                    logger.info(
+                        "[WbCard] article-path: CDN 404 для всех nm_id — "
+                        "falling back to title search"
+                    )
+            else:
+                logger.info(
+                    "[WbCard] article-path: 0 nm_id для article='%s' — "
+                    "falling back to title search",
+                    article,
+                )
+
+        # ---- TITLE-BASED PATH (оригинальный, неизменный) ----
         primary_query = _build_wb_query(
             full_name, context.brand, cat_leaf, max_tokens=5
         )

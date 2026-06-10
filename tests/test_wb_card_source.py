@@ -13,16 +13,18 @@ Covers two diagnosed bugs (no live API — collaborators mocked):
 
 import httpx
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.enrichment.sources.wb_card_source import (
     WbCardSource,
     _build_wb_query,
+    _build_wb_article_query,
     _wb_query_type_word,
     _target_type_lemma,
     _type_lemma,
     _lemma,
     _SERPER_MAX_ATTEMPTS,
+    _BRAND_LINE_THRESHOLD,
 )
 
 
@@ -299,3 +301,258 @@ async def test_transient_429_still_retries():
 
     assert result == []
     assert client.search.await_count == _SERPER_MAX_ATTEMPTS
+
+
+# ---------------------------------------------------------------------------
+# Article-anchored WB lookup — STEP 2 tests
+# ---------------------------------------------------------------------------
+
+# ---- Unit: _build_wb_article_query ----
+
+def test_article_query_contains_quoted_article():
+    """Article is quoted so Serper does not tokenise it."""
+    q = _build_wb_article_query("501-0065", "Levi's")
+    assert '"501-0065"' in q
+
+
+def test_article_query_contains_brand_when_present():
+    q = _build_wb_article_query("ABC-123", "Nike")
+    assert "Nike" in q
+    assert "wildberries" in q.lower()
+
+
+def test_article_query_no_brand_still_has_wildberries():
+    q = _build_wb_article_query("ABC-123", None)
+    assert '"ABC-123"' in q
+    assert "wildberries" in q.lower()
+    # No extra spaces from the missing brand
+    assert "  " not in q
+
+
+def test_article_query_blank_brand_treated_as_none():
+    q_none = _build_wb_article_query("X1", None)
+    q_blank = _build_wb_article_query("X1", "   ")
+    assert q_none == q_blank
+
+
+# ---- Integration: _do_extract with article ----
+
+def _make_context(article=None, product_name="Куртка Nike Resolve", brand="Nike",
+                  category_path=None):
+    """Build a minimal ExtractionContext for tests."""
+    from app.services.enrichment.base import ExtractionContext
+    return ExtractionContext(
+        product_id=1,
+        product_name=product_name,
+        category_id=100,
+        category_path=category_path or ["Одежда", "Куртки"],
+        brand=brand,
+        article=article,
+    )
+
+
+def _make_target(attr_id=10, name="Цвет"):
+    from app.services.enrichment.base import TargetAttribute
+    return TargetAttribute(id=attr_id, name=name, type="text")
+
+
+def _fake_card(nm_id: int, subj_name: str = "Куртки", imt_name: str = "Nike Resolve",
+               options=None) -> dict:
+    """Minimal WB card.json dict that passes type-gate for 'куртк*'."""
+    return {
+        "nm_id": nm_id,
+        "subj_name": subj_name,
+        "subj_root_name": subj_name,
+        "imt_name": imt_name,
+        "selling": {"brand_name": "Nike"},
+        "options": options or [{"name": "Цвет", "value": "Чёрный"}],
+    }
+
+
+class _FakeSearchResults:
+    def __init__(self, organic):
+        self.organic_results = organic
+
+
+class _FakeSearchOrganic:
+    def __init__(self, link):
+        self.link = link
+
+
+def _wb_link(nm_id: int) -> str:
+    return f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx"
+
+
+@pytest.mark.asyncio
+async def test_article_path_taken_when_article_present():
+    """When context.article is set, the first Serper call uses article query.
+
+    Verifies the article-anchored path fires BEFORE the title-based path
+    and that the resulting AttributeValues are returned.
+    """
+    nm_id = 123456789
+
+    search_client = MagicMock()
+    search_client.search = AsyncMock(
+        return_value=_FakeSearchResults([_FakeSearchOrganic(_wb_link(nm_id))])
+    )
+    src = _make_source(search_client)
+
+    card = _fake_card(nm_id)
+    ctx = _make_context(article="501-0065")
+    target = _make_target()
+
+    # Patch _fetch_card to return our fake card for nm_id=123456789, else None.
+    async def fake_fetch(client, fetched_nm_id):
+        return card if fetched_nm_id == nm_id else None
+
+    with patch.object(src, "_fetch_card", side_effect=fake_fetch):
+        result = await src._do_extract(ctx, [target])
+
+    # The article query was fired (first search call must contain the article).
+    first_call_query = search_client.search.call_args_list[0][0][0]
+    assert '"501-0065"' in first_call_query, (
+        f"First Serper query should be article-anchored; got: {first_call_query!r}"
+    )
+    # At least one AttributeValue returned (card had Цвет).
+    assert result, "Expected non-empty result from article-path card"
+
+
+@pytest.mark.asyncio
+async def test_no_article_uses_title_search_only():
+    """When context.article is None, only the title-based path runs.
+
+    The search query must NOT contain a double-quoted article token.
+    """
+    nm_id = 987654321
+
+    search_client = MagicMock()
+    search_client.search = AsyncMock(
+        return_value=_FakeSearchResults([_FakeSearchOrganic(_wb_link(nm_id))])
+    )
+    src = _make_source(search_client)
+
+    card = _fake_card(nm_id)
+    ctx = _make_context(article=None)
+    target = _make_target()
+
+    async def fake_fetch(client, fetched_nm_id):
+        return card if fetched_nm_id == nm_id else None
+
+    import app.services.enrichment.sources.wb_card_source as mod
+    orig_sleep = mod.asyncio.sleep
+    mod.asyncio.sleep = AsyncMock()
+    try:
+        with patch.object(src, "_fetch_card", side_effect=fake_fetch):
+            await src._do_extract(ctx, [target])
+    finally:
+        mod.asyncio.sleep = orig_sleep
+
+    # All search calls must be title-based (no quoted article in any query).
+    for call in search_client.search.call_args_list:
+        q = call[0][0]
+        assert '"' not in q, (
+            f"Title-search query must not contain quoted article; got: {q!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_article_path_falls_back_to_title_when_zero_nm_ids():
+    """Article search returns 0 nm_ids → fall back to title search.
+
+    The second search call (title-based) is made, and its result is used.
+    """
+    title_nm_id = 111222333
+
+    call_count = [0]
+
+    async def side_effect(query, **kwargs):
+        call_count[0] += 1
+        if '"' in query:
+            # Article query — return empty
+            return _FakeSearchResults([])
+        # Title query — return a real card link
+        return _FakeSearchResults([_FakeSearchOrganic(_wb_link(title_nm_id))])
+
+    search_client = MagicMock()
+    search_client.search = AsyncMock(side_effect=side_effect)
+    src = _make_source(search_client)
+
+    card = _fake_card(title_nm_id)
+    ctx = _make_context(article="NOTFOUND-99")
+    target = _make_target()
+
+    import app.services.enrichment.sources.wb_card_source as mod
+    orig_sleep = mod.asyncio.sleep
+    mod.asyncio.sleep = AsyncMock()
+    try:
+        async def fake_fetch(client, fetched_nm_id):
+            return card if fetched_nm_id == title_nm_id else None
+
+        with patch.object(src, "_fetch_card", side_effect=fake_fetch):
+            result = await src._do_extract(ctx, [target])
+    finally:
+        mod.asyncio.sleep = orig_sleep
+
+    # Title search must have been tried (call_count >= 2: article attempt + title attempt).
+    assert call_count[0] >= 2, (
+        f"Expected >=2 search calls (article + title fallback); got {call_count[0]}"
+    )
+    # Result comes from the title-path card.
+    assert result, "Expected non-empty result from title-path fallback"
+
+
+@pytest.mark.asyncio
+async def test_article_path_rejects_wrong_type_card_and_falls_back():
+    """Article search returns a card of the WRONG type (e.g. шорты vs куртка).
+
+    The wrong-type card must be rejected by the type-gate; flow falls back
+    to the title-based path (which in this test also returns nothing, so
+    the final result is empty — NOT the wrong card).
+    """
+    wrong_nm_id = 444555666
+
+    call_count = [0]
+
+    async def side_effect(query, **kwargs):
+        call_count[0] += 1
+        if '"' in query:
+            return _FakeSearchResults([_FakeSearchOrganic(_wb_link(wrong_nm_id))])
+        # Title fallback: no results (simplifies assertion).
+        return _FakeSearchResults([])
+
+    search_client = MagicMock()
+    search_client.search = AsyncMock(side_effect=side_effect)
+    src = _make_source(search_client)
+
+    # Wrong type: article query returned шорты, but target is куртка.
+    wrong_card = _fake_card(
+        wrong_nm_id,
+        subj_name="Шорты",
+        imt_name="Nike Shorts",
+        options=[{"name": "Цвет", "value": "Синий"}],
+    )
+
+    import app.services.enrichment.sources.wb_card_source as mod
+    orig_sleep = mod.asyncio.sleep
+    mod.asyncio.sleep = AsyncMock()
+    try:
+        async def fake_fetch(client, fetched_nm_id):
+            return wrong_card if fetched_nm_id == wrong_nm_id else None
+
+        with patch.object(src, "_fetch_card", side_effect=fake_fetch):
+            result = await src._do_extract(
+                _make_context(article="ART-999"),
+                [_make_target()],
+            )
+    finally:
+        mod.asyncio.sleep = orig_sleep
+
+    # The wrong card must NOT have been accepted.
+    assert result == [], (
+        "Wrong-type card from article-path must be rejected; result should be []"
+    )
+    # Fallback was attempted (at least 2 search calls: article + title).
+    assert call_count[0] >= 2, (
+        f"Expected >=2 calls (article + title fallback); got {call_count[0]}"
+    )
