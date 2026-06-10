@@ -22,6 +22,35 @@ def norm(attr_name: str, raw: str) -> str:
 # Observed real cases from eval run
 # ---------------------------------------------------------------------------
 
+class TestTrailingUnitStrip:
+    """Trailing bare SI unit stripped when attr name encodes the same unit."""
+
+    def test_cord_length_m(self):
+        """'1,2 m' for attr 'Длина шнура, м' → '1.2'."""
+        result = norm("Длина шнура, м", "1,2 m")
+        assert result == "1.2"
+
+    def test_charge_time_min(self):
+        """'50 min' for attr 'Время зарядки до 100%, мин' → '50'."""
+        result = norm("Время зарядки до 100%, мин", "50 min")
+        assert result == "50"
+
+    def test_already_bare_number_unchanged(self):
+        """'785' for attr with known unit → stays '785' (no unit to strip)."""
+        result = norm("Частота обновления, Гц", "785")
+        assert result == "785"
+
+    def test_dimension_pair_mm_unchanged(self):
+        """'0,2331 x 0,2331 mm' for мм attr → unchanged (multi-value guard)."""
+        result = norm("Пиксельный шаг, мм", "0,2331 x 0,2331 mm")
+        assert result == "0,2331 x 0,2331 mm"
+
+    def test_incompatible_unit_value_passthrough(self):
+        """'1.2 kg' for attr 'Длина шнура, м' → unchanged (no m←kg conversion)."""
+        result = norm("Длина шнура, м", "1.2 kg")
+        assert result == "1.2 kg"
+
+
 class TestObservedRealCases:
     """The exact specimens from the task description."""
 
