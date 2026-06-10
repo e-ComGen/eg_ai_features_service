@@ -46,6 +46,7 @@ from app.services.enrichment.base import (
     TargetAttribute,
 )
 from app.services.enrichment.judges.icecat_judge import IceCatJudge
+from app.services.enrichment.sources.icecat_numeric_normalizer import normalize_icecat_numeric
 
 logger = logging.getLogger(__name__)
 
@@ -731,9 +732,17 @@ class IceCatSource(AttributeSource):
                 continue  # уже заполнили этот target
 
             used_target_ids.add(matched_target.id)
+            # Normalize numeric values: strip units, convert if needed
+            # (e.g. "6,3 kg" → "6.3", "68,6 cm (27\")" → "27", "165 Hz" → "165")
+            normalized_value = normalize_icecat_numeric(matched_target.name, value)
+            if normalized_value != value:
+                logger.debug(
+                    "[IceCat] numeric normalize: attr=%r raw=%r → %r",
+                    matched_target.name, value, normalized_value,
+                )
             results.append(AttributeValue(
                 attribute_id=matched_target.id,
-                value=value,
+                value=normalized_value,
                 confidence=_ICECAT_CONFIDENCE,
                 source=Source.ICECAT,
                 evidence=f"icecat:{icecat_name}={value}",
