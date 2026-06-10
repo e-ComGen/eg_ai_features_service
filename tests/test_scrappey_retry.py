@@ -150,9 +150,12 @@ async def test_ozon_scrappey_fetch_gives_up_after_max_attempts(caplog):
 # ---------------------------------------------------------------------------
 
 def test_ozon_retry_constants_are_sensible():
-    """Per-attempt timeout and max attempts must give a sane total budget."""
-    # 2 attempts × 30s + backoff = ~62s < 80s total cap.
-    assert _SCRAPPEY_PER_ATTEMPT_TIMEOUT == 30.0
+    """Per-attempt timeout and max attempts must give a sane total budget.
+
+    Timeouts were cut 80→45s total, 30→18s per-attempt (2026-06 fail-fast change).
+    2 attempts × 18s + 2s backoff = 38s worst-case Scrappey path < 45s total cap.
+    """
+    assert _SCRAPPEY_PER_ATTEMPT_TIMEOUT == 18.0
     assert _SCRAPPEY_MAX_ATTEMPTS == 2
     worst_case = _SCRAPPEY_MAX_ATTEMPTS * _SCRAPPEY_PER_ATTEMPT_TIMEOUT + 2.0  # + 1 backoff
     from app.services.enrichment.sources.ozon_card_source import _OZON_CARD_TOTAL_TIMEOUT

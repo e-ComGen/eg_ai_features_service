@@ -83,16 +83,25 @@ _HTTP_TIMEOUT = 30.0   # httpx-level fallback cap (belt-and-suspenders).
                        # asyncio.wait_for, so 30s keeps both layers consistent.
 
 # Fail-fast retry constants for Scrappey proxy calls.
-# Scrappey hangs are transient: a single stuck proxy absorbs the full old 60s budget.
-# With 30s per attempt + 1 retry we still get two fair shots while limiting worst-case
-# to ~62s (30 + 2s backoff + 30), well inside the 80s total cap.
-_SCRAPPEY_PER_ATTEMPT_TIMEOUT = 30.0  # asyncio.wait_for per Scrappey call
+# Rationale for the 45s total cap (down from 80s):
+#   In the last eval, Ozon Scrappey consistently hung to the FULL old timeout and it
+#   was the Serper-snippet fallback (not the Scrappey card) that actually recovered the
+#   data. So the old 80s budget was being wasted waiting for a dead proxy path before
+#   reaching the fallback that works. Cutting to 45s means we fail to Serper ~35s faster
+#   with essentially no quality loss — the fallback quality is identical to what the eval
+#   was actually delivering.
+# Budget breakdown: 18s × 2 attempts = 36s Scrappey + 2s backoff = 38s worst-case
+#   Scrappey path, leaving 7s margin before the 45s total fires. Serper has its own 15s
+#   timeout and is called AFTER the total fires, so it runs outside this budget — the
+#   total cap only gates the Scrappey path itself.
+_SCRAPPEY_PER_ATTEMPT_TIMEOUT = 18.0  # asyncio.wait_for per Scrappey call (was 30s)
 _SCRAPPEY_MAX_ATTEMPTS = 2            # 1 attempt + 1 retry on timeout/empty-block
 
-_OZON_CARD_TOTAL_TIMEOUT = 80.0  # Hard cap on the entire _do_extract (Scrappey path
-                                  # + Serper fallback). 2×30s Scrappey + 2s backoff +
-                                  # up to 15s Serper = ~47s typical worst-case, 80s cap
-                                  # leaves comfortable headroom without the old 90s hang.
+_OZON_CARD_TOTAL_TIMEOUT = 45.0  # Hard cap on the entire _do_extract (Scrappey path).
+                                  # 2×18s Scrappey + 2s backoff = 38s worst-case, fits
+                                  # well under 45s cap. On timeout, falls through to the
+                                  # Serper-snippet fallback which is what the eval showed
+                                  # actually recovers the data when Scrappey hangs.
 
 # Regex для парсинга
 _PRODUCT_LINK_RE = re.compile(
