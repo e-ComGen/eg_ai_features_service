@@ -48,6 +48,7 @@ from collections import OrderedDict
 from typing import Any, Optional, Union
 
 import httpx
+import numpy as np
 
 from app.services.enrichment.base import (
     AttributeSource,
@@ -72,6 +73,7 @@ from app.services.enrichment.sources.ozon_card_source import (
 )
 from app.services.enrichment.strategies.dictionaries.ozon_loader import (
     get_ozon_characteristics_for_type,
+    get_matcher,
     resolve_value_id,
 )
 from app.services.enrichment.strategies.dictionaries.eg_wb_ozon_field_map import (
@@ -319,6 +321,15 @@ _CONF_GENDER_DOWNWEIGHT = 0.40
 
 _EXACT_THRESHOLD = 78.0
 _BRAND_LINE_THRESHOLD = 60.0
+
+# Semantic attr-name fallback (step 5 of _map_characteristics).
+# Cosine similarity threshold for WB char name ↔ Ozon target attr name.
+# 0.82 was chosen so that semantically equivalent but differently-phrased
+# names match ("Объём чаши"↔"Объём", "Мощность, Вт"↔"Потребляемая мощность")
+# while unrelated attribute names (similarity typically < 0.65) are rejected.
+# Tie guard: if top-2 candidates are within this margin, DROP (ambiguous).
+_SEMANTIC_ATTR_THRESHOLD = 0.82
+_SEMANTIC_ATTR_TIE_MARGIN = 0.05
 
 # Skip-guard
 _SKIP_FILL_RATIO = 0.80
@@ -581,6 +592,60 @@ def _card_url(nn: str, nm_id: int) -> str:
         f"https://basket-{nn}.wbbasket.ru"
         f"/vol{vol}/part{part}/{nm_id}/info/ru/card.json"
     )
+
+
+def _semantic_attr_name_match(
+    wb_char_name: str,
+    target_names: list[str],
+) -> Optional[int]:
+    """Return the index into *target_names* whose embedding is closest to
+    *wb_char_name*, or None when no candidate clears the conservative threshold
+    or when two candidates tie within the tie-margin (ambiguous → DROP).
+
+    Uses the module-level MatcherService singleton from ozon_loader so no
+    second sentence-transformers model is loaded.  Returns None when the matcher
+    is unavailable (sentence-transformers not installed) so callers degrade
+    gracefully.
+    """
+    if not wb_char_name or not target_names:
+        return None
+    matcher = get_matcher()
+    if matcher is None:
+        return None
+    try:
+        wb_vec = matcher.get_embedding(wb_char_name)
+        # Batch-encode only names not yet in the matcher's cache.
+        missing = [n for n in target_names if n not in matcher.vector_cache]
+        if missing:
+            batch_vecs = matcher.model.encode(
+                missing, convert_to_numpy=True, batch_size=256,
+            )
+            for text, vec in zip(missing, batch_vecs):
+                matcher.vector_cache[text] = vec
+
+        target_vecs = np.array([matcher.vector_cache[n] for n in target_names])
+        # Cosine similarity: dot(wb, t) / (||wb|| * ||t||).
+        wb_norm = wb_vec / (np.linalg.norm(wb_vec) + 1e-9)
+        target_norms = target_vecs / (
+            np.linalg.norm(target_vecs, axis=1, keepdims=True) + 1e-9
+        )
+        sims = target_norms @ wb_norm  # shape (N,)
+
+        best_idx = int(np.argmax(sims))
+        best_sim = float(sims[best_idx])
+
+        if best_sim < _SEMANTIC_ATTR_THRESHOLD:
+            return None
+
+        # Tie guard: if second-best is within TIE_MARGIN, result is ambiguous.
+        second_sim = float(np.partition(sims, -2)[-2]) if len(sims) > 1 else 0.0
+        if best_sim - second_sim < _SEMANTIC_ATTR_TIE_MARGIN:
+            return None
+
+        return best_idx
+    except Exception as exc:
+        logger.debug("[WbCard] semantic attr-name fallback failed: %s", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1431,6 +1496,13 @@ class WbCardSource(AttributeSource):
             fuzz = None
             all_target_names = []
 
+        # Semantic fallback (step 5): one representative name per target,
+        # using the original display-case name for better embeddings.
+        # Built once per _map_characteristics call; indexed in sync with
+        # _semantic_target_ids so we can round-trip index → target_id.
+        _semantic_target_names: list[str] = [t.name for t in targets]
+        _semantic_target_ids: list[int] = [t.id for t in targets]
+
         target_by_id: dict[int, TargetAttribute] = {t.id: t for t in targets}
 
         # Verified WB→Ozon field map (eg-importer). Имя WB-характеристики →
@@ -1493,6 +1565,23 @@ class WbCardSource(AttributeSource):
                 )
                 if best is not None and best[1] >= 88:
                     target_id = name_to_target_id[best[0]]
+
+            # 5) Semantic fallback: embedding cosine-sim on attr NAMES.
+            #    Only for chars that survived all previous steps unresolved.
+            #    Threshold _SEMANTIC_ATTR_THRESHOLD (0.82) + tie-guard ensure
+            #    "Объём чаши"↔"Объём" maps while unrelated pairs drop.
+            if target_id is None and _semantic_target_names:
+                sem_idx = _semantic_attr_name_match(char_name, _semantic_target_names)
+                if sem_idx is not None:
+                    candidate_id = _semantic_target_ids[sem_idx]
+                    if candidate_id not in used_ids:
+                        target_id = candidate_id
+                        logger.debug(
+                            "[WbCard] semantic attr-name match: '%s' → '%s' (id=%d)",
+                            char_name,
+                            _semantic_target_names[sem_idx],
+                            candidate_id,
+                        )
 
             if target_id is None or target_id in used_ids:
                 continue

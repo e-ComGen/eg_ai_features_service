@@ -1,16 +1,17 @@
-"""Unit tests for WbCardSource query-building and search retry behavior.
+"""Unit tests for WbCardSource query-building, search retry behavior,
+and WB→Ozon attribute-name semantic fallback.
 
-Covers two diagnosed bugs (no live API — collaborators mocked):
+Covers:
 
-  BUG 1 — indeclinable-noun garments ("Худи", "Пальто") break the type-word:
-    pymorphy3 parses them as non-nouns, so the old noun-gate dropped the garment
-    type and the name-scan picked a feature word ("молния"). Fix: when a category
-    leaf exists, trust the leaf's first significant token UNCONDITIONALLY.
-
-  BUG 2 — permanent 4xx (Serper "Not enough credits" → HTTP 400) must fail fast
-    (exactly ONE attempt, no backoff), while transient errors still retry.
+  BUG 1 — indeclinable-noun garments ("Худи", "Пальто") break the type-word.
+  BUG 2 — permanent 4xx (Serper "Not enough credits" → HTTP 400) must fail fast.
+  FEAT  — semantic attr-name fallback (step 5): name-different but meaning-equal
+           WB chars (e.g. "Объём чаши") resolve to the correct Ozon target via
+           embedding cosine-similarity; unrelated chars DROP; already-matched
+           chars bypass the fallback entirely.
 """
 
+import numpy as np
 import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -556,3 +557,176 @@ async def test_article_path_rejects_wrong_type_card_and_falls_back():
     assert call_count[0] >= 2, (
         f"Expected >=2 calls (article + title fallback); got {call_count[0]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Semantic attr-name fallback (step 5 of _map_characteristics)
+# ---------------------------------------------------------------------------
+
+def _make_extraction_context(**kwargs):
+    """Build a minimal ExtractionContext for _map_characteristics unit tests."""
+    from app.services.enrichment.base import ExtractionContext
+    defaults = dict(
+        product_id=1,
+        product_name="Блендер мощный",
+        category_id=100,
+        category_path=[],
+        brand=None,
+    )
+    defaults.update(kwargs)
+    return ExtractionContext(**defaults)
+
+
+def _make_target_attr(attr_id: int, name: str):
+    from app.services.enrichment.base import TargetAttribute
+    return TargetAttribute(id=attr_id, name=name, type="text")
+
+
+def _fake_matcher_high_sim(query_name: str, target_names: list[str]) -> int | None:
+    """Mock for _semantic_attr_name_match that returns index 0 always (high similarity)."""
+    return 0
+
+
+def _fake_matcher_low_sim(query_name: str, target_names: list[str]) -> int | None:
+    """Mock for _semantic_attr_name_match that always returns None (low similarity)."""
+    return None
+
+
+class _FakeSearchClientNoop(MagicMock):
+    """Search client that should never be called in _map_characteristics unit tests."""
+
+
+def _make_src() -> "WbCardSource":
+    from app.services.enrichment.sources.wb_card_source import WbCardSource
+    return WbCardSource(web_search_client=_FakeSearchClientNoop())
+
+
+def test_semantic_fallback_maps_meaning_equal_but_name_different_char():
+    """WB 'Объём чаши' has no exact/substring/fuzzy≥88 match but the Ozon target
+    is 'Объём' — semantic fallback (mocked to return index 0) resolves it.
+    """
+    import app.services.enrichment.sources.wb_card_source as mod
+
+    src = _make_src()
+    ctx = _make_extraction_context()
+    targets = [_make_target_attr(42, "Объём")]
+    chars = [{"name": "Объём чаши", "value": "2 л"}]
+
+    with (
+        patch.object(mod, "_semantic_attr_name_match", side_effect=_fake_matcher_high_sim),
+        patch(
+            "app.services.enrichment.sources.wb_card_source.get_ozon_characteristics_for_type",
+            return_value=[],
+        ),
+        patch(
+            "app.services.enrichment.sources.wb_card_source.eg_get_field_map",
+            return_value={},
+        ),
+        patch(
+            "app.services.enrichment.sources.wb_card_source.resolve_value_id",
+            return_value=None,
+        ),
+    ):
+        result = src._map_characteristics(
+            chars=chars,
+            targets=targets,
+            context=ctx,
+            mode="exact",
+            title="Блендер мощный",
+            score=90.0,
+        )
+
+    assert len(result) == 1, (
+        f"Semantic fallback must resolve 'Объём чаши'→'Объём'; got {result}"
+    )
+    assert result[0].attribute_id == 42
+    assert result[0].value == "2 л"
+
+
+def test_semantic_fallback_drops_unrelated_char():
+    """WB 'Артикул производителя' (low similarity to 'Объём') must be DROPPED,
+    not mis-mapped, when the semantic matcher returns None.
+    """
+    import app.services.enrichment.sources.wb_card_source as mod
+
+    src = _make_src()
+    ctx = _make_extraction_context()
+    targets = [_make_target_attr(42, "Объём")]
+    chars = [{"name": "Артикул производителя", "value": "BL-1234"}]
+
+    with (
+        patch.object(mod, "_semantic_attr_name_match", side_effect=_fake_matcher_low_sim),
+        patch(
+            "app.services.enrichment.sources.wb_card_source.get_ozon_characteristics_for_type",
+            return_value=[],
+        ),
+        patch(
+            "app.services.enrichment.sources.wb_card_source.eg_get_field_map",
+            return_value={},
+        ),
+        patch(
+            "app.services.enrichment.sources.wb_card_source.resolve_value_id",
+            return_value=None,
+        ),
+    ):
+        result = src._map_characteristics(
+            chars=chars,
+            targets=targets,
+            context=ctx,
+            mode="exact",
+            title="Блендер мощный",
+            score=90.0,
+        )
+
+    assert result == [], (
+        f"Unrelated char must be DROPPED (semantic fallback returned None); got {result}"
+    )
+
+
+def test_semantic_fallback_not_invoked_when_already_matched():
+    """A char 'Объём' that exactly matches target 'Объём' resolves at step 2
+    (exact name), so the semantic fallback must NOT be called.
+    """
+    import app.services.enrichment.sources.wb_card_source as mod
+
+    src = _make_src()
+    ctx = _make_extraction_context()
+    targets = [_make_target_attr(42, "Объём")]
+    # char name matches target name exactly → resolved at step 2, no fallback needed
+    chars = [{"name": "Объём", "value": "2 л"}]
+
+    call_tracker = {"called": False}
+
+    def tracking_fallback(wb_char_name, target_names):
+        call_tracker["called"] = True
+        return None
+
+    with (
+        patch.object(mod, "_semantic_attr_name_match", side_effect=tracking_fallback),
+        patch(
+            "app.services.enrichment.sources.wb_card_source.get_ozon_characteristics_for_type",
+            return_value=[],
+        ),
+        patch(
+            "app.services.enrichment.sources.wb_card_source.eg_get_field_map",
+            return_value={},
+        ),
+        patch(
+            "app.services.enrichment.sources.wb_card_source.resolve_value_id",
+            return_value=None,
+        ),
+    ):
+        result = src._map_characteristics(
+            chars=chars,
+            targets=targets,
+            context=ctx,
+            mode="exact",
+            title="Блендер мощный",
+            score=90.0,
+        )
+
+    assert not call_tracker["called"], (
+        "Semantic fallback must NOT be called when char was already matched at steps 1-4"
+    )
+    assert len(result) == 1, "Exact-match char must still be resolved"
+    assert result[0].attribute_id == 42
