@@ -255,7 +255,7 @@ class TestSafeEnumFillSource:
         assert av.attribute_id == 6001
         assert av.value == "Мужчины"
         assert _EVIDENCE_PREFIX_ADVERSARIAL in (av.evidence or "")
-        assert av.source == Source.LLM_KNOWLEDGE
+        assert av.source == Source.SAFE_ENUM_FILL
         assert llm_mock.structured_request.call_count == 2  # proposal + adversarial
 
     @pytest.mark.asyncio

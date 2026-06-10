@@ -55,6 +55,7 @@ class Source(StrEnum):
     OZON_CARD = "ozon_card"             # копия характеристик из live-карточки Ozon (через Apify ozon-scraper-pro)
     WB_CARD = "wb_card"                 # копия характеристик из live-карточки Wildberries (открытое API, без Scrappey)
     UGC = "ugc"                         # отзывы + Q&A с Ozon/WB (user-generated, реальные пользователи)
+    SAFE_ENUM_FILL = "safe_enum_fill"   # gated LLM fill: short optional enum, двойной Gate (verbatim + adversarial)
 
 
 # Source priority при tie-break (если confidence равна).
@@ -70,6 +71,7 @@ SOURCE_PRIORITY: dict[Source, int] = {
     Source.COMPETITOR_RAG: 2,      # реальные Ozon-карточки с модерацией
     Source.UGC: 2,                 # отзывы реальных покупателей — обычно про конкретный товар, но noisy
     Source.LLM_KNOWLEDGE: 1,       # общие знания
+    Source.SAFE_ENUM_FILL: 1,      # gated LLM enum fill — уровень знаний, но двойной gate
 }
 
 
@@ -85,6 +87,7 @@ SOURCE_CONFIDENCE_THRESHOLDS: dict[Source, float] = {
     Source.VISION: 0.85,
     Source.COMPETITOR_RAG: 0.80,   # consensus из реальных Ozon-листингов — высокая точность
     Source.UGC: 0.75,              # отзывы/Q&A — шумные, низкий порог, всегда через judge
+    Source.SAFE_ENUM_FILL: 0.82,   # gated LLM fill — adversarial guard, но всё равно LLM-инференс
 }
 
 

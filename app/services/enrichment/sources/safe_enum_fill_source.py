@@ -234,7 +234,7 @@ class SafeEnumFillSource(AttributeSource):
 
     @property
     def source_type(self) -> Source:
-        return Source.LLM_KNOWLEDGE  # semantically it is LLM knowledge, gated
+        return Source.SAFE_ENUM_FILL
 
     def is_applicable(self, context: ExtractionContext, target: TargetAttribute) -> bool:
         return bool(context.product_name) and _is_short_enum(target)
@@ -259,6 +259,10 @@ class SafeEnumFillSource(AttributeSource):
             every candidate goes through Gate B.
         """
         if not targets or not context.product_name:
+            logger.info(
+                "[SafeEnumFill] product=%s: skipped — no targets or no product_name",
+                context.product_id,
+            )
             return []
 
         # Only operate on short optional enums not yet filled
@@ -266,18 +270,33 @@ class SafeEnumFillSource(AttributeSource):
             t for t in filter_already_filled_targets(targets, already_filled or [])
             if _is_short_enum(t)
         ]
+        logger.info(
+            "[SafeEnumFill] product=%s: %d raw targets → %d short-enum optional "
+            "targets after filter (source_text=%s)",
+            context.product_id,
+            len(targets),
+            len(effective_targets),
+            "present" if source_text else "ABSENT",
+        )
         if not effective_targets:
             return []
 
         # ── Step 1: Proposal ──────────────────────────────────────────────────
         proposals = await self._propose_fills(context, effective_targets, already_filled or [])
         if not proposals:
+            logger.info(
+                "[SafeEnumFill] SUMMARY product=%s: targets=%d proposed=0 — LLM skipped "
+                "all targets (uncertain / targets were already filled in effective filter). "
+                "gate_a_pass=0 gate_b_confirmed=0 gate_b_retracted=0 accepted=0",
+                context.product_id,
+                len(effective_targets),
+            )
             return []
 
-        logger.debug(
-            "[SafeEnumFill] %d proposals before gating for product %s",
-            len(proposals),
+        logger.info(
+            "[SafeEnumFill] product=%s: %d proposals received from LLM (before gating)",
             context.product_id,
+            len(proposals),
         )
 
         # ── Step 2: Gate A — verbatim evidence ────────────────────────────────
@@ -294,6 +313,11 @@ class SafeEnumFillSource(AttributeSource):
                     prop.attribute_id, prop.value,
                 )
             else:
+                reason = "no source_text" if not source_text else "value not literally in text"
+                logger.info(
+                    "[SafeEnumFill] Gate A MISS: attr=%s value=%r (%s) → going to Gate B",
+                    prop.attribute_id, prop.value, reason,
+                )
                 need_adversarial.append(prop)
 
         # ── Step 3: Gate B — adversarial verify (batched) ────────────────────
@@ -325,7 +349,7 @@ class SafeEnumFillSource(AttributeSource):
                 attribute_id=prop.attribute_id,
                 value=prop.value,
                 confidence=_FILL_CONFIDENCE,
-                source=Source.LLM_KNOWLEDGE,
+                source=Source.SAFE_ENUM_FILL,
                 evidence=f"{_EVIDENCE_PREFIX_VERBATIM}: {prop.reasoning or ''}".strip(": "),
                 semantic_type=t.semantic_type if t else None,
                 is_collection=t.is_collection if t else False,
@@ -337,20 +361,22 @@ class SafeEnumFillSource(AttributeSource):
                 attribute_id=prop.attribute_id,
                 value=prop.value,
                 confidence=_FILL_CONFIDENCE,
-                source=Source.LLM_KNOWLEDGE,
+                source=Source.SAFE_ENUM_FILL,
                 evidence=f"{_EVIDENCE_PREFIX_ADVERSARIAL}: {prop.reasoning or ''}".strip(": "),
                 semantic_type=t.semantic_type if t else None,
                 is_collection=t.is_collection if t else False,
             ))
 
         logger.info(
-            "[SafeEnumFill] product=%s: %d proposed, %d verbatim, %d adversarial, "
-            "%d retracted (mud blocked)",
+            "[SafeEnumFill] SUMMARY product=%s: targets=%d proposed=%d "
+            "gate_a_pass=%d gate_b_confirmed=%d gate_b_retracted=%d accepted=%d",
             context.product_id,
+            len(effective_targets),
             len(proposals),
             len(verbatim_passed),
             len(adversarial_passed),
             len(need_adversarial) - len(adversarial_passed),
+            len(results),
         )
         return results
 
@@ -499,8 +525,8 @@ class SafeEnumFillSource(AttributeSource):
         return confirmed
 
     def get_judge(self) -> LlmJudge:
-        # Reuse the KnowledgeJudge — the adversarial gate already is a specialized
+        # Reuse the KnowledgeJudge — the adversarial gate already acts as a specialized
         # judge; the ConfidenceAwareJudgeWrapper will call KnowledgeJudge only for
-        # values below SOURCE_CONFIDENCE_THRESHOLDS[LLM_KNOWLEDGE].
+        # values below SOURCE_CONFIDENCE_THRESHOLDS[SAFE_ENUM_FILL].
         from app.services.enrichment.judges.knowledge_judge import KnowledgeJudge
         return KnowledgeJudge()
