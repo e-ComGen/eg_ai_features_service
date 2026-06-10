@@ -35,6 +35,7 @@ from app.services.enrichment.sources import (
     UgcSource,
     TnvedSource,
     YandexMarketSource,
+    ScrapflyOzonSource,
 )
 from app.services.enrichment.sources.ozon_card_source import (
     _extract_gender_signal,
@@ -888,6 +889,234 @@ def _apply_brand_from_name(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Brand-from-title LLM: constrained LLM extraction for brand when deterministic
+# parser misses it (two-word category nouns: "Умная колонка Яндекс"→Яндекс).
+# ---------------------------------------------------------------------------
+_BRAND_FROM_TITLE_LLM_EVIDENCE = "brand_from_title_llm"
+_BRAND_FROM_TITLE_LLM_CONF = 0.88
+
+# Safety: maximum brand options to pass in the LLM prompt.
+# Huge brand dicts (123k) will be truncated; deterministic path handles those
+# via dict scan. LLM path is primarily for the "title has brand but needle
+# grabbed the category noun" case — a small working set is sufficient and safe.
+_BRAND_FROM_TITLE_LLM_MAX_OPTIONS = 200
+
+
+async def _apply_brand_from_title_llm(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+    context: ExtractionContext,
+    brand_options_fn: Optional[Callable[[int], list[str]]] = None,
+    brand_id_fn: Optional[Callable[[int], dict[str, int]]] = None,
+) -> list[AttributeValue]:
+    """POST-merge ASYNC brand filler: LLM picks brand from TITLE, constrained to enum.
+
+    Runs ONLY for brand targets that are STILL EMPTY after _apply_brand_from_name.
+    Scenario: "Умная колонка Яндекс Станция Мини 2" — the positional parser set
+    context.brand="колонка" (category noun, correctly rejected by needle guard).
+    The dict scan also misses Яндекс when it's absent from the first 5000 brands.
+    This LLM call bridges that gap.
+
+    Safety constraints (fail-closed — «пусто честнее мусора»):
+      1. TITLE-ANCHORED: the prompt explicitly forbids returning a brand not present
+         in the title. Returned value must pass _brand_in_name / _needle_brand_in_name
+         token check → drop if fails (empty > wrong).
+      2. ENUM-CONSTRAINED: the prompt receives the official allowed-brand list and
+         must return one of those values or null. Value not in the options list → drop.
+      3. NULL allowed: LLM returns null → field stays empty. No forced fills.
+      4. CATEGORY-NOUN GUARD: returned value is checked via _is_category_noun_brand;
+         category nouns are rejected even if LLM returns them.
+      5. Source=DESCRIPTION, evidence="brand_from_title_llm": naturally bypasses
+         _BRAND_GUESS_SOURCES guard (which only blocks VISION/WEB_SEARCH/
+         LLM_KNOWLEDGE/COMPETITOR_RAG). The DESCRIPTION source is authoritative
+         by convention — we are reading the product TITLE, not inferring from
+         world knowledge.
+      6. General LLM brand guessing (LLM_KNOWLEDGE source) remains DROPPED as
+         before. This path is exempt ONLY because it is title-anchored and
+         enum-constrained, not because we loosened the general guard.
+
+    value_id is resolved synchronously via brand_id_fn (same exact-match as
+    _apply_brand_from_name); brand survives drain-C (required-enum drop on None id).
+    """
+    # Lazy import to avoid circular deps and keep LLM import at call site only.
+    from pydantic import BaseModel as _PydanticBase, Field as _Field
+
+    brand_targets: dict[int, TargetAttribute] = {}
+    for t in targets:
+        if t.id == _BRAND_TARGET_ATTR_ID or _is_brand_target_name(t.name):
+            brand_targets[t.id] = t
+    if not brand_targets:
+        return merged
+
+    # Only act on targets STILL EMPTY after prior deterministic brand fill.
+    filled_attr_ids: set[int] = {v.attribute_id for v in merged}
+
+    name = (context.product_name or "").strip()
+    if not name:
+        return merged
+    name_tokens = _brand_norm_tokens(name)
+    if not name_tokens:
+        return merged
+
+    all_cat_words = _all_category_words(context.category_path)
+
+    # Collect (attr_id, options_list) pairs that still need filling.
+    pending: list[tuple[int, list[str]]] = []
+    for attr_id, t in brand_targets.items():
+        if attr_id in filled_attr_ids:
+            continue  # already filled by deterministic path
+
+        options = list(t.allowed_values or [])
+
+        # Prefer the full dict list for truncated enums (same logic as _apply_brand_from_name).
+        _BRAND_MAX_INLINE = 100
+        if brand_options_fn is not None and len(options) <= _BRAND_MAX_INLINE:
+            try:
+                full_opts = list(brand_options_fn(attr_id) or [])
+                if len(full_opts) > len(options):
+                    options = full_opts
+            except Exception as exc:
+                logger.warning(
+                    "[Pipeline] brand-from-title-llm: brand list unavailable for attr %s: %s",
+                    attr_id, exc,
+                )
+
+        if not options:
+            continue  # No enum to constrain against — skip (anti-hallucination).
+
+        pending.append((attr_id, options))
+
+    if not pending:
+        return merged
+
+    # One LLM call per pending brand target (usually exactly 1).
+    out = list(merged)
+    llm = get_main_manager()
+
+    for attr_id, options in pending:
+        # Truncate to a safe size to keep prompt concise.
+        options_for_prompt = options[:_BRAND_FROM_TITLE_LLM_MAX_OPTIONS]
+        options_str = ", ".join(f'"{o}"' for o in options_for_prompt)
+
+        class _BrandFromTitleResponse(_PydanticBase):
+            brand: Optional[str] = _Field(
+                None,
+                description=(
+                    "Exact brand value from the allowed list that is PRESENT in the title, "
+                    "or null if no allowed brand appears in the title."
+                ),
+            )
+
+        system_prompt = (
+            "You are a brand-extraction assistant. Your ONLY job is to identify which brand "
+            "from the provided ALLOWED LIST is explicitly present in the product title.\n\n"
+            "RULES (non-negotiable):\n"
+            "1. Return a brand ONLY if it literally appears in the title as a word or phrase.\n"
+            "2. Do NOT guess or infer brands from world knowledge. If unsure → return null.\n"
+            "3. The returned value must be EXACTLY one of the allowed values (spelling must match).\n"
+            "4. If zero or multiple allowed brands appear in the title → return null.\n"
+            "5. Category nouns (колонка, книга, машина, печь, телефон, etc.) are NOT brands → null.\n"
+            "6. Return null rather than an incorrect brand. Empty is safer than wrong."
+        )
+        user_text = (
+            f"Product title: {name}\n\n"
+            f"Allowed brands: {options_str}\n\n"
+            "Which single brand from the allowed list appears in this title? "
+            "Return its exact spelling from the list, or null."
+        )
+
+        try:
+            parsed, _ = await llm.structured_request(
+                system_prompt=system_prompt,
+                user_text=user_text,
+                response_model=_BrandFromTitleResponse,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Pipeline] brand-from-title-llm: LLM call failed for attr %s: %s",
+                attr_id, exc,
+            )
+            continue
+
+        context.llm_calls_so_far += 1
+
+        if parsed is None or parsed.brand is None:
+            logger.info(
+                "[Pipeline] brand-from-title-llm: attr %s — LLM returned null for title=%r",
+                attr_id, name[:60],
+            )
+            continue
+
+        brand_raw = str(parsed.brand).strip()
+        if not brand_raw:
+            continue
+
+        # Safety guard 1: returned value must be in the options list (enum constraint).
+        def _norm_cmp(s: str) -> str:
+            return s.strip().lower().replace("ё", "е")
+
+        norm_raw = _norm_cmp(brand_raw)
+        matched_option: Optional[str] = None
+        for opt in options:
+            if _norm_cmp(opt) == norm_raw:
+                matched_option = opt
+                break
+        if matched_option is None:
+            logger.info(
+                "[Pipeline] brand-from-title-llm: attr %s, LLM returned '%s' "
+                "NOT in options list → drop (enum constraint)",
+                attr_id, brand_raw,
+            )
+            continue
+
+        # Safety guard 2: must appear in the title (title-anchored, use needle min-len=2
+        # since these are known brands from the official enum, not arbitrary strings).
+        if not _needle_brand_in_name(matched_option, name_tokens):
+            logger.info(
+                "[Pipeline] brand-from-title-llm: attr %s, '%s' NOT found in title tokens "
+                "→ drop (title-anchored constraint)",
+                attr_id, matched_option,
+            )
+            continue
+
+        # Safety guard 3: category-noun filter (same as needle path).
+        if _is_category_noun_brand(matched_option, all_cat_words):
+            logger.info(
+                "[Pipeline] brand-from-title-llm: attr %s, '%s' is a category noun → drop",
+                attr_id, matched_option,
+            )
+            continue
+
+        # Safety guard 4: adjective/gender noise.
+        b_tokens = _brand_norm_tokens(matched_option)
+        if len(b_tokens) == 1 and (
+            _is_gender_noise_token(b_tokens[0]) or _is_adjective_noise_token(b_tokens[0])
+        ):
+            logger.info(
+                "[Pipeline] brand-from-title-llm: attr %s, '%s' is gender/adj noise → drop",
+                attr_id, matched_option,
+            )
+            continue
+
+        # All guards passed — resolve value_id and emit.
+        vid = _resolve_brand_value_id(matched_option, attr_id, brand_id_fn)
+        logger.info(
+            "[Pipeline] brand-from-title-llm: attr %s ← '%s' (vid=%s) from title=%r",
+            attr_id, matched_option, vid, name[:60],
+        )
+        out.append(AttributeValue(
+            attribute_id=attr_id,
+            value=matched_option,
+            value_id=vid,
+            confidence=_BRAND_FROM_TITLE_LLM_CONF,
+            source=Source.DESCRIPTION,
+            evidence=_BRAND_FROM_TITLE_LLM_EVIDENCE,
+        ))
+
+    return out
+
+
 _TYPE_FROM_CATEGORY_EVIDENCE = "type_from_category"
 
 
@@ -1101,6 +1330,143 @@ def _apply_size_from_name(
             is_collection=True,
             value_id=None,
             value_ids=resolved_ids,
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Spec-from-title: deterministic filler for OPTIONAL enum attrs whose allowed
+# value is literally present (whole token sequence) in the product title.
+# Mirrors _apply_brand_from_name / _apply_type_from_category in spirit.
+# ---------------------------------------------------------------------------
+_SPEC_FROM_TITLE_EVIDENCE = "spec_from_title"
+_SPEC_FROM_TITLE_CONF = 0.90
+# Allowed values shorter than this (in total normalised token chars) are skipped —
+# they produce too many false positives on common short tokens (e.g. "SSD" length 3
+# is the minimum; single tokens < 3 chars are filtered by MIN sum).
+_SPEC_MIN_VALUE_LEN = 3
+
+
+def _spec_value_in_title(
+    value: str,
+    title_tokens: list[str],
+) -> bool:
+    """True if `value` appears as a contiguous normalised token sequence in `title_tokens`.
+
+    Normalisation mirrors _brand_norm_tokens: ё→е, lowercase, only
+    [а-яёa-z0-9]+ tokens. Allowed values shorter than _SPEC_MIN_VALUE_LEN
+    chars (total over all tokens) are rejected to avoid accidental hits on
+    common abbreviations / punctuation remnants.
+    """
+    v_tokens = _brand_norm_tokens(value)
+    if not v_tokens:
+        return False
+    total_len = sum(len(t) for t in v_tokens)
+    if total_len < _SPEC_MIN_VALUE_LEN:
+        return False
+    n = len(v_tokens)
+    for i in range(len(title_tokens) - n + 1):
+        if title_tokens[i : i + n] == v_tokens:
+            return True
+    return False
+
+
+def _apply_spec_from_title(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+    context: ExtractionContext,
+    value_id_fn: Optional[Callable[[int, str], Optional[int]]] = None,
+) -> list[AttributeValue]:
+    """POST-merge filler: fill still-EMPTY optional enum attrs from the product title.
+
+    For each OPTIONAL enum target (has allowed_values) that is still EMPTY after
+    all real sources, scan the normalised product title. If EXACTLY ONE allowed
+    value appears as a whole-token/phrase match → fill it with
+    source=DESCRIPTION, evidence=spec_from_title.
+
+    Mud guards (fail-closed — «пусто честнее мусора»):
+      1. Whole-word/phrase match only (contiguous normalised tokens, NOT arbitrary
+         substring). Uses the same _brand_norm_tokens normalisation (ё→е,
+         case-insensitive, latin+cyrillic+digits only).
+      2. Min value length: ≥ _SPEC_MIN_VALUE_LEN (3) total chars across tokens.
+         Skips trivially short values that could hit by coincidence.
+      3. Ambiguity guard: if ≥2 different allowed values of the same attr both
+         match the title → SKIP that attr entirely (empty > wrong).
+      4. Only fills targets still EMPTY (no existing AttributeValue for that attr_id).
+      5. Only fills OPTIONAL targets (is_required==False). Required fields are
+         handled by _apply_type_from_category + mandatory pipeline stages.
+      6. Only enum targets (allowed_values non-empty). Free-text fields are never
+         touched — they have no allowed_values to match against.
+      7. Never touches brand targets (detected by _is_brand_target_name / id==31) —
+         those are handled by _apply_brand_from_name with dedicated logic.
+
+    Called in _finalize_async AFTER _apply_size_from_name and BEFORE the
+    _drop_unresolved_* guards, so filled values get a chance at value_id resolution.
+    """
+    if not (context.product_name or "").strip():
+        return merged
+
+    title_tokens = _brand_norm_tokens(context.product_name)
+    if not title_tokens:
+        return merged
+
+    # attribute_ids that are already filled (any value present → skip)
+    filled_ids: set[int] = {v.attribute_id for v in merged}
+
+    out = list(merged)
+    for t in targets:
+        # Scope: ONLY optional, ONLY enum (has allowed_values), ONLY empty.
+        if t.is_required:
+            continue
+        if not t.allowed_values:
+            continue
+        if t.id in filled_ids:
+            continue
+        # Brand attrs: leave to _apply_brand_from_name
+        if t.id == _BRAND_TARGET_ATTR_ID or _is_brand_target_name(t.name):
+            continue
+
+        # Find which allowed values match the title as whole-token sequence.
+        hitting: list[str] = [
+            v for v in t.allowed_values
+            if _spec_value_in_title(v, title_tokens)
+        ]
+
+        if not hitting:
+            continue
+
+        if len(hitting) >= 2:
+            # Ambiguity guard: multiple hits → skip (empty > wrong).
+            logger.info(
+                "[Pipeline] spec-from-title: AMBIG attr=%s '%s' — %d values hit title"
+                " %s → skip",
+                t.id, t.name, len(hitting), hitting[:4],
+            )
+            continue
+
+        chosen = hitting[0]
+        vid: Optional[int] = None
+        if value_id_fn is not None:
+            try:
+                vid = value_id_fn(t.id, chosen)
+            except Exception as exc:
+                logger.warning(
+                    "[Pipeline] spec-from-title: value_id для attr %s '%s' "
+                    "недоступен: %s", t.id, chosen, exc,
+                )
+                vid = None
+
+        logger.info(
+            "[Pipeline] spec-from-title: attr=%s '%s' ← '%s' (vid=%s) из title=%r",
+            t.id, t.name, chosen, vid, (context.product_name or "")[:60],
+        )
+        out.append(AttributeValue(
+            attribute_id=t.id,
+            value=chosen,
+            value_id=vid,
+            confidence=_SPEC_FROM_TITLE_CONF,
+            source=Source.DESCRIPTION,
+            evidence=_SPEC_FROM_TITLE_EVIDENCE,
         ))
     return out
 
@@ -1410,6 +1776,7 @@ class PipelineOrchestrator:
         yandex_market_source: Optional[YandexMarketSource] = None,
         ugc_source: Optional[UgcSource] = None,
         tnved_source: Optional[TnvedSource] = None,
+        scrapfly_ozon_source: Optional[ScrapflyOzonSource] = None,
         classifier: Optional[LlmClassifier] = None,
         cost_predictor: Optional[CostPredictor] = None,
         strategy: Optional[MarketplaceStrategy] = None,
@@ -1466,6 +1833,14 @@ class PipelineOrchestrator:
         # Создаётся ОДИН раз → кэш переживает все товары батча.
         # None → по умолчанию создаём инстанс (всегда нужен для Ozon).
         self._tnved: TnvedSource = tnved_source or TnvedSource()
+        # ScrapflyOzonSource: last-resort Ozon card gap-filler via Scrapfly.
+        # Fires ONLY when OzonCardSource (Scrappey) returned 0 results AND
+        # SCRAPFLY_OZON_FALLBACK_ENABLED=true AND there are still-empty targets.
+        # Default: auto-create with env-based config (dormant when flag is off).
+        self._scrapfly_ozon: Optional[ScrapflyOzonSource] = (
+            scrapfly_ozon_source if scrapfly_ozon_source is not None
+            else ScrapflyOzonSource()
+        )
         self._judges: dict[Source, ConfidenceAwareJudgeWrapper] = {
             src: ConfidenceAwareJudgeWrapper(s.get_judge())
             for src, s in self._sources.items()
@@ -1509,6 +1884,16 @@ class PipelineOrchestrator:
             self._judges[Source.UGC] = ConfidenceAwareJudgeWrapper(
                 self._ugc.get_judge()
             )
+        # ScrapflyOzonSource emits Source.OZON_CARD — reuse OZON_CARD judge.
+        # Register ONLY when OZON_CARD judge not already set (ScrapflyOzon is a
+        # last-resort path; OzonCardSource judge takes precedence when present).
+        if (
+            self._scrapfly_ozon is not None
+            and Source.OZON_CARD not in self._judges
+        ):
+            self._judges[Source.OZON_CARD] = ConfidenceAwareJudgeWrapper(
+                self._scrapfly_ozon.get_judge()
+            )
         self._classifier = classifier or LlmClassifier()
         self._cost_predictor = cost_predictor or CostPredictor()
         self._finisher = FinishingExtractor(sources=list(self._sources.values()))
@@ -1530,6 +1915,9 @@ class PipelineOrchestrator:
         all_values: list[AttributeValue] = []
         # filled_so_far — накапливаем high-confidence AVs для skip-filled кооперации
         filled_so_far: list[AttributeValue] = []
+        # Track whether OzonCardSource (Scrappey) returned ≥1 values this run.
+        # ScrapflyOzonSource gate (a): skip if Scrappey already got the card.
+        _ozon_card_obtained: bool = False
 
         # Stage 0: DescriptionSource (always first, cheapest)
         new_avs = await self._run_stage(Source.DESCRIPTION, context, targets)
@@ -1568,6 +1956,8 @@ class PipelineOrchestrator:
             new_avs = await self._run_ozon_card_stage(
                 context, remaining, already_filled=filled_so_far,
             )
+            if new_avs:
+                _ozon_card_obtained = True
             all_values += new_avs
             filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
             remaining = self._remaining_targets(targets, all_values)
@@ -1783,6 +2173,24 @@ class PipelineOrchestrator:
                 )
                 all_values += new_avs
 
+        # Stage 4.6: ScrapflyOzonSource — last-resort Ozon card gap-filler via Scrapfly.
+        # Fires ONLY when:
+        #   (a) _ozon_card_obtained=False (Scrappey got nothing this run), AND
+        #   (b) there are still-empty target attributes (remaining > 0), AND
+        #   (c) SCRAPFLY_OZON_FALLBACK_ENABLED=true (env flag).
+        # Cost: 60 credits/product (30 search + 30 features). Default: OFF.
+        if self._scrapfly_ozon is not None:
+            remaining_for_scrapfly = self._remaining_targets(targets, all_values)
+            if remaining_for_scrapfly and not _ozon_card_obtained:
+                new_avs = await self._run_scrapfly_ozon_stage(
+                    context,
+                    remaining_for_scrapfly,
+                    already_filled=filled_so_far,
+                    ozon_card_obtained=_ozon_card_obtained,
+                )
+                all_values += new_avs
+                filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
+
         # Stage 4.7: TnvedSource — per-category резолвер ТН ВЭД ЕАЭС.
         # Запускается после всех товарных sources: кэш по category_id уже тёплый
         # если несколько товаров одной категории обрабатываются параллельно.
@@ -1927,6 +2335,17 @@ class PipelineOrchestrator:
         finalized = self._finalize(filtered_values, targets, context)
         resolved = await self._strategy.llm_resolve_tail(finalized, targets, context)
 
+        # Brand-from-title LLM: AFTER brand-from-name (deterministic, already ran inside
+        # _finalize) and AFTER llm_resolve_tail, but BEFORE drop-guards. Only fires when
+        # brand targets are STILL EMPTY — deterministic path wins when it succeeds.
+        # Exempt from _BRAND_GUESS_SOURCES guard: emits Source.DESCRIPTION (title-read),
+        # not Source.LLM_KNOWLEDGE (world-knowledge). Title-anchored + enum-constrained.
+        resolved = await _apply_brand_from_title_llm(
+            resolved, targets, context,
+            brand_options_fn=lambda attr_id: self._strategy.brand_value_options(attr_id, context),
+            brand_id_fn=lambda attr_id: self._strategy.brand_value_id_options(attr_id, context),
+        )
+
         # Type-from-category: ПОСЛЕ brand-from-name/gender/llm_resolve_tail, но ДО
         # drop-guard. Category leaf — это И ЕСТЬ тип товара; заполняем ПУСТОЙ/нерезолвнутый
         # required enum точным enum-матчем leaf-леммы, привязывая словарный value_id (тем
@@ -1950,6 +2369,21 @@ class PipelineOrchestrator:
             value_id_fn=lambda attr_id, val: self._strategy.resolve_value_ids(
                 AttributeValue(
                     attribute_id=attr_id, value=val, confidence=_SIZE_FROM_NAME_CONF,
+                    source=Source.DESCRIPTION,
+                ),
+                context,
+            ).value_id,
+        )
+
+        # Spec-from-title: deterministic filler for OPTIONAL enum targets still empty
+        # after all real sources. Fills only when EXACTLY ONE allowed value is present
+        # in the product title as a whole-token sequence (ambiguity → skip).
+        # Runs BEFORE drop-guards so filled values get value_id resolution.
+        resolved = _apply_spec_from_title(
+            resolved, targets, context,
+            value_id_fn=lambda attr_id, val: self._strategy.resolve_value_ids(
+                AttributeValue(
+                    attribute_id=attr_id, value=val, confidence=_SPEC_FROM_TITLE_CONF,
                     source=Source.DESCRIPTION,
                 ),
                 context,
@@ -2147,6 +2581,52 @@ class PipelineOrchestrator:
             except Exception as e:
                 logger.warning(
                     "[Pipeline] ugc judge failed for attr %s: %s",
+                    value.attribute_id, e,
+                )
+        return results
+
+    async def _run_scrapfly_ozon_stage(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: Optional[list[AttributeValue]] = None,
+        ozon_card_obtained: bool = False,
+    ) -> list[AttributeValue]:
+        """Run ScrapflyOzonSource — last-resort Ozon card gap-fill via Scrapfly.
+
+        Errors never interrupt the pipeline (return []).
+        Gate (a): ozon_card_obtained=True → source returns [] immediately.
+        Gate (b): no remaining gaps → source returns [] immediately.
+        Gate (c): SCRAPFLY_OZON_FALLBACK_ENABLED env flag → off by default.
+        """
+        if self._scrapfly_ozon is None:
+            return []
+        if not self._scrapfly_ozon.is_applicable(context, targets[0] if targets else None):
+            return []
+        judge_wrapper = self._judges.get(Source.OZON_CARD)
+        try:
+            extracted = await self._scrapfly_ozon.extract(
+                context,
+                targets,
+                already_filled=already_filled,
+                ozon_card_obtained=ozon_card_obtained,
+            )
+        except Exception as e:
+            logger.warning("[Pipeline] scrapfly_ozon source failed: %s", e, exc_info=True)
+            return []
+        if not extracted:
+            return []
+        if judge_wrapper is None:
+            return extracted
+        results: list[AttributeValue] = []
+        for value in extracted:
+            try:
+                judged = await judge_wrapper.maybe_validate(value, context)
+                if judged is not None:
+                    results.append(judged)
+            except Exception as e:
+                logger.warning(
+                    "[Pipeline] scrapfly_ozon judge failed for attr %s: %s",
                     value.attribute_id, e,
                 )
         return results

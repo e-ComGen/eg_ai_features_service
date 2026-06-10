@@ -12,6 +12,7 @@ from .wb_card_source import WbCardSource
 from .ugc_source import UgcSource
 from .tnved_source import TnvedSource
 from .yandex_market_source import YandexMarketSource
+from .scrapfly_ozon_source import ScrapflyOzonSource
 
 __all__ = [
     "DescriptionSource",
@@ -27,4 +28,5 @@ __all__ = [
     "UgcSource",
     "TnvedSource",
     "YandexMarketSource",
+    "ScrapflyOzonSource",
 ]

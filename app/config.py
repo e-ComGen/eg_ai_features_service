@@ -86,6 +86,19 @@ VAGUE_FEATURE_PATTERNS = [
 # Enable via env: USE_NEW_PIPELINE=true (or "1" / "yes").
 USE_NEW_PIPELINE: bool = os.getenv("USE_NEW_PIPELINE", "false").lower() in ("1", "true", "yes")
 
+# ---------------------------------------------------------------------------
+# Scrapfly — last-resort Ozon card gap-filler
+# ---------------------------------------------------------------------------
+# API key: read SCRAPFLY_API_KEY (canonical) or the legacy SCRAPFLY_KEY env var.
+SCRAPFLY_API_KEY: str = os.getenv("SCRAPFLY_API_KEY", "") or os.getenv("SCRAPFLY_KEY", "")
+
+# Feature flag: Scrapfly gap-fill fires ONLY when this env var is set to "true".
+# Default OFF — prevents unexpected credits spend unless explicitly enabled.
+# Enable via env: SCRAPFLY_OZON_FALLBACK_ENABLED=true (or "1" / "yes").
+SCRAPFLY_OZON_FALLBACK_ENABLED: bool = os.getenv(
+    "SCRAPFLY_OZON_FALLBACK_ENABLED", "false"
+).lower() in ("1", "true", "yes")
+
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set in environment (.env)")
 if not INTERNAL_SERVICE_SECRET:
