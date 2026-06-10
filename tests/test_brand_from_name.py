@@ -263,16 +263,39 @@ def test_truncated_brand_multiword_from_dict():
 
 
 def test_allowed_values_preferred_over_dict_when_present():
-    """When target.allowed_values is non-empty, the dict fn is NOT consulted.
+    """Short allowed_values (≤100) → dict fn consulted and used if it has more options.
 
-    Guards the priority order: small enum in the target wins; brand_options_fn
-    (which would raise here) must not be called.
+    Change: brand targets with short allowed_values (e.g. eval-truncated [:50] slice)
+    now consult brand_options_fn for the full dict. If the full dict has more options,
+    it replaces the short slice. The final brand is still chosen by name-match.
+    Champion matches in both the short list and the full dict → result is Champion.
     """
     ctx = _ctx("Толстовка Champion Reverse Weave")
     target = _brand_target(["Champion", "Nike"])
 
+    # brand_options_fn returns the same small set → no upgrade; short list is used.
+    # Still fills Champion correctly from the name.
+    out = _apply_brand_from_name(
+        [], [target], ctx,
+        brand_options_fn=lambda _attr_id: ["Champion", "Nike"],
+    )
+    v = _val_for(out)
+    assert v is not None and v.value == "Champion"
+
+
+def test_large_allowed_values_not_replaced_by_dict():
+    """Large allowed_values (>100 items) are used as-is WITHOUT consulting the dict.
+
+    A target with >100 allowed_values is treated as a real full enum (not truncated).
+    brand_options_fn (which would raise here) must not be called.
+    """
+    ctx = _ctx("Толстовка Champion Reverse Weave")
+    # 101 items → above _BRAND_MAX_INLINE threshold
+    big_allowed = ["Champion"] + ["Brand" + str(i) for i in range(100)]
+    target = _brand_target(big_allowed)
+
     def _boom(_attr_id):
-        raise AssertionError("brand_options_fn must not be called when allowed_values present")
+        raise AssertionError("brand_options_fn must not be called with large allowed_values")
 
     out = _apply_brand_from_name([], [target], ctx, brand_options_fn=_boom)
     v = _val_for(out)
@@ -686,6 +709,234 @@ def test_all_adjective_title_returns_empty():
     target = _brand_target(["Чёрные", "Спортивные", "Прямые"])
     out = _apply_brand_from_name([], [target], ctx)
     assert _val_for(out) is None, "all-adjective title must yield empty, not a descriptor adjective"
+
+
+# ── NEEDLE fallback: context.brand present in name when dict is empty ─────────
+# The static dict returns only first ~5000 brands; many real brands are absent.
+# When the dict (options list) is empty AND context.brand is set AND present in
+# the product name — accept it directly (same _brand_in_name token rules).
+# value_id stays None and is resolved later by resolve_value_ids_async (search API).
+
+
+def test_needle_fallback_fills_brand_when_dict_empty():
+    """NEEDLE: dict empty + context.brand in name → filled from context.brand."""
+    ctx = ExtractionContext(
+        product_id=1,
+        product_name="Кроссовки Nike Air мужские",
+        category_id=1,
+        brand="Nike",  # known from product metadata
+    )
+    target = TargetAttribute(id=_BRAND_ID, name="Бренд", type="enum", allowed_values=[])
+    # brand_options_fn returns [] (truncated dict, brand not in first 5000)
+    out = _apply_brand_from_name(
+        [], [target], ctx,
+        brand_options_fn=lambda attr_id: [],
+    )
+    v = _val_for(out)
+    assert v is not None and v.value == "Nike"
+    assert v.source == Source.DESCRIPTION
+    assert v.evidence == "brand_from_name"
+    assert v.value_id is None  # resolved later by async path
+
+
+def test_needle_fallback_no_options_fn_uses_context_brand():
+    """NEEDLE: no brand_options_fn (no dict) + context.brand in name → filled."""
+    ctx = ExtractionContext(
+        product_id=1,
+        product_name="Джинсы Wrangler Texas",
+        category_id=1,
+        brand="Wrangler",
+    )
+    target = TargetAttribute(id=_BRAND_ID, name="Бренд", type="enum", allowed_values=[])
+    out = _apply_brand_from_name([], [target], ctx)  # no brand_options_fn at all
+    v = _val_for(out)
+    assert v is not None and v.value == "Wrangler"
+    assert v.evidence == "brand_from_name"
+
+
+def test_needle_fallback_brand_not_in_name_stays_empty():
+    """NEEDLE: context.brand is set but NOT in the product name → no fill."""
+    ctx = ExtractionContext(
+        product_id=1,
+        product_name="Кроссовки мужские спортивные",
+        category_id=1,
+        brand="Nike",  # brand set but absent from name
+    )
+    target = TargetAttribute(id=_BRAND_ID, name="Бренд", type="enum", allowed_values=[])
+    out = _apply_brand_from_name(
+        [], [target], ctx,
+        brand_options_fn=lambda attr_id: [],
+    )
+    assert _val_for(out) is None
+
+
+def test_needle_fallback_skipped_when_dict_has_options():
+    """NEEDLE not used when dict returns non-empty options (dict path takes priority)."""
+    ctx = ExtractionContext(
+        product_id=1,
+        product_name="Кроссовки Adidas Ultraboost",
+        category_id=1,
+        brand="Nike",  # context.brand differs from name brand
+    )
+    target = TargetAttribute(id=_BRAND_ID, name="Бренд", type="enum", allowed_values=[])
+    # Dict has options — Adidas matched, NOT Nike (context.brand)
+    out = _apply_brand_from_name(
+        [], [target], ctx,
+        brand_options_fn=lambda attr_id: ["Adidas", "Puma", "Reebok"],
+    )
+    v = _val_for(out)
+    assert v is not None and v.value == "Adidas"  # dict path wins, not needle
+
+
+def test_needle_fallback_none_context_brand_skips():
+    """NEEDLE: context.brand is None → no fill (dict also empty)."""
+    ctx = ExtractionContext(
+        product_id=1,
+        product_name="Кроссовки Nike мужские",
+        category_id=1,
+        brand=None,  # brand unknown
+    )
+    target = TargetAttribute(id=_BRAND_ID, name="Бренд", type="enum", allowed_values=[])
+    out = _apply_brand_from_name(
+        [], [target], ctx,
+        brand_options_fn=lambda attr_id: [],
+    )
+    assert _val_for(out) is None
+
+
+# ── NEEDLE FIX: category-noun guard (MUD prevention) ─────────────────────────
+# When dict is empty, the needle fallback uses context.brand. If context.brand
+# is a category noun (e.g. eval heuristic takes "колонка" from "Умная колонка"),
+# it must be REJECTED — a category type word is not a brand.
+
+
+def test_needle_category_noun_rejected_kolonka():
+    """NEEDLE: 'колонка' (2nd word of 'Умная колонка') is a category noun → EMPTY."""
+    ctx = ExtractionContext(
+        product_id=1,
+        product_name="Умная колонка Яндекс Станция Мини 2",
+        category_id=1,
+        category_path=["Электроника", "Умная колонка"],
+        brand="колонка",  # eval heuristic: words[1] of product name
+    )
+    target = TargetAttribute(id=85, name="Бренд", type="enum", allowed_values=[])
+    out = _apply_brand_from_name(
+        [], [target], ctx,
+        brand_options_fn=lambda attr_id: [],
+    )
+    assert _val_for(out, 85) is None  # rejected: category noun
+
+
+def test_needle_category_noun_rejected_kniga():
+    """NEEDLE: 'книга' from 'Электронная книга PocketBook' → EMPTY (category noun)."""
+    ctx = ExtractionContext(
+        product_id=1,
+        product_name="Электронная книга PocketBook 629 Verse",
+        category_id=1,
+        category_path=["Электроника", "Электронная книга"],
+        brand="книга",  # eval heuristic: words[1]
+    )
+    target = TargetAttribute(id=85, name="Бренд", type="enum", allowed_values=[])
+    out = _apply_brand_from_name(
+        [], [target], ctx,
+        brand_options_fn=lambda attr_id: [],
+    )
+    assert _val_for(out, 85) is None
+
+
+def test_needle_category_noun_rejected_mashina():
+    """NEEDLE: 'машина' from 'Стиральная машина Bosch' → EMPTY (category noun)."""
+    ctx = ExtractionContext(
+        product_id=1,
+        product_name="Стиральная машина Bosch WGG2540MOE",
+        category_id=1,
+        category_path=["Бытовая техника", "Стиральная машина"],
+        brand="машина",
+    )
+    target = TargetAttribute(id=85, name="Бренд", type="enum", allowed_values=[])
+    out = _apply_brand_from_name(
+        [], [target], ctx,
+        brand_options_fn=lambda attr_id: [],
+    )
+    assert _val_for(out, 85) is None
+
+
+def test_needle_category_noun_rejected_pech():
+    """NEEDLE: 'печь' from 'Микроволновая печь Samsung' → EMPTY (category noun)."""
+    ctx = ExtractionContext(
+        product_id=1,
+        product_name="Микроволновая печь Samsung MS23K3513AK",
+        category_id=1,
+        category_path=["Бытовая техника", "Микроволновая печь"],
+        brand="печь",
+    )
+    target = TargetAttribute(id=85, name="Бренд", type="enum", allowed_values=[])
+    out = _apply_brand_from_name(
+        [], [target], ctx,
+        brand_options_fn=lambda attr_id: [],
+    )
+    assert _val_for(out, 85) is None
+
+
+# ── NEEDLE FIX: 2-char brand (LG, HP) must fill ──────────────────────────────
+# context.brand='LG' from "Монитор LG UltraGear" — 'LG' is 2 chars, which was
+# previously rejected by _BRAND_MIN_LEN=3. Needle path now uses _NEEDLE_BRAND_MIN_LEN=2.
+
+
+def test_needle_two_char_brand_lg_fills():
+    """NEEDLE: 'LG' (2 chars) in name + dict empty → fills brand with 'LG'."""
+    ctx = ExtractionContext(
+        product_id=1,
+        product_name="Монитор LG UltraGear 27GP850-B 27 дюймов",
+        category_id=1,
+        category_path=["Электроника", "Мониторы"],
+        brand="LG",
+    )
+    target = TargetAttribute(id=85, name="Бренд", type="enum", allowed_values=[])
+    out = _apply_brand_from_name(
+        [], [target], ctx,
+        brand_options_fn=lambda attr_id: [],
+    )
+    v = _val_for(out, 85)
+    assert v is not None and v.value == "LG"
+    assert v.source.value == "description"
+    assert v.evidence == "brand_from_name"
+
+
+def test_needle_two_char_brand_hp_fills():
+    """NEEDLE: 'HP' (2 chars) in name → fills."""
+    ctx = ExtractionContext(
+        product_id=1,
+        product_name="Ноутбук HP Pavilion 15 Core i5",
+        category_id=1,
+        category_path=["Электроника", "Ноутбуки"],
+        brand="HP",
+    )
+    target = TargetAttribute(id=85, name="Бренд", type="enum", allowed_values=[])
+    out = _apply_brand_from_name(
+        [], [target], ctx,
+        brand_options_fn=lambda attr_id: [],
+    )
+    v = _val_for(out, 85)
+    assert v is not None and v.value == "HP"
+
+
+def test_needle_real_brand_not_category_noun_yandex():
+    """NEEDLE: 'Яндекс' is NOT a category noun for 'Умная колонка' path → fills."""
+    ctx = ExtractionContext(
+        product_id=1,
+        product_name="Умная колонка Яндекс Станция Мини 2",
+        category_id=1,
+        category_path=["Электроника", "Умная колонка"],
+        brand="Яндекс",  # correctly extracted brand
+    )
+    target = TargetAttribute(id=85, name="Бренд", type="enum", allowed_values=[])
+    out = _apply_brand_from_name(
+        [], [target], ctx,
+        brand_options_fn=lambda attr_id: [],
+    )
+    v = _val_for(out, 85)
+    assert v is not None and v.value == "Яндекс"
 
 
 if __name__ == "__main__":

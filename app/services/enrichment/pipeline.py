@@ -480,6 +480,85 @@ def _is_adjective_noise_token(token: str) -> bool:
     return t.endswith(_RU_ADJ_ENDINGS)
 
 
+# Минимальная длина бренда в символах для NEEDLE-пути (менее строгая, чем dict-путь).
+# Dict-путь: ≥3 символов (много шумовых 1-2 буквенных токенов в 123K dict).
+# Needle-путь: ≥2 символов (context.brand — известный бренд из метаданных товара,
+# аббревиатуры LG/HP/JBL легитимны). Суммарная длина токенов кандидата ≥ 2.
+_NEEDLE_BRAND_MIN_LEN = 2
+
+
+def _needle_brand_in_name(brand: str, name_tokens: list[str]) -> bool:
+    """Needle-вариант _brand_in_name с пониженным минимумом длины (≥2 символа).
+
+    Используется ТОЛЬКО в NEEDLE-пути, где brand = context.brand (известный бренд
+    из метаданных, не случайная строка из 123K словаря). Поэтому 2-символьные
+    аббревиатуры (LG, HP, JBL) допустимы — ложняки на 2-символьных токенах
+    маловероятны, если кандидат пришёл из надёжного источника.
+    Логика аналогична _brand_in_name, но без _BRAND_MIN_LEN > 2 ограничения.
+    """
+    b_tokens = _brand_norm_tokens(brand)
+    if not b_tokens:
+        return False
+    # Needle min: ≥ 2 суммарно (блок однобуквенных, пропускаем LG / HP).
+    if sum(len(t) for t in b_tokens) < _NEEDLE_BRAND_MIN_LEN:
+        return False
+    n = len(b_tokens)
+    for i in range(len(name_tokens) - n + 1):
+        if name_tokens[i:i + n] == b_tokens:
+            return True
+    # Canon-fallback: апостроф/дефис-инсенситивный матч (аналогично _brand_in_name).
+    b_canon = _brand_canon_tokens(brand)
+    if b_canon != b_tokens:
+        name_canon = [_punct_collapse_re.sub("", t) for t in name_tokens]
+        nc = len(b_canon)
+        for i in range(len(name_canon) - nc + 1):
+            if name_canon[i:i + nc] == b_canon:
+                return True
+    return False
+
+
+def _all_category_words(category_path: list[str]) -> set[str]:
+    """Нормализованные 5-символьные стеммы ВСЕХ слов category_path (не только leaf).
+
+    Расширяет _category_type_words на полную цепочку категорий: для пути
+    ['Электроника', 'Умные колонки', 'колонка'] вернёт стеммы всех слов
+    из всех узлов — не только leaf. Используется в NEEDLE-гарде чтобы
+    отвергнуть кандидатов типа «колонка», «книга», «машина», «печь» — слова
+    из ЛЮБОГО узла категории-пути, не только листового.
+    Граница ≥ _BRAND_MIN_LEN символов (3) — те же правила, что и type_words.
+    """
+    words: set[str] = set()
+    for node in (category_path or []):
+        for w in _brand_norm_tokens(node):
+            if len(w) >= _BRAND_MIN_LEN:
+                words.add(w[:5])
+    return words
+
+
+def _is_category_noun_brand(brand: str, cat_words: set[str]) -> bool:
+    """True если кандидат-бренд совпадает с категорийным существительным.
+
+    Генеральное правило (без хардкода): кандидат отвергается, если КАЖДЫЙ его
+    нормализованный токен имеет 5-символьный стемм, совпадающий с одним из
+    cat_words (слов из category_path). Односимвольные токены игнорируются.
+    Примеры (cat_path=['Электроника','Умная колонка']):
+      'колонка' → stem='колон' ∈ cat_words → True (отвергнуть)
+      'книга'   → stem='книга' ∈ {'книга'} при path=['Электронная книга'] → True
+      'Яндекс'  → stem='яндек' ∉ cat_words → False (пропустить)
+      'LG'      → stem='lg' ∉ cat_words → False (пропустить)
+    Многословные кандидаты отвергаются только если ВСЕ токены = категорийные
+    (консервативно: «Умная колонка» как бренд — пограничный случай, не блокируем).
+    """
+    if not cat_words:
+        return False
+    b_tokens = _brand_norm_tokens(brand)
+    # Игнорируем короткие токены (1-2 символа) при проверке — не категорийное слово.
+    meaningful = [t for t in b_tokens if len(t) >= _BRAND_MIN_LEN]
+    if not meaningful:
+        return False
+    return all(t[:5] in cat_words for t in meaningful)
+
+
 def _disambiguate_brand_matches(
     matches: list[str],
     name_tokens: list[str],
@@ -634,10 +713,14 @@ def _apply_brand_from_name(
       2. brand_options_fn(attr_id) — ПОЛНЫЙ словарный список (Бренд — огромный
          truncated enum, его allowed_values НЕ переносятся в target; список даёт
          стратегия через словарь). Это закрывает реальный кейс «Бренд» (id 31).
-    Если оба источника пусты — таргет пропускается (нечего матчить).
+      3. NEEDLE fallback (только когда dict пуст): context.brand присутствует в имени
+         — принимаем как единственный кандидат. value_id резолвится async-путём
+         (resolve_value_ids_async → search_value API) — здесь остаётся None.
+    Если все источники пусты — таргет пропускается (нечего матчить).
 
     НИКОГДА не пишет бренд, отсутствующий И в имени, И в списке брендов: B всегда
-    выбирается из списка И присутствует в имени.
+    выбирается из списка И присутствует в имени. В needle-режиме — context.brand
+    проверяется на вхождение в name_tokens теми же правилами (_brand_in_name).
 
     value_id: «Бренд» (id 31) — часто truncated enum (>100k значений), статический
     словарь держит лишь первые 5000, поэтому sync resolve_value_ids в _finalize
@@ -668,42 +751,93 @@ def _apply_brand_from_name(
     resolved_brand: dict[int, str] = {}
     # Привязанный словарный value_id выбранного бренда (exact-матч), если нашёлся.
     resolved_brand_id: dict[int, int] = {}
+    # Порог: если allowed_values содержит ≤ _BRAND_MAX_INLINE брендов, список может
+    # быть усечённым вырезом из truncated enum (напр. eval передаёт first-50 из 123k).
+    # В таком случае ПРЕДПОЧИТАЕМ ПОЛНЫЙ словарь через brand_options_fn.
+    # Маленькие НЕ-brand enum'ы (Тип/Пол/Сезон: ≤50 опций) не затрагиваются, поскольку
+    # brand_targets содержит только brand-таргеты (детект по id==31 или имени).
+    _BRAND_MAX_INLINE = 100  # если allowed_values ≤ 100 → вероятно truncated-срез
+
     for attr_id, t in brand_targets.items():
         # Полный список брендов: target.allowed_values (мелкий enum) ИЛИ словарь.
         options = list(t.allowed_values or [])
-        if not options and brand_options_fn is not None:
+
+        # Если allowed_values коротко (≤ _BRAND_MAX_INLINE) — это почти наверняка
+        # усечённый срез из truncated-enum (Бренд: 123k записей). Запрашиваем
+        # ПОЛНЫЙ список через brand_options_fn; если он возвращает больше опций —
+        # используем его (гарантирует нахождение Nike/Adidas/... вне first-50 среза).
+        if brand_options_fn is not None and len(options) <= _BRAND_MAX_INLINE:
             try:
-                options = list(brand_options_fn(attr_id) or [])
+                full_opts = list(brand_options_fn(attr_id) or [])
+                if len(full_opts) > len(options):
+                    options = full_opts
             except Exception as exc:  # словарь недоступен — не падаем, пропускаем
                 logger.warning(
                     "[Pipeline] brand-from-name: словарный список брендов для attr %s "
                     "недоступен: %s", attr_id, exc,
                 )
-                options = []
-        if not options:
-            continue
-        matches = [b for b in options if _brand_in_name(str(b), name_tokens)]
-        # Бренд-aware дизамбигуация ДО подсчёта: containment-collapse + дроп
-        # гендер/тип-шума (фейковые «бренды» в enum «Бренд в одежде»: футболка,
-        # Мужская, NORTH ⊂ The North Face). Дедуп по норм-форме внутри.
-        real = _disambiguate_brand_matches(matches, name_tokens, type_words)
-        if len(real) == 1:
-            chosen = real[0]
-            resolved_brand[attr_id] = chosen
-            # Привязка словарного value_id выбранного бренда ТОЧНЫМ матчем. «Бренд» —
-            # truncated enum: sync resolve_value_ids в _finalize часто не находит id
-            # (нет в первых 5000 словаря) → бренд дропается. Берём id из той же
-            # {value:id}-карты словаря, что и список опций. Без fuzzy — owner
-            # чувствителен к неверным id; только exact (case/ё-insensitive).
-            vid = _resolve_brand_value_id(chosen, attr_id, brand_id_fn)
-            if vid is not None:
-                resolved_brand_id[attr_id] = vid
-        elif len(real) > 1:
-            logger.info(
-                "[Pipeline] brand-from-name: %d брендов в имени '%s' для attr %s — "
-                "двусмысленно, не трогаем",
-                len(real), context.product_name, attr_id,
-            )
+
+        if options:
+            matches = [b for b in options if _brand_in_name(str(b), name_tokens)]
+            # Бренд-aware дизамбигуация ДО подсчёта: containment-collapse + дроп
+            # гендер/тип-шума (фейковые «бренды» в enum «Бренд в одежде»: футболка,
+            # Мужская, NORTH ⊂ The North Face). Дедуп по норм-форме внутри.
+            real = _disambiguate_brand_matches(matches, name_tokens, type_words)
+            if len(real) == 1:
+                chosen = real[0]
+                resolved_brand[attr_id] = chosen
+                # Привязка словарного value_id выбранного бренда ТОЧНЫМ матчем. «Бренд» —
+                # truncated enum: sync resolve_value_ids в _finalize часто не находит id
+                # (нет в первых 5000 словаря) → бренд дропается. Берём id из той же
+                # {value:id}-карты словаря, что и список опций. Без fuzzy — owner
+                # чувствителен к неверным id; только exact (case/ё-insensitive).
+                vid = _resolve_brand_value_id(chosen, attr_id, brand_id_fn)
+                if vid is not None:
+                    resolved_brand_id[attr_id] = vid
+            elif len(real) > 1:
+                logger.info(
+                    "[Pipeline] brand-from-name: %d брендов в имени '%s' для attr %s — "
+                    "двусмысленно, не трогаем",
+                    len(real), context.product_name, attr_id,
+                )
+        else:
+            # NEEDLE fallback: dict пуст (truncated enum полностью вне первых 5000).
+            # Если context.brand задан и присутствует в имени — принимаем напрямую.
+            # Безопасность:
+            #   а) токен-матч (contiguous), ≥2 символов (у dict-пути ≥3, но needle —
+            #      известный бренд из контекста, поэтому допускаем 2-символьные
+            #      аббревиатуры вроде LG, HP, JBL);
+            #   б) КАТЕГОРИЙНЫЙ ГАРД: кандидат отвергается, если КАЖДЫЙ его токен
+            #      совпадает со стеммом слова из category_path (колонка/книга/машина/
+            #      печь — это тип товара, не бренд). Генеральное правило без хардкода.
+            # value_id будет None → resolve_value_ids_async добьёт его через
+            # Ozon search_value API (truncated enum path).
+            ctx_brand = (context.brand or "").strip()
+            if ctx_brand and _needle_brand_in_name(ctx_brand, name_tokens):
+                # Category-noun guard: отвергаем если каждый токен кандидата — слово
+                # из category_path (любого узла, не только leaf). Расширяем type_words
+                # до полного набора токенов всей цепочки категорий.
+                all_cat_words = _all_category_words(context.category_path)
+                if _is_category_noun_brand(ctx_brand, all_cat_words):
+                    logger.info(
+                        "[Pipeline] brand-from-name NEEDLE: attr %s, context.brand=%r "
+                        "ОТВЕРГНУТ — совпадает с категорийным словом (category_path=%s)",
+                        attr_id, ctx_brand, context.category_path,
+                    )
+                elif _is_gender_noise_token(ctx_brand) or _is_adjective_noise_token(ctx_brand):
+                    logger.info(
+                        "[Pipeline] brand-from-name NEEDLE: attr %s, context.brand=%r "
+                        "ОТВЕРГНУТ — гендерное/прилагательное слово, не бренд",
+                        attr_id, ctx_brand,
+                    )
+                else:
+                    logger.info(
+                        "[Pipeline] brand-from-name NEEDLE: attr %s, context.brand=%r в имени — "
+                        "принят напрямую (dict пуст, value_id=None → async-resolve)",
+                        attr_id, ctx_brand,
+                    )
+                    resolved_brand[attr_id] = ctx_brand
+                    # value_id останется None; resolve_value_ids_async (truncated path) добьёт
 
     if not resolved_brand:
         return merged
