@@ -2197,6 +2197,24 @@ class PipelineOrchestrator:
         new_avs = await self._run_tnved_stage(context, targets, already_filled=filled_so_far)
         all_values += new_avs
 
+        # Stage 4.8: SafeEnumFillSource — gated LLM fill for still-empty short
+        # optional enum attrs.  Off by default (SAFE_LLM_ENUM_FILL_ENABLED flag).
+        # Gate A: verbatim value in web_search summary (zero extra LLM calls).
+        # Gate B: adversarial verifier LLM call (batched per product, 1 call).
+        # The reverted "force-route short enums to llm_knowledge" is what this
+        # replaces, with an actual mud-gate rather than self-reported confidence.
+        from app import config as _cfg  # local import avoids circular dep at module level
+        if _cfg.SAFE_LLM_ENUM_FILL_ENABLED:
+            remaining_for_safe_enum = self._remaining_targets(targets, all_values)
+            if remaining_for_safe_enum:
+                new_avs = await self._run_safe_enum_fill_stage(
+                    context,
+                    remaining_for_safe_enum,
+                    already_filled=filled_so_far,
+                )
+                all_values += new_avs
+                filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
+
         # Stage 5: Finishing pass — focused re-extraction for empty required attributes
         all_values += await self._run_finishing(context, targets, all_values)
 
@@ -2655,6 +2673,53 @@ class PipelineOrchestrator:
                     "[Pipeline] tnved judge failed for attr %s: %s",
                     value.attribute_id, e,
                 )
+        return results
+
+    async def _run_safe_enum_fill_stage(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: Optional[list[AttributeValue]] = None,
+    ) -> list[AttributeValue]:
+        """Stage 4.8: SafeEnumFillSource — gated LLM fill for short optional enums.
+
+        Disabled by default (SAFE_LLM_ENUM_FILL_ENABLED flag).
+        Gate A: verbatim value in web_search summary (zero extra LLM calls).
+        Gate B: adversarial verifier LLM call (batched per product, 1 call).
+        Errors do not interrupt the pipeline (returns []).
+        """
+        from app.services.enrichment.sources.safe_enum_fill_source import (
+            SafeEnumFillSource,
+            _is_short_enum,
+        )
+
+        # Restrict to short-enum optional targets only
+        short_enum_targets = [t for t in targets if _is_short_enum(t)]
+        if not short_enum_targets:
+            return []
+
+        # Gate A needs the web_search summary for this product.
+        # WebSearchSource caches it in _summary_cache; extract from the source instance.
+        ws_source = self._sources.get(Source.WEB_SEARCH)
+        source_text: Optional[str] = None
+        if ws_source is not None:
+            summary_cache = getattr(ws_source, "_summary_cache", {})
+            source_text = summary_cache.get(context.product_id)
+
+        source = SafeEnumFillSource(llm_manager=None)  # uses default get_main_manager()
+        try:
+            results = await source.extract(
+                context,
+                short_enum_targets,
+                already_filled=already_filled,
+                source_text=source_text,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Pipeline] safe_enum_fill stage failed: %s", exc, exc_info=True
+            )
+            return []
+
         return results
 
     async def _run_ozon_card_stage(

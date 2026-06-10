@@ -99,6 +99,20 @@ SCRAPFLY_OZON_FALLBACK_ENABLED: bool = os.getenv(
     "SCRAPFLY_OZON_FALLBACK_ENABLED", "false"
 ).lower() in ("1", "true", "yes")
 
+# ---------------------------------------------------------------------------
+# Safe LLM enum fill — gated fill for short optional enum attrs
+# ---------------------------------------------------------------------------
+# When True, PipelineOrchestrator runs SafeEnumFillSource as a late stage
+# (after all card/web sources) for still-empty optional short-enum targets.
+# Every proposed fill is gated: verbatim-evidence in fetched text (Gate A)
+# OR adversarial LLM verifier (Gate B). Gate B is a second focused LLM call
+# that defaults to RETRACT, batched per product (1 call covers all fills).
+# Cost per product: 1 proposal call + 1 adversarial call (when Gate A misses).
+# Default OFF — set SAFE_LLM_ENUM_FILL_ENABLED=true to enable.
+SAFE_LLM_ENUM_FILL_ENABLED: bool = os.getenv(
+    "SAFE_LLM_ENUM_FILL_ENABLED", "false"
+).lower() in ("1", "true", "yes")
+
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set in environment (.env)")
 if not INTERNAL_SERVICE_SECRET:
