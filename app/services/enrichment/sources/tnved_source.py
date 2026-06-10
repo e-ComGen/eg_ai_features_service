@@ -1,10 +1,14 @@
-"""TnvedSource — per-category резолвер ТН ВЭД кода ЕАЭС.
+"""TnvedSource — per-(category, type) резолвер ТН ВЭД кода ЕАЭС.
 
-ТН ВЭД код — категорийная константа: у всех товаров одной категории Ozon код одинаков.
-Поэтому один раз резолвим через LLM и кэшируем по category_id для всего батча.
+ТН ВЭД код зависит от типа товара (type_id), а не только от категории.
+Например, футболка (6109) и джинсы (6203) могут жить в одной category_id
+Ozon, но иметь разные 10-значные коды ТН ВЭД.
 
-Паттерн: double-checked locking (per-category asyncio.Lock) гарантирует,
-что при 8 параллельных товарах одной категории LLM вызывается ровно 1 раз.
+Кэш ключуется по (category_id, type_id) — если type_id отсутствует,
+фоллбэк к последнему элементу category_path (имя листовой категории).
+
+Паттерн: double-checked locking (per-key asyncio.Lock) гарантирует,
+что при 8 параллельных товарах одного (cat, type) LLM вызывается ровно 1 раз.
 
 Source: LLM_KNOWLEDGE — ТН ВЭД — знание о категории товара, которое LLM
 хорошо знает из обучающих данных (таможенные классификаторы публичны и
@@ -16,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import re
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -64,11 +68,12 @@ class TnvedSource(AttributeSource):
     def __init__(self) -> None:
         self._llm = get_main_manager()
         self._judge = TnvedJudge()
-        # Кэш: category_id → код (str) или None (не удалось резолвить)
-        self._cache: dict[int, Optional[str]] = {}
-        # Per-category lock для double-checked locking
-        self._locks: dict[int, asyncio.Lock] = {}
-        self._locks_lock = asyncio.Lock()  # защищает создание self._locks[id]
+        # Кэш: (category_id, type_key) → код (str) или None (не удалось резолвить)
+        # type_key = ozon_type_id если задан, иначе листовой элемент category_path
+        self._cache: dict[Tuple[int, Optional[object]], Optional[str]] = {}
+        # Per-key lock для double-checked locking
+        self._locks: dict[Tuple[int, Optional[object]], asyncio.Lock] = {}
+        self._locks_lock = asyncio.Lock()  # защищает создание self._locks[key]
 
     @property
     def source_type(self) -> Source:
@@ -101,7 +106,7 @@ class TnvedSource(AttributeSource):
                     logger.debug("[TnvedSource] attr %s already filled (confident)", tnved_target.id)
                     return []
 
-        # 3. Резолв с double-checked locking по category_id
+        # 3. Резолв с double-checked locking по (category_id, type_key)
         cat_id = context.category_id
         code = await self._resolve_for_category(cat_id, context)
 
@@ -119,36 +124,55 @@ class TnvedSource(AttributeSource):
             )
         ]
 
+    @staticmethod
+    def _make_cache_key(
+        cat_id: int,
+        context: ExtractionContext,
+    ) -> Tuple[int, Optional[object]]:
+        """Build a cache key that is unique per (category, product-type).
+
+        Uses ozon_type_id when available; falls back to the leaf element of
+        category_path so that garments that differ only by type_id (e.g. a
+        t-shirt vs jeans sharing the same Ozon category_id) each get their
+        own LLM call and their own cached result.
+        """
+        type_key: Optional[object] = context.ozon_type_id
+        if type_key is None and context.category_path:
+            type_key = context.category_path[-1]
+        return (cat_id, type_key)
+
     async def _resolve_for_category(
         self,
         cat_id: int,
         context: ExtractionContext,
     ) -> Optional[str]:
-        """Double-checked locking: резолвим ровно 1 раз на category_id."""
+        """Double-checked locking: резолвим ровно 1 раз на (category_id, type_key)."""
+        cache_key = self._make_cache_key(cat_id, context)
+
         # Первая проверка кэша (без lock)
-        if cat_id in self._cache:
-            logger.debug("[TnvedSource] cache hit for category %s", cat_id)
-            return self._cache[cat_id]
+        if cache_key in self._cache:
+            logger.debug("[TnvedSource] cache hit for key %s", cache_key)
+            return self._cache[cache_key]
 
-        # Получаем или создаём per-category lock (под общим locks_lock)
+        # Получаем или создаём per-key lock (под общим locks_lock)
         async with self._locks_lock:
-            if cat_id not in self._locks:
-                self._locks[cat_id] = asyncio.Lock()
-            cat_lock = self._locks[cat_id]
+            if cache_key not in self._locks:
+                self._locks[cache_key] = asyncio.Lock()
+            cat_lock = self._locks[cache_key]
 
-        # Захватываем per-category lock
+        # Захватываем per-key lock
         async with cat_lock:
             # Вторая проверка кэша (под lock) — классический double-checked locking
-            if cat_id in self._cache:
-                logger.debug("[TnvedSource] cache hit (after lock) for category %s", cat_id)
-                return self._cache[cat_id]
+            if cache_key in self._cache:
+                logger.debug("[TnvedSource] cache hit (after lock) for key %s", cache_key)
+                return self._cache[cache_key]
 
             # Выполняем LLM-вызов
             code = await self._call_llm(context)
-            self._cache[cat_id] = code
+            self._cache[cache_key] = code
             if code:
                 context.llm_calls_so_far += 1
-                logger.info("[TnvedSource] category %s → ТН ВЭД %s", cat_id, code)
+                logger.info("[TnvedSource] key %s → ТН ВЭД %s", cache_key, code)
             return code
 
     async def _call_llm(self, context: ExtractionContext) -> Optional[str]:
