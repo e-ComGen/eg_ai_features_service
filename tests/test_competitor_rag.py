@@ -18,6 +18,7 @@ from app.services.enrichment.judges.competitor_rag_judge import CompetitorRagJud
 from app.services.enrichment.sources.competitor_rag_source import (
     CompetitorRagSource,
     _RelevanceFilter,
+    _get_embedded_client_singleton,
 )
 from app.services.enrichment.pipeline import PipelineOrchestrator
 
@@ -461,3 +462,103 @@ async def test_llm_filter_failure_falls_back_to_legacy():
     assert results[0].value == "Красный"
     # Evidence без "(LLM-filtered)" — это legacy evidence
     assert "LLM-filtered" not in results[0].evidence
+
+
+# ---------------------------------------------------------------------------
+# Test 13 (NEW): _search_neighbors graceful degrade — filtered 4xx → unfiltered retry
+# ---------------------------------------------------------------------------
+
+def test_search_neighbors_retries_without_filter_on_4xx():
+    """If filtered query raises 4xx UnexpectedResponse (missing index), retry without filter."""
+    from unittest.mock import MagicMock, call, patch
+    from qdrant_client.http.exceptions import UnexpectedResponse  # type: ignore
+
+    # Build a minimal source without hitting real Qdrant
+    source = CompetitorRagSource.__new__(CompetitorRagSource)
+    source._index_path = "/fake/path"
+    source._collection_name = "ozon_products"
+    source._top_k = 5
+    source._fellback_to_embedded = False
+
+    # Simulate the 4xx error (missing text index)
+    four_xx_exc = UnexpectedResponse(
+        status_code=400,
+        reason_phrase="Bad Request",
+        content=b'{"status":{"error":"No index for field categories"}}',
+        headers={},
+    )
+
+    # A fake successful response (unfiltered)
+    fake_point = MagicMock()
+    fake_point.payload = {"characteristics": {"Цвет": ["Красный"]}}
+    fake_response = MagicMock()
+    fake_response.points = [fake_point]
+
+    mock_client = MagicMock()
+    # First call (with filter) raises 4xx; second call (without filter) succeeds
+    mock_client.query_points.side_effect = [four_xx_exc, fake_response]
+
+    with patch.object(source, "_get_client", return_value=mock_client):
+        neighbors = source._search_neighbors([0.1] * 384, category_filter_text="Электроника")
+
+    assert neighbors == [{"characteristics": {"Цвет": ["Красный"]}}]
+    # Must have been called twice: first with filter, second without
+    assert mock_client.query_points.call_count == 2
+    # Second call must have query_filter=None
+    second_call_kwargs = mock_client.query_points.call_args_list[1]
+    assert second_call_kwargs.kwargs.get("query_filter") is None
+
+
+def test_search_neighbors_does_not_retry_on_5xx():
+    """5xx (server error) must NOT trigger the filter-degrade retry — it's a connection error."""
+    from unittest.mock import MagicMock, patch
+    from qdrant_client.http.exceptions import UnexpectedResponse  # type: ignore
+
+    source = CompetitorRagSource.__new__(CompetitorRagSource)
+    source._index_path = "/fake/path"
+    source._collection_name = "ozon_products"
+    source._top_k = 5
+    source._fellback_to_embedded = False
+
+    five_xx_exc = UnexpectedResponse(
+        status_code=503,
+        reason_phrase="Service Unavailable",
+        content=b"",
+        headers={},
+    )
+    mock_client = MagicMock()
+    mock_client.query_points.side_effect = five_xx_exc
+
+    # _fallback_to_embedded is called for 5xx; patch it to return False (no local index)
+    with patch.object(source, "_get_client", return_value=mock_client), \
+         patch.object(source, "_fallback_to_embedded", return_value=False):
+        try:
+            source._search_neighbors([0.1] * 384, category_filter_text="Электроника")
+            raised = False
+        except UnexpectedResponse:
+            raised = True
+
+    assert raised, "5xx should propagate, not be swallowed by filter-degrade"
+    # query_points called only ONCE — no unfiltered retry
+    assert mock_client.query_points.call_count == 1
+
+
+def test_process_wide_embedded_singleton_is_reused():
+    """_get_embedded_client_singleton returns same object on repeated calls."""
+    import app.services.enrichment.sources.competitor_rag_source as mod
+    from unittest.mock import MagicMock, patch
+
+    # Reset singleton to test creation
+    original = mod._embedded_client_singleton
+    mod._embedded_client_singleton = None
+
+    fake_client = MagicMock()
+    with patch("qdrant_client.QdrantClient", return_value=fake_client) as MockClient:
+        c1 = _get_embedded_client_singleton("/fake/path")
+        c2 = _get_embedded_client_singleton("/fake/path")
+
+    assert c1 is c2, "Singleton must return same instance"
+    assert MockClient.call_count == 1, "QdrantClient constructor called only once"
+
+    # Restore
+    mod._embedded_client_singleton = original

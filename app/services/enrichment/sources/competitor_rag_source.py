@@ -27,6 +27,7 @@ except ImportError:
 import logging
 import math
 import os
+import socket
 from collections import Counter
 from typing import Optional, TYPE_CHECKING
 
@@ -106,6 +107,58 @@ def _get_embedding(text: str) -> list[float]:
 # Кэш загруженной модели (singleton per process)
 _model_cache = None
 
+# ── Process-wide Qdrant embedded singleton ────────────────────────────────────
+# Embedded local mode loads ALL vectors into numpy RAM (~3.7 GB for ozon_rag).
+# Creating multiple QdrantClient(path=...) instances multiplies that footprint.
+# This singleton ensures one shared client for the lifetime of the process.
+_embedded_client_singleton = None
+
+
+def _get_embedded_client_singleton(index_path: str):
+    """Return (or lazily create) the process-wide embedded Qdrant client.
+
+    Thread-safety: Python GIL protects the assignment; the client itself is
+    NOT thread-safe for concurrent writes but reads are safe in practice.
+    """
+    global _embedded_client_singleton
+    if _embedded_client_singleton is None:
+        from qdrant_client import QdrantClient  # type: ignore
+        logger.info(
+            "[CompetitorRag] Creating process-wide embedded Qdrant client at %s "
+            "(first call — vectors load into RAM, ~1-2 min for large index)",
+            index_path,
+        )
+        _embedded_client_singleton = QdrantClient(path=index_path)
+    return _embedded_client_singleton
+
+
+# ── One-time server reachability probe ────────────────────────────────────────
+# We probe the Qdrant server URL ONCE per process with a cheap TCP connect
+# (1-second timeout).  Result is cached so we never do a per-product dead-server
+# roundtrip again.
+_server_reachable_cache: Optional[bool] = None
+
+
+def _probe_server_reachable(url: str, timeout: float = 1.0) -> bool:
+    """TCP-probe url (http[s]://host:port) — returns True if port is open.
+
+    This is intentionally cheap: one connect(), no HTTP, no TLS handshake.
+    Called at most once per process.
+    """
+    try:
+        # Strip scheme
+        host_port = url.split("://", 1)[-1].rstrip("/").split("/")[0]
+        if ":" in host_port:
+            host, port_str = host_port.rsplit(":", 1)
+            port = int(port_str)
+        else:
+            host = host_port
+            port = 443 if url.startswith("https") else 80
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
 
 def _build_relevance_user_text(query_name: str, candidates: list[dict]) -> str:
     """Собрать user-текст для LLM-фильтра: запрос + список кандидатов.
@@ -167,30 +220,53 @@ class CompetitorRagSource(AttributeSource):
         self._judge = CompetitorRagJudge()
         # LLM-менеджер для relevance filter — инициализируется лениво
         self._llm_manager = llm_manager
+        # Server reachability is decided ONCE per-instance at first _get_client call.
+        # (The process-wide _server_reachable_cache covers the common case of one instance.)
 
     def _get_client(self):
-        """Lazy-init Qdrant client. HTTP server mode if QDRANT_URL set, else local."""
-        if self._client is None:
+        """Lazy-init Qdrant client. HTTP server mode if QDRANT_URL set AND reachable, else embedded singleton."""
+        if self._client is not None:
+            return self._client
+
+        global _server_reachable_cache
+
+        use_server = False
+        if self._qdrant_url and not self._fellback_to_embedded:
+            # Probe once per process — avoids per-product dead-server roundtrip.
+            if _server_reachable_cache is None:
+                _server_reachable_cache = _probe_server_reachable(self._qdrant_url)
+                if not _server_reachable_cache:
+                    logger.warning(
+                        "[CompetitorRagSource] QDRANT_URL=%s is unreachable (TCP probe failed) — "
+                        "using embedded singleton for the whole run. "
+                        "RAM residual: full vector set stays in numpy (~3.7 GB). "
+                        "For true RAM reduction run qdrant-server out-of-process.",
+                        self._qdrant_url,
+                    )
+            use_server = _server_reachable_cache
+
+        if use_server:
             from qdrant_client import QdrantClient  # type: ignore
-            if self._qdrant_url and not self._fellback_to_embedded:
-                self._client = QdrantClient(url=self._qdrant_url, timeout=60)
-                logger.info("[CompetitorRagSource] using Qdrant server at %s", self._qdrant_url)
-            else:
-                self._client = self._build_embedded_client()
+            self._client = QdrantClient(url=self._qdrant_url, timeout=60)
+            logger.info("[CompetitorRagSource] using Qdrant server at %s", self._qdrant_url)
+        else:
+            self._client = self._build_embedded_client()
+
         return self._client
 
     def _build_embedded_client(self):
-        """Создать embedded (local file-based) Qdrant-клиент на _index_path.
+        """Return the process-wide embedded Qdrant singleton for _index_path.
 
-        Local mode мемори-мапит sqlite-хранилище, не грузит индекс целиком в RAM.
-        Первичная инициализация может занять ~1-1.5 мин на 3.7 ГБ индексе, далее
-        запросы ~1-2с. Используется как штатный режим (QDRANT_URL не задан) и как
-        fallback при недоступности сервера.
+        IMPORTANT — RAM reality check:
+          qdrant-client local mode loads ALL vectors into numpy arrays in RAM.
+          For the ozon_rag index (384-dim, ~2M points) that is ~3 GB.
+          There is NO mmap/on_disk option in QdrantClient(path=...) v1.18.
+          The only way to avoid this RAM cost is to run qdrant-server as a
+          separate OS process (which uses its own mmap). This singleton at
+          least ensures the cost is paid ONCE per Python process instead of
+          once per CompetitorRagSource instance / product.
         """
-        from qdrant_client import QdrantClient  # type: ignore
-        client = QdrantClient(path=self._index_path)
-        logger.info("[CompetitorRagSource] using Qdrant local mode at %s", self._index_path)
-        return client
+        return _get_embedded_client_singleton(self._index_path)
 
     def _fallback_to_embedded(self, exc: Exception) -> bool:
         """Переключиться на embedded-индекс при недоступности Qdrant-сервера.
@@ -212,13 +288,16 @@ class CompetitorRagSource(AttributeSource):
             return False
         logger.warning(
             "[CompetitorRagSource] Qdrant server unreachable (%s) -> fallback to embedded "
-            "index at %s. Первичная загрузка ~1 мин (mmap, без OOM).",
+            "singleton at %s.",
             exc, self._index_path,
         )
-        # Закрываем серверный клиент и пересоздаём в embedded-режиме.
+        # Update process-wide cache so no other instance probes again.
+        global _server_reachable_cache
+        _server_reachable_cache = False
+
         old = self._client
-        self._client = None
         self._fellback_to_embedded = True
+        self._client = None  # will be recreated via _build_embedded_client → singleton
         try:
             if old is not None:
                 old.close()
@@ -383,6 +462,46 @@ class CompetitorRagSource(AttributeSource):
             logger.warning("[CompetitorRag] relevance filter exception: %s", e)
             return None
 
+    @staticmethod
+    def _is_filter_index_error(exc: Exception) -> bool:
+        """Return True when a 4xx UnexpectedResponse signals a missing payload index.
+
+        This happens when MatchText is applied to a field that has no text index.
+        Qdrant returns 400 Bad Request in that case.  It is NOT a connection problem —
+        the server is alive; we just need to retry without the filter.
+        """
+        from qdrant_client.http.exceptions import UnexpectedResponse  # type: ignore
+        if isinstance(exc, UnexpectedResponse):
+            status = getattr(exc, "status_code", None)
+            return status is not None and 400 <= status < 500
+        # Local embedded mode raises ValueError for unsupported filter ops
+        return isinstance(exc, (ValueError, TypeError)) and "index" in str(exc).lower()
+
+    def _run_query(
+        self,
+        query_vector: list[float],
+        query_filter,
+    ):
+        """Execute query_points, falling back to embedded on connection error."""
+        try:
+            return self._get_client().query_points(
+                collection_name=self._collection_name,
+                query=query_vector,
+                limit=self._top_k,
+                with_payload=True,
+                query_filter=query_filter,
+            )
+        except Exception as exc:
+            if self._is_connection_error(exc) and self._fallback_to_embedded(exc):
+                return self._get_client().query_points(
+                    collection_name=self._collection_name,
+                    query=query_vector,
+                    limit=self._top_k,
+                    with_payload=True,
+                    query_filter=query_filter,
+                )
+            raise
+
     def _search_neighbors(
         self,
         query_vector: list[float],
@@ -393,10 +512,14 @@ class CompetitorRagSource(AttributeSource):
         Если задан category_filter_text — фильтруем кандидатов чьё поле
         `categories` содержит эту строку (через text-payload-index). Это резко
         снижает шум на запросах типа "EVGA SuperNOVA" (иначе ловит замки EVVA).
+
+        Graceful degrade: if the filtered query fails with a 4xx (missing text index),
+        automatically retries WITHOUT the category filter so fills are never blocked
+        by an unbuilt index.  A warning is logged once so the missing index is obvious.
         """
         query_filter = None
         if category_filter_text:
-            from qdrant_client.models import Filter, FieldCondition, MatchText
+            from qdrant_client.models import Filter, FieldCondition, MatchText  # type: ignore
             query_filter = Filter(
                 must=[FieldCondition(
                     key="categories",
@@ -405,23 +528,18 @@ class CompetitorRagSource(AttributeSource):
             )
 
         try:
-            response = self._get_client().query_points(
-                collection_name=self._collection_name,
-                query=query_vector,
-                limit=self._top_k,
-                with_payload=True,
-                query_filter=query_filter,
-            )
+            response = self._run_query(query_vector, query_filter)
         except Exception as exc:
-            # Сервер недоступен? Грациозно падаем на embedded-индекс и повторяем 1 раз.
-            if self._is_connection_error(exc) and self._fallback_to_embedded(exc):
-                response = self._get_client().query_points(
-                    collection_name=self._collection_name,
-                    query=query_vector,
-                    limit=self._top_k,
-                    with_payload=True,
-                    query_filter=query_filter,
+            if query_filter is not None and self._is_filter_index_error(exc):
+                # Missing text index on `categories` — retry without filter.
+                # Fills are restored; noise suppression is just disabled until index is built.
+                logger.warning(
+                    "[CompetitorRag] category filter failed (%s: %s) — "
+                    "retrying without filter. Build the text index to restore noise-reduction "
+                    "(run scripts/build_rag_text_index.py once).",
+                    type(exc).__name__, exc,
                 )
+                response = self._run_query(query_vector, None)
             else:
                 raise
 
