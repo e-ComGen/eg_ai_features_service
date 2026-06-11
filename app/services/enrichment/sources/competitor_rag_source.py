@@ -568,9 +568,7 @@ class CompetitorRagSource(AttributeSource):
             # Собираем голоса: value → count
             votes: Counter[str] = Counter()
             for neighbor in neighbors:
-                characteristics = neighbor.get("characteristics", {})
-                if not isinstance(characteristics, dict):
-                    continue
+                characteristics = self._coerce_characteristics(neighbor.get("characteristics"))
                 value = self._find_attr_value(characteristics, target.name)
                 if value is not None:
                     votes[str(value)] += 1
@@ -614,9 +612,7 @@ class CompetitorRagSource(AttributeSource):
         for target in targets:
             votes: Counter[str] = Counter()
             for neighbor in neighbors:
-                characteristics = neighbor.get("characteristics", {})
-                if not isinstance(characteristics, dict):
-                    continue
+                characteristics = self._coerce_characteristics(neighbor.get("characteristics"))
                 value = self._find_attr_value(characteristics, target.name)
                 if value is not None:
                     votes[str(value)] += 1
@@ -642,6 +638,28 @@ class CompetitorRagSource(AttributeSource):
             ))
 
         return results
+
+    @staticmethod
+    def _coerce_characteristics(raw) -> dict:
+        """Parse characteristics payload field to dict, handling JSON-string encoding.
+
+        Real Qdrant payloads store characteristics as a JSON-encoded string, e.g.
+            '{"Цвет товара": ["белый"], "Бренд": ["1 Toy"]}'
+        rather than a nested dict.  This helper normalises both shapes so consensus
+        voting works regardless of index format version.
+
+        Returns an empty dict on malformed JSON or unexpected type (never raises).
+        """
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            import json as _json
+            try:
+                parsed = _json.loads(raw)
+                return parsed if isinstance(parsed, dict) else {}
+            except _json.JSONDecodeError:
+                return {}
+        return {}
 
     def _find_attr_value(self, characteristics: dict, target_name: str) -> Optional[str]:
         """Найти значение атрибута по имени цели в словаре characteristics.

@@ -543,6 +543,77 @@ def test_search_neighbors_does_not_retry_on_5xx():
     assert mock_client.query_points.call_count == 1
 
 
+# ---------------------------------------------------------------------------
+# Test 14 (NEW): _coerce_characteristics — JSON string payload produces fills
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_aggregate_consensus_with_json_string_characteristics():
+    """characteristics stored as JSON string (real Qdrant payload shape) → fills produced."""
+    import json
+    # Encode characteristics as JSON strings — exactly how real payloads look
+    raw_neighbors = [
+        {"variantid": 0, "imt_name": "Product 0", "characteristics": json.dumps({"Цвет товара": ["белый"]})},
+        {"variantid": 1, "imt_name": "Product 1", "characteristics": json.dumps({"Цвет товара": ["белый"]})},
+        {"variantid": 2, "imt_name": "Product 2", "characteristics": json.dumps({"Цвет товара": ["белый"]})},
+    ]
+    llm_mgr = _make_llm_manager_returning([0, 1, 2])
+    source = _make_rag_source_with_mock(raw_neighbors, llm_manager=llm_mgr)
+    targets = [_make_target(10, "Цвет товара")]
+    ctx = _make_context()
+
+    with patch("app.services.enrichment.sources.competitor_rag_source._get_embedding",
+               return_value=[0.1] * 128):
+        results = await source.extract(ctx, targets)
+
+    assert len(results) == 1, "JSON-string characteristics must produce fills"
+    assert results[0].value == "белый"
+    assert results[0].source == Source.COMPETITOR_RAG
+
+
+@pytest.mark.asyncio
+async def test_aggregate_consensus_malformed_json_skipped_others_counted():
+    """Malformed JSON characteristics → that neighbor skipped, valid ones still counted."""
+    import json
+    raw_neighbors = [
+        {"variantid": 0, "imt_name": "P0", "characteristics": json.dumps({"Цвет": ["Красный"]})},
+        {"variantid": 1, "imt_name": "P1", "characteristics": "{NOT VALID JSON{{"},  # malformed
+        {"variantid": 2, "imt_name": "P2", "characteristics": json.dumps({"Цвет": ["Красный"]})},
+    ]
+    llm_mgr = _make_llm_manager_returning([0, 1, 2])
+    source = _make_rag_source_with_mock(raw_neighbors, llm_manager=llm_mgr)
+    targets = [_make_target(10, "Цвет")]
+    ctx = _make_context()
+
+    with patch("app.services.enrichment.sources.competitor_rag_source._get_embedding",
+               return_value=[0.1] * 128):
+        results = await source.extract(ctx, targets)
+
+    # 2 out of 3 valid neighbors agree → min_agree = ceil(3/2)=2 → consensus reached
+    assert len(results) == 1, "Malformed neighbor skipped; remaining 2 still form consensus"
+    assert results[0].value == "Красный"
+
+
+@pytest.mark.asyncio
+async def test_aggregate_consensus_dict_characteristics_still_works():
+    """characteristics as a plain dict (back-compat) still produces fills after the fix."""
+    raw_neighbors = [
+        {"variantid": 0, "imt_name": "P0", "characteristics": {"Бренд": ["1 Toy"]}},
+        {"variantid": 1, "imt_name": "P1", "characteristics": {"Бренд": ["1 Toy"]}},
+    ]
+    llm_mgr = _make_llm_manager_returning([0, 1])
+    source = _make_rag_source_with_mock(raw_neighbors, llm_manager=llm_mgr)
+    targets = [_make_target(11, "Бренд")]
+    ctx = _make_context()
+
+    with patch("app.services.enrichment.sources.competitor_rag_source._get_embedding",
+               return_value=[0.1] * 128):
+        results = await source.extract(ctx, targets)
+
+    assert len(results) == 1
+    assert results[0].value == "1 Toy"
+
+
 def test_process_wide_embedded_singleton_is_reused():
     """_get_embedded_client_singleton returns same object on repeated calls."""
     import app.services.enrichment.sources.competitor_rag_source as mod
