@@ -527,6 +527,7 @@ class CompetitorRagSource(AttributeSource):
                 )]
             )
 
+        already_retried_unfiltered = False
         try:
             response = self._run_query(query_vector, query_filter)
         except Exception as exc:
@@ -540,6 +541,7 @@ class CompetitorRagSource(AttributeSource):
                     type(exc).__name__, exc,
                 )
                 response = self._run_query(query_vector, None)
+                already_retried_unfiltered = True
             else:
                 raise
 
@@ -547,6 +549,24 @@ class CompetitorRagSource(AttributeSource):
         for hit in response.points:
             if hit.payload:
                 neighbors.append(hit.payload)
+
+        # Empty-result fallback: category taxonomy mismatch (Ozon leaf vs EPG) causes
+        # MatchText to return 0 results silently — no 4xx, just an empty list.
+        # If a filter WAS applied AND we haven't already retried (exception path above),
+        # AND results are below the floor, retry without the filter.
+        # The downstream LLM relevance filter + consensus already remove off-topic noise.
+        _EMPTY_FALLBACK_FLOOR = max(_MIN_FILTERED_CANDIDATES, 3)
+        if query_filter is not None and not already_retried_unfiltered and len(neighbors) < _EMPTY_FALLBACK_FLOOR:
+            logger.info(
+                "[CompetitorRag] category filter '%s' returned %d results (< floor %d) — "
+                "taxonomy mismatch suspected; retrying without filter.",
+                category_filter_text, len(neighbors), _EMPTY_FALLBACK_FLOOR,
+            )
+            unfiltered_response = self._run_query(query_vector, None)
+            neighbors = [
+                hit.payload for hit in unfiltered_response.points if hit.payload
+            ]
+
         return neighbors
 
     def _aggregate_consensus(

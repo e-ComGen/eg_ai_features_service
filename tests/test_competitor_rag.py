@@ -614,6 +614,71 @@ async def test_aggregate_consensus_dict_characteristics_still_works():
     assert results[0].value == "1 Toy"
 
 
+# ---------------------------------------------------------------------------
+# Test 15 (NEW): _search_neighbors empty-result fallback — filter returns 0 → unfiltered retry
+# ---------------------------------------------------------------------------
+
+def test_search_neighbors_retries_without_filter_on_empty_result():
+    """Filtered query returns [] with a category filter set → unfiltered retry fires."""
+    from unittest.mock import MagicMock, patch
+
+    source = CompetitorRagSource.__new__(CompetitorRagSource)
+    source._index_path = "/fake/path"
+    source._collection_name = "ozon_products"
+    source._top_k = 10
+    source._fellback_to_embedded = False
+
+    # First call (filtered) returns empty points; second call (unfiltered) returns results
+    empty_response = MagicMock()
+    empty_response.points = []
+
+    fake_point = MagicMock()
+    fake_point.payload = {"characteristics": {"Цвет": ["Синий"]}}
+    full_response = MagicMock()
+    full_response.points = [fake_point, fake_point, fake_point]  # 3 neighbors
+
+    mock_client = MagicMock()
+    mock_client.query_points.side_effect = [empty_response, full_response]
+
+    with patch.object(source, "_get_client", return_value=mock_client):
+        neighbors = source._search_neighbors([0.1] * 384, category_filter_text="Футболки и поло")
+
+    # Unfiltered results are returned
+    assert len(neighbors) == 3
+    assert neighbors[0] == {"characteristics": {"Цвет": ["Синий"]}}
+    # Must have been called twice: first with filter, second without
+    assert mock_client.query_points.call_count == 2
+    second_call_kwargs = mock_client.query_points.call_args_list[1]
+    assert second_call_kwargs.kwargs.get("query_filter") is None
+
+
+def test_search_neighbors_no_retry_when_filtered_results_sufficient():
+    """Filtered query returns enough results → NO retry (filter respected, called once)."""
+    from unittest.mock import MagicMock, patch
+
+    source = CompetitorRagSource.__new__(CompetitorRagSource)
+    source._index_path = "/fake/path"
+    source._collection_name = "ozon_products"
+    source._top_k = 10
+    source._fellback_to_embedded = False
+
+    fake_point = MagicMock()
+    fake_point.payload = {"characteristics": {"Тип": ["Толстовка"]}}
+    # 5 results from filtered query — above floor (max(1, 3) = 3)
+    full_response = MagicMock()
+    full_response.points = [fake_point] * 5
+
+    mock_client = MagicMock()
+    mock_client.query_points.return_value = full_response
+
+    with patch.object(source, "_get_client", return_value=mock_client):
+        neighbors = source._search_neighbors([0.1] * 384, category_filter_text="Толстовки")
+
+    assert len(neighbors) == 5
+    # Called only ONCE — no retry
+    assert mock_client.query_points.call_count == 1
+
+
 def test_process_wide_embedded_singleton_is_reused():
     """_get_embedded_client_singleton returns same object on repeated calls."""
     import app.services.enrichment.sources.competitor_rag_source as mod
