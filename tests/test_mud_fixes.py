@@ -776,17 +776,22 @@ class TestWebSearchAdversarialPass:
 
     @pytest.mark.asyncio
     async def test_web_search_routed_alongside_llm_knowledge(self):
-        """Both WEB_SEARCH and LLM_KNOWLEDGE fills are sent to Gate B together."""
+        """Both WEB_SEARCH and LLM_KNOWLEDGE non-spec fills are sent to Gate B together.
+
+        NOTE: Uses non-spec attr names («Стиль», «Сезон») — spec-class attrs (material,
+        bool, numeric, connectivity) now go through deterministic corroboration (Track A)
+        instead of Gate B. This test validates Track B (Gate B) routing for non-spec attrs.
+        """
         from app.services.enrichment.pipeline import PipelineOrchestrator
 
-        llm_fill = _av(attr_id=1001, value="Хлопок", source=Source.LLM_KNOWLEDGE, confidence=0.85)
-        web_fill = _av(attr_id=1002, value="Бязь", source=Source.WEB_SEARCH, confidence=0.80)
+        llm_fill = _av(attr_id=1001, value="Спортивный", source=Source.LLM_KNOWLEDGE, confidence=0.85)
+        web_fill = _av(attr_id=1002, value="Повседневный", source=Source.WEB_SEARCH, confidence=0.80)
         card_fill = _av(attr_id=1003, value="Синий", source=Source.OZON_CARD, confidence=0.95)
 
         targets = [
-            _target(1001, "Материал1"),
-            _target(1002, "Материал2"),
-            _target(1003, "Цвет"),
+            _target(1001, "Стиль"),    # non-spec: no fragment match, type=enum → Gate B
+            _target(1002, "Сезон"),    # non-spec: no fragment match, type=enum → Gate B
+            _target(1003, "Цвет"),     # authoritative source → passthrough
         ]
         context = _ctx()
 
@@ -805,9 +810,9 @@ class TestWebSearchAdversarialPass:
                 [llm_fill, web_fill, card_fill], targets, context, [],
             )
 
-        # Both inference fills must be routed; card fill must NOT be routed
-        assert 1001 in verified_attr_ids, "LLM_KNOWLEDGE fill must be sent to Gate B"
-        assert 1002 in verified_attr_ids, "WEB_SEARCH fill must be sent to Gate B"
+        # Both non-spec inference fills must be routed to Gate B; card fill must NOT be routed
+        assert 1001 in verified_attr_ids, "LLM_KNOWLEDGE non-spec fill must be sent to Gate B"
+        assert 1002 in verified_attr_ids, "WEB_SEARCH non-spec fill must be sent to Gate B"
         assert 1003 not in verified_attr_ids, "OZON_CARD fill must NOT be sent to Gate B"
 
         # All three fills survive (card passthrough + both confirmed by mock)

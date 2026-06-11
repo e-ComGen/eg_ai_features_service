@@ -146,6 +146,134 @@ def _apply_brand_source_guard(
     return out
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Objective-spec predicate + corroboration gate helpers (Stage 4.9)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Semantic types that unambiguously tag an attribute as objective-spec (when set).
+_OBJECTIVE_SPEC_SEMANTIC_TYPES: frozenset[str] = frozenset({
+    # Material / fabric / composition
+    "material", "material_composition", "composition", "fabric",
+    "fabric_composition",
+    # Physical / numeric measurements
+    "weight", "net_weight", "gross_weight", "dimensions",
+    "temperature", "thermal", "frequency", "power", "voltage",
+    "capacity", "volume", "resolution",
+    # Connectivity / interface / audio
+    "connectivity", "interface", "audio_config", "channel_config",
+    # Boolean feature presence
+    "feature_bool", "boolean_feature",
+})
+
+# Name substrings (lower-cased) that identify objective-spec attributes when
+# semantic_type is None or missing. Matches case-insensitively via str.lower().
+#
+# Rationale for each group:
+#   Material/composition: «Материал», «Состав», «Подкладка», «Материал верха», etc.
+#   Connectivity/interface: «Тип подключения», «Интерфейс», «Разъём», «Порт»
+#   Audio/video configuration: «Звуковая схема», «Каналы», «Разрядность»
+#   Wireless feature flags: «True Wireless», «Bluetooth», «Wi-Fi» (exact feature)
+#
+# NOT included: color, brand, size/gender (subjective or identity attrs) — those
+# stay on Gate B LLM-verify path since wrong values are less dangerous than mud.
+_OBJECTIVE_SPEC_NAME_FRAGMENTS: tuple[str, ...] = (
+    # Material / composition group
+    "материал",
+    "состав",
+    "подкладк",
+    # Tech connectivity / interface
+    "интерфейс",
+    "тип подключения",
+    "разъём",
+    "разъем",
+    # Audio / video configuration
+    "звуковая схема",
+    "акустическая система",
+    "количество каналов",
+    # Wireless / binary feature flags
+    "true wireless",
+    "активное шумоподавление",
+    "шумоподавлен",
+)
+
+# Sources considered AUTHORITATIVE for corroboration purposes.
+# These must NOT include LLM_KNOWLEDGE, WEB_SEARCH, or VISION — two guess-prone
+# sources agreeing with each other is NOT independent corroboration.
+_AUTHORITATIVE_SOURCES: frozenset[Source] = frozenset({
+    Source.WB_CARD,
+    Source.OZON_CARD,
+    Source.ICECAT,
+    Source.PDF_DATASHEET,
+    Source.DESCRIPTION,
+})
+
+
+def _is_objective_spec_attr(target: TargetAttribute) -> bool:
+    """True when the attribute is in the OBJECTIVE-SPEC class.
+
+    Objective-spec attributes have factual ground truths that an LLM can be
+    confidently wrong about (e.g. True Wireless=true on over-ear headphones,
+    Звуковая схема=2.0 on a mono speaker, Бязь fabric on a Nike tee).  For
+    these attrs, LLM self-judgment is insufficient — corroboration from an
+    authoritative source is required instead (Stage 4.9 gate).
+
+    Three orthogonal signals trigger the class, checked in order:
+      1. semantic_type is in _OBJECTIVE_SPEC_SEMANTIC_TYPES (explicit tag).
+      2. TargetAttribute.type is "bool" (binary feature-presence: Да/Нет).
+      3. TargetAttribute.type is "numeric" (physical measurement with unit).
+      4. Name (lower-cased) contains any substring from
+         _OBJECTIVE_SPEC_NAME_FRAGMENTS (catches material/connectivity/audio
+         attrs regardless of whether semantic_type was populated).
+
+    Judgment calls (deliberately NOT included):
+      - "color", "brand", "model" — wrong but less dangerous than mud; Gate B
+        LLM-verify is appropriate (LLM *does* know the brand/color from name).
+      - Long free-text description attrs — not factual-spec, stay on Gate B.
+      - Short lifestyle enums (style, occasion) — subjective, Gate B is fine.
+    """
+    # Signal 1: explicit semantic_type tag
+    st = (target.semantic_type or "").lower()
+    if st and st in _OBJECTIVE_SPEC_SEMANTIC_TYPES:
+        return True
+
+    # Signal 2 & 3: structural type signals
+    if target.type in ("bool", "numeric"):
+        return True
+
+    # Signal 4: name-based heuristic (covers attrs where semantic_type is None)
+    name_low = target.name.lower()
+    for fragment in _OBJECTIVE_SPEC_NAME_FRAGMENTS:
+        if fragment in name_low:
+            return True
+
+    return False
+
+
+def _normalize_for_corroboration(value: object) -> str:
+    """Normalise a fill value for source-corroboration equality checks.
+
+    Rules (deterministic, no LLM):
+      - Convert to str and strip whitespace.
+      - Lower-case.
+      - Replace ё→е (Russian letter equivalence).
+      - Collapse internal whitespace sequences to a single space.
+      - Boolean aliases: True / «Да» / «yes» / «1» → «да»;
+                         False / «Нет» / «no» / «0» → «нет».
+    """
+    raw = str(value).strip()
+    # Boolean aliases
+    lower_raw = raw.lower()
+    if lower_raw in {"true", "да", "yes", "1"}:
+        return "да"
+    if lower_raw in {"false", "нет", "no", "0"}:
+        return "нет"
+    # General normalisation
+    norm = raw.lower()
+    norm = norm.replace("ё", "е")
+    norm = " ".join(norm.split())
+    return norm
+
+
 def _apply_gender_guard(
     all_values: list[AttributeValue],
     targets: list[TargetAttribute],
@@ -2879,26 +3007,29 @@ class PipelineOrchestrator:
         context: ExtractionContext,
         resolved_attrs: list[AttributeValue],
     ) -> list[AttributeValue]:
-        """Stage 4.9: adversarial Gate B pass over inference-source fills.
+        """Stage 4.9: deterministic corroboration gate (spec-class) + LLM Gate B (non-spec).
 
-        Covers Source.LLM_KNOWLEDGE and Source.WEB_SEARCH:
-          - LLM_KNOWLEDGE: world-knowledge values with NO verbatim anchor; confident
-            hallucinations (Бязь at conf=0.93, stereo 2.0 for mono speaker, etc.).
-          - WEB_SEARCH: wrong-product attribution can survive Gate A's verbatim check
-            (web snippet mentions Бязь for a different product, literal match fires,
-            but value is wrong for THIS product — e.g. Бязь on a Nike tee).
-            Gate B's «correct for THIS exact product» check catches this case.
+        Two-track approach based on attribute class:
 
-        The proposer's own evidence/reasoning is NEVER passed to Gate B (proposals
-        are (attr_id, attr_name, value) triples — no evidence field). Gate B judges
-        purely from product identity + its own independent knowledge.
+        TRACK A — OBJECTIVE-SPEC attrs (_is_objective_spec_attr == True):
+          Material, composition, boolean feature flags (True Wireless),
+          numeric measurements, audio/connectivity configs, etc.
+          Gate: DETERMINISTIC source-corroboration.
+          KEEP the fill ONLY if at least one AUTHORITATIVE source
+          (_AUTHORITATIVE_SOURCES: wb_card, ozon_card, icecat, pdf_datasheet,
+          description) independently produced the SAME (attribute_id, normalised
+          value) for this product.
+          Two guess-prone sources (llm_knowledge + web_search) agreeing is NOT
+          corroboration.  If not corroborated → DROP (empty > wrong).
+          No LLM call needed — deterministic, zero extra cost.
 
-        Skips fills that are verbatim-anchored (evidence starts with
-        ``safe_enum:verbatim_gate``) — those already passed Gate A.
-        Skips all other sources — they have independent verification (judges,
-        card-copy fidelity, verbatim extraction).
+        TRACK B — non-spec attrs (_is_objective_spec_attr == False):
+          Lifestyle enums (style, occasion), color names inferred from description,
+          OS family, etc.  LLM Gate B: «is this correct for THIS exact product?»
+          Retracted fills are DROPPED (empty > wrong). Errors retract all (fail-closed).
 
-        Retracted fills are DROPPED (empty > wrong). Errors retract all (fail-closed).
+        Both tracks only apply to Source.LLM_KNOWLEDGE and Source.WEB_SEARCH fills
+        that are NOT verbatim-anchored (safe_enum:verbatim_gate — already passed Gate A).
 
         Flag: LLM_KNOWLEDGE_ADVERSARIAL_ENABLED (name kept for back-compat; now gates
         both llm_knowledge and web_search fills).
@@ -2907,40 +3038,74 @@ class PipelineOrchestrator:
             run_adversarial_verify,
         )
 
-        # Sources routed through Gate B adversarial verify.
+        # Sources that require the gate.
         _ADVERSARIAL_SOURCES = {Source.LLM_KNOWLEDGE, Source.WEB_SEARCH}
 
-        # Separate inference fills from everything else.
-        pending: list[AttributeValue] = []
-        keep_as_is: list[AttributeValue] = []
         target_by_id: dict[int, TargetAttribute] = {t.id: t for t in targets}
+
+        # Build a lookup: authoritative fills already present in all_values,
+        # keyed by (attribute_id, normalised_value).  Used for Track A corroboration.
+        authoritative_fills: set[tuple[int, str]] = set()
+        for v in all_values:
+            if v.source in _AUTHORITATIVE_SOURCES:
+                norm = _normalize_for_corroboration(v.value)
+                authoritative_fills.add((v.attribute_id, norm))
+
+        # Partition fills.
+        keep_as_is: list[AttributeValue] = []          # passthrough (other sources / verbatim)
+        spec_pending: list[AttributeValue] = []         # Track A: deterministic corroboration
+        non_spec_pending: list[AttributeValue] = []     # Track B: LLM Gate B
 
         for v in all_values:
             if v.source not in _ADVERSARIAL_SOURCES:
                 keep_as_is.append(v)
                 continue
-            # Skip verbatim-anchored fills — already confirmed by Gate A.
-            ev = (v.evidence or "")
-            if ev.startswith("safe_enum:verbatim_gate"):
+            # Verbatim-anchored fills already passed Gate A — keep as-is.
+            if (v.evidence or "").startswith("safe_enum:verbatim_gate"):
                 keep_as_is.append(v)
                 continue
-            pending.append(v)
+            t = target_by_id.get(v.attribute_id)
+            if t is not None and _is_objective_spec_attr(t):
+                spec_pending.append(v)
+            else:
+                non_spec_pending.append(v)
 
-        if not pending:
-            return all_values  # nothing to verify
+        result: list[AttributeValue] = list(keep_as_is)
 
-        # Build (attribute_id, attr_name, value) triples for the verifier.
+        # ── Track A: DETERMINISTIC corroboration for objective-spec attrs ────────
+        for v in spec_pending:
+            norm_val = _normalize_for_corroboration(v.value)
+            corroborated = (v.attribute_id, norm_val) in authoritative_fills
+            if corroborated:
+                logger.info(
+                    "[Pipeline] spec-corroboration PASS: attr=%s value=%r source=%s "
+                    "— matched by authoritative source",
+                    v.attribute_id, v.value, v.source.value,
+                )
+                result.append(v)
+            else:
+                logger.info(
+                    "[Pipeline] spec-corroboration DROP (no authoritative match): "
+                    "attr=%s value=%r source=%s norm=%r "
+                    "— empty>wrong for objective-spec attr",
+                    v.attribute_id, v.value, v.source.value, norm_val,
+                )
+
+        # ── Track B: LLM Gate B for non-spec attrs ───────────────────────────────
+        if not non_spec_pending:
+            return result
+
         proposals: list[tuple[int, str, str]] = []
-        for v in pending:
+        for v in non_spec_pending:
             t = target_by_id.get(v.attribute_id)
             attr_name = t.name if t else str(v.attribute_id)
             proposals.append((v.attribute_id, attr_name, str(v.value)))
 
         logger.info(
-            "[Pipeline] inference adversarial pass: product=%s, %d fills to verify "
-            "(sources: %s)",
+            "[Pipeline] inference adversarial pass (Gate B, non-spec): "
+            "product=%s, %d fills to verify (sources: %s)",
             context.product_id, len(proposals),
-            ", ".join(sorted({str(v.source.value) for v in pending})),
+            ", ".join(sorted({str(v.source.value) for v in non_spec_pending})),
         )
 
         try:
@@ -2951,26 +3116,26 @@ class PipelineOrchestrator:
             )
         except Exception as exc:
             logger.warning(
-                "[Pipeline] inference adversarial pass failed (all retracted): %s",
+                "[Pipeline] inference adversarial pass (Gate B) failed (all retracted): %s",
                 exc,
             )
             confirmed_ids = set()  # fail-closed: retract all on error
 
-        # Rebuild: keep confirmed fills, drop retracted.
-        result: list[AttributeValue] = list(keep_as_is)
-        for v in pending:
+        for v in non_spec_pending:
             if v.attribute_id in confirmed_ids:
                 logger.info(
-                    "[Pipeline] inference adversarial CONFIRMED: attr=%s value=%r source=%s",
+                    "[Pipeline] inference adversarial CONFIRMED (Gate B): "
+                    "attr=%s value=%r source=%s",
                     v.attribute_id, v.value, v.source.value,
                 )
                 result.append(v)
             else:
                 logger.info(
-                    "[Pipeline] inference adversarial RETRACTED (MUD): attr=%s value=%r "
-                    "source=%s — not independently-verifiable-correct for this product",
+                    "[Pipeline] inference adversarial RETRACTED (Gate B, MUD): "
+                    "attr=%s value=%r source=%s — not verifiable for this product",
                     v.attribute_id, v.value, v.source.value,
                 )
+
         return result
 
     async def _run_ozon_card_stage(
