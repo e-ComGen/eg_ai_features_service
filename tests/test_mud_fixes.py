@@ -661,3 +661,190 @@ class TestRunAdversarialVerifyStandalone:
         ctx = _ctx()
         confirmed = await run_adversarial_verify(ctx, [])
         assert confirmed == set()
+
+    @pytest.mark.asyncio
+    async def test_gate_b_prompt_does_not_contain_proposer_evidence(self):
+        """FIX A: Gate B verify prompt must NOT include the proposer's own evidence string.
+
+        Root cause of Яндекс Станция Мини 2 / «Звуковая схема=2.0» mud leak:
+        the llm_knowledge fill carried evidence='stereo 2.0 according to official
+        specifications' and Gate B received it → self-confirmation loop. The fix:
+        proposals are (attr_id, attr_name, value) tuples — no evidence field.
+        This test asserts the self-reported evidence text is absent from the prompt.
+        """
+        evidence_text = "stereo 2.0 according to official specifications"
+
+        captured_user_text = []
+
+        async def _mock_structured_request(system_prompt, user_text, response_model):
+            captured_user_text.append(user_text)
+            return (_adversarial_response([{"attribute_id": 777, "verdict": "CONFIRMED"}]), 10)
+
+        mock_llm = AsyncMock(spec=StructuredLlmManager)
+        mock_llm.structured_request.side_effect = _mock_structured_request
+
+        ctx = _ctx(product_name="Яндекс Станция Мини 2", brand="Яндекс")
+        await run_adversarial_verify(
+            ctx,
+            [(777, "Звуковая схема", "2.0")],
+            llm_manager=mock_llm,
+        )
+
+        assert captured_user_text, "LLM must have been called"
+        prompt = captured_user_text[0]
+        assert evidence_text not in prompt, (
+            f"Proposer evidence MUST NOT appear in Gate B verify prompt, "
+            f"but found: {evidence_text!r} in prompt"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FIX B: web_search fills covered by the adversarial pass
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestWebSearchAdversarialPass:
+    """web_search fills must be routed through the adversarial Gate B pass.
+
+    Root cause of «Бязь» on Nike tee (source=web_search): Gate A verbatim-check
+    may have fired (word appears in some web snippet about a different product),
+    but Gate B's «correct for THIS exact product» check would catch the wrong
+    attribution. Extending the pass to WEB_SEARCH closes this leak.
+    """
+
+    @pytest.mark.asyncio
+    async def test_web_search_mud_fill_is_dropped_when_retracted(self):
+        """WEB_SEARCH Бязь on Nike tee → Gate B retracts → dropped."""
+        from app.services.enrichment.pipeline import PipelineOrchestrator
+
+        mud_fill = _av(
+            attr_id=4496,
+            value="Бязь",
+            source=Source.WEB_SEARCH,
+            confidence=0.85,
+            evidence="web_search found бязь in snippet",
+        )
+        targets = [_target(4496, "Материал")]
+        context = _ctx(product_name="Футболка Nike Dri-FIT мужская", brand="Nike")
+
+        async def _retract_all(ctx, proposals, resolved_attrs=None, llm_manager=None):
+            return set()  # retract everything
+
+        orchestrator = PipelineOrchestrator()
+        with patch(
+            "app.services.enrichment.sources.safe_enum_fill_source.run_adversarial_verify",
+            new=_retract_all,
+        ):
+            result = await orchestrator._run_llm_knowledge_adversarial_pass(
+                [mud_fill], targets, context, [],
+            )
+
+        assert not any(v.attribute_id == 4496 for v in result), (
+            "WEB_SEARCH Бязь fill must be DROPPED when Gate B retracts"
+        )
+
+    @pytest.mark.asyncio
+    async def test_web_search_good_fill_survives_when_confirmed(self):
+        """WEB_SEARCH confirmed fill (e.g. correct color from web snippet) survives."""
+        from app.services.enrichment.pipeline import PipelineOrchestrator
+
+        good_fill = _av(
+            attr_id=2000,
+            value="Чёрный",
+            source=Source.WEB_SEARCH,
+            confidence=0.88,
+            evidence="web search: color is black from product page",
+        )
+        targets = [_target(2000, "Цвет")]
+        context = _ctx(product_name="Кроссовки Nike Air Max 270 чёрные", brand="Nike")
+
+        async def _confirm_all(ctx, proposals, resolved_attrs=None, llm_manager=None):
+            return {p[0] for p in proposals}
+
+        orchestrator = PipelineOrchestrator()
+        with patch(
+            "app.services.enrichment.sources.safe_enum_fill_source.run_adversarial_verify",
+            new=_confirm_all,
+        ):
+            result = await orchestrator._run_llm_knowledge_adversarial_pass(
+                [good_fill], targets, context, [],
+            )
+
+        assert any(v.attribute_id == 2000 and v.value == "Чёрный" for v in result), (
+            "Good WEB_SEARCH fill must SURVIVE when Gate B confirms"
+        )
+
+    @pytest.mark.asyncio
+    async def test_web_search_routed_alongside_llm_knowledge(self):
+        """Both WEB_SEARCH and LLM_KNOWLEDGE fills are sent to Gate B together."""
+        from app.services.enrichment.pipeline import PipelineOrchestrator
+
+        llm_fill = _av(attr_id=1001, value="Хлопок", source=Source.LLM_KNOWLEDGE, confidence=0.85)
+        web_fill = _av(attr_id=1002, value="Бязь", source=Source.WEB_SEARCH, confidence=0.80)
+        card_fill = _av(attr_id=1003, value="Синий", source=Source.OZON_CARD, confidence=0.95)
+
+        targets = [
+            _target(1001, "Материал1"),
+            _target(1002, "Материал2"),
+            _target(1003, "Цвет"),
+        ]
+        context = _ctx()
+
+        verified_attr_ids: list[int] = []
+
+        async def _track_and_confirm(ctx, proposals, resolved_attrs=None, llm_manager=None):
+            verified_attr_ids.extend(p[0] for p in proposals)
+            return {p[0] for p in proposals}  # confirm all
+
+        orchestrator = PipelineOrchestrator()
+        with patch(
+            "app.services.enrichment.sources.safe_enum_fill_source.run_adversarial_verify",
+            new=_track_and_confirm,
+        ):
+            result = await orchestrator._run_llm_knowledge_adversarial_pass(
+                [llm_fill, web_fill, card_fill], targets, context, [],
+            )
+
+        # Both inference fills must be routed; card fill must NOT be routed
+        assert 1001 in verified_attr_ids, "LLM_KNOWLEDGE fill must be sent to Gate B"
+        assert 1002 in verified_attr_ids, "WEB_SEARCH fill must be sent to Gate B"
+        assert 1003 not in verified_attr_ids, "OZON_CARD fill must NOT be sent to Gate B"
+
+        # All three fills survive (card passthrough + both confirmed by mock)
+        all_attr_ids = {v.attribute_id for v in result}
+        assert all_attr_ids == {1001, 1002, 1003}
+
+    @pytest.mark.asyncio
+    async def test_web_search_verbatim_anchored_skipped(self):
+        """WEB_SEARCH fills with verbatim_gate evidence skip adversarial (already gated)."""
+        from app.services.enrichment.pipeline import PipelineOrchestrator
+
+        verbatim_anchored = _av(
+            attr_id=5000,
+            value="Повседневный",
+            source=Source.WEB_SEARCH,
+            confidence=0.82,
+            evidence="safe_enum:verbatim_gate: found in web text",
+        )
+        targets = [_target(5000, "Стиль")]
+        context = _ctx()
+
+        verify_calls: list = []
+
+        async def _track_verify(ctx, proposals, resolved_attrs=None, llm_manager=None):
+            verify_calls.extend(proposals)
+            return set()  # retract all — but this fill should be skipped
+
+        orchestrator = PipelineOrchestrator()
+        with patch(
+            "app.services.enrichment.sources.safe_enum_fill_source.run_adversarial_verify",
+            new=_track_verify,
+        ):
+            result = await orchestrator._run_llm_knowledge_adversarial_pass(
+                [verbatim_anchored], targets, context, [],
+            )
+
+        assert not verify_calls, "Verbatim-anchored WEB_SEARCH fill must skip Gate B"
+        assert any(v.attribute_id == 5000 for v in result), (
+            "Verbatim-anchored fill must be kept as-is"
+        )

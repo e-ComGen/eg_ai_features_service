@@ -2336,15 +2336,14 @@ class PipelineOrchestrator:
                 all_values += new_avs
                 filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
 
-        # Stage 4.9: LLM_KNOWLEDGE adversarial post-merge pass (FIX #1).
-        # llm_knowledge writes world-knowledge values with NO verbatim anchor →
-        # confident hallucinations can reach `filled` (Apple Watch Series 3 model id,
-        # Бязь fabric for denim, Sony WH True Wireless, etc.).
-        # Fix: route all pending llm_knowledge fills through the same adversarial Gate B
-        # used by SafeEnumFillSource. Batched per product (1 LLM call). Retracted → DROP.
-        # Skip fills already verbatim-anchored to a fetched source (evidence tag
-        # "safe_enum:verbatim_gate" or source != LLM_KNOWLEDGE) — they are already gated.
-        # Off by default; enabled via LLM_KNOWLEDGE_ADVERSARIAL_ENABLED env flag.
+        # Stage 4.9: inference-source adversarial post-merge pass (FIX #1 + FIX B).
+        # Covers Source.LLM_KNOWLEDGE (world-knowledge, no verbatim anchor) and
+        # Source.WEB_SEARCH (wrong-product attribution leaks past Gate A's verbatim
+        # check — e.g. Бязь on a Nike tee from a web snippet about a different product).
+        # Gate B's «correct for THIS exact product» check catches both cases.
+        # Skip fills already verbatim-anchored (evidence tag "safe_enum:verbatim_gate").
+        # Off by default; enabled via LLM_KNOWLEDGE_ADVERSARIAL_ENABLED env flag
+        # (name kept for back-compat; now gates both llm_knowledge and web_search).
         if os.environ.get("LLM_KNOWLEDGE_ADVERSARIAL_ENABLED", "0") == "1":
             all_values = await self._run_llm_knowledge_adversarial_pass(
                 all_values, targets, context, filled_so_far,
@@ -2880,31 +2879,44 @@ class PipelineOrchestrator:
         context: ExtractionContext,
         resolved_attrs: list[AttributeValue],
     ) -> list[AttributeValue]:
-        """Stage 4.9: adversarial Gate B pass over all pending LLM_KNOWLEDGE fills.
+        """Stage 4.9: adversarial Gate B pass over inference-source fills.
 
-        llm_knowledge fills are world-knowledge values with NO verbatim anchor.
-        Self-reported confidence is meaningless for mud-detection (Бязь at conf=0.93).
-        This stage routes every unanchored llm_knowledge fill through the same Gate B
-        adversarial verifier used by SafeEnumFillSource — one batched LLM call.
+        Covers Source.LLM_KNOWLEDGE and Source.WEB_SEARCH:
+          - LLM_KNOWLEDGE: world-knowledge values with NO verbatim anchor; confident
+            hallucinations (Бязь at conf=0.93, stereo 2.0 for mono speaker, etc.).
+          - WEB_SEARCH: wrong-product attribution can survive Gate A's verbatim check
+            (web snippet mentions Бязь for a different product, literal match fires,
+            but value is wrong for THIS product — e.g. Бязь on a Nike tee).
+            Gate B's «correct for THIS exact product» check catches this case.
+
+        The proposer's own evidence/reasoning is NEVER passed to Gate B (proposals
+        are (attr_id, attr_name, value) triples — no evidence field). Gate B judges
+        purely from product identity + its own independent knowledge.
 
         Skips fills that are verbatim-anchored (evidence starts with
         ``safe_enum:verbatim_gate``) — those already passed Gate A.
-        Skips non-llm_knowledge fills — they have independent verification (judges,
+        Skips all other sources — they have independent verification (judges,
         card-copy fidelity, verbatim extraction).
 
         Retracted fills are DROPPED (empty > wrong). Errors retract all (fail-closed).
+
+        Flag: LLM_KNOWLEDGE_ADVERSARIAL_ENABLED (name kept for back-compat; now gates
+        both llm_knowledge and web_search fills).
         """
         from app.services.enrichment.sources.safe_enum_fill_source import (
             run_adversarial_verify,
         )
 
-        # Separate llm_knowledge fills from everything else.
+        # Sources routed through Gate B adversarial verify.
+        _ADVERSARIAL_SOURCES = {Source.LLM_KNOWLEDGE, Source.WEB_SEARCH}
+
+        # Separate inference fills from everything else.
         pending: list[AttributeValue] = []
         keep_as_is: list[AttributeValue] = []
         target_by_id: dict[int, TargetAttribute] = {t.id: t for t in targets}
 
         for v in all_values:
-            if v.source != Source.LLM_KNOWLEDGE:
+            if v.source not in _ADVERSARIAL_SOURCES:
                 keep_as_is.append(v)
                 continue
             # Skip verbatim-anchored fills — already confirmed by Gate A.
@@ -2925,8 +2937,10 @@ class PipelineOrchestrator:
             proposals.append((v.attribute_id, attr_name, str(v.value)))
 
         logger.info(
-            "[Pipeline] llm_knowledge adversarial pass: product=%s, %d fills to verify",
+            "[Pipeline] inference adversarial pass: product=%s, %d fills to verify "
+            "(sources: %s)",
             context.product_id, len(proposals),
+            ", ".join(sorted({str(v.source.value) for v in pending})),
         )
 
         try:
@@ -2937,7 +2951,7 @@ class PipelineOrchestrator:
             )
         except Exception as exc:
             logger.warning(
-                "[Pipeline] llm_knowledge adversarial pass failed (all retracted): %s",
+                "[Pipeline] inference adversarial pass failed (all retracted): %s",
                 exc,
             )
             confirmed_ids = set()  # fail-closed: retract all on error
@@ -2947,15 +2961,14 @@ class PipelineOrchestrator:
         for v in pending:
             if v.attribute_id in confirmed_ids:
                 logger.info(
-                    "[Pipeline] llm_knowledge adversarial CONFIRMED: attr=%s value=%r",
-                    v.attribute_id, v.value,
+                    "[Pipeline] inference adversarial CONFIRMED: attr=%s value=%r source=%s",
+                    v.attribute_id, v.value, v.source.value,
                 )
                 result.append(v)
             else:
                 logger.info(
-                    "[Pipeline] llm_knowledge adversarial RETRACTED (MUD): attr=%s value=%r "
-                    "source=%s — world-knowledge fill not strongly-implied-correct for "
-                    "this product",
+                    "[Pipeline] inference adversarial RETRACTED (MUD): attr=%s value=%r "
+                    "source=%s — not independently-verifiable-correct for this product",
                     v.attribute_id, v.value, v.source.value,
                 )
         return result
