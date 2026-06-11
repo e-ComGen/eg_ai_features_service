@@ -53,6 +53,24 @@ VISUAL_SEMANTIC_TYPES = {
 # This denylist acts as a hard gate: any attribute whose semantic_type is listed
 # here is silently dropped from Vision output regardless of what the LLM returns.
 # Extend this set; never shrink it without an explicit architectural decision.
+
+# Attribute IDs that are ALWAYS blocked from Vision regardless of semantic_type.
+# These are material/composition fields that leaked through when semantic_type was
+# not set or mapped to "material_visual" (a visual type). Belt-and-suspenders guard
+# in addition to NON_VISUAL_SEMANTIC_TYPES + name-based check below.
+_VISION_BLOCKED_ATTR_IDS: frozenset[int] = frozenset({
+    4496,   # Материал (Ozon)
+    4604,   # Состав (Ozon)
+})
+
+# Name substrings that identify material/composition targets.
+# Matched case-insensitively. Vision must never fill these.
+_VISION_BLOCKED_NAME_FRAGMENTS: tuple[str, ...] = (
+    "материал",  # Материал, Материал подкладки, Материал верха, etc.
+    "состав",    # Состав материала, Состав подкладки, etc.
+    "подкладк",  # Подкладка, Материал подкладки
+)
+
 NON_VISUAL_SEMANTIC_TYPES: frozenset[str] = frozenset({
     # Fabric / textile composition (Материал, Состав материала, …)
     "material",
@@ -152,6 +170,15 @@ class VisionSource(AttributeSource):
             return False
         # Numeric targets — vision плохо измеряет числа без референса.
         if target.type == "numeric":
+            return False
+        # Hard denylist by attribute_id: Материал (4496), Состав (4604).
+        # Belt-and-suspenders: semantic_type may be absent/wrong when attrs arrive
+        # from the scheduler; id-based check is unconditional.
+        if target.id in _VISION_BLOCKED_ATTR_IDS:
+            return False
+        # Hard denylist by name: Материал*/Состав*/Подкладка* fragments.
+        name_low = target.name.lower()
+        if any(frag in name_low for frag in _VISION_BLOCKED_NAME_FRAGMENTS):
             return False
         # Hard denylist: attrs whose semantic_type is known to be non-visual.
         # These cannot be determined from a photo — attempting them causes hallucinations.
@@ -264,10 +291,26 @@ class VisionSource(AttributeSource):
         for a in parsed.extracted:
             tgt = target_by_id.get(a.attribute_id)
             sem_type = tgt.semantic_type if tgt else None
+            tgt_name = (tgt.name or "") if tgt else ""
             # Second chokepoint: drop any non-visual attr the LLM tried to emit.
             # This catches cases where is_applicable was bypassed (e.g. direct
             # inject paths) or where semantic_type was None at scheduling time but
             # is known now via the target_by_id lookup.
+            # Guard order: id → name → semantic_type (belt-and-suspenders).
+            if a.attribute_id in _VISION_BLOCKED_ATTR_IDS:
+                logger.warning(
+                    "[Vision] dropping blocked-id attr %s (name=%r, value=%r) — "
+                    "material/composition attrs are never visually determinable",
+                    a.attribute_id, tgt_name, a.value,
+                )
+                continue
+            if any(frag in tgt_name.lower() for frag in _VISION_BLOCKED_NAME_FRAGMENTS):
+                logger.warning(
+                    "[Vision] dropping blocked-name attr %s (name=%r, value=%r) — "
+                    "material/composition attrs are never visually determinable",
+                    a.attribute_id, tgt_name, a.value,
+                )
+                continue
             if sem_type and sem_type.lower() in NON_VISUAL_SEMANTIC_TYPES:
                 logger.warning(
                     "[Vision] dropping non-visual attr %s (semantic_type=%s, value=%r) — "

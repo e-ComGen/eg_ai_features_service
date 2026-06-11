@@ -2336,6 +2336,20 @@ class PipelineOrchestrator:
                 all_values += new_avs
                 filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
 
+        # Stage 4.9: LLM_KNOWLEDGE adversarial post-merge pass (FIX #1).
+        # llm_knowledge writes world-knowledge values with NO verbatim anchor →
+        # confident hallucinations can reach `filled` (Apple Watch Series 3 model id,
+        # Бязь fabric for denim, Sony WH True Wireless, etc.).
+        # Fix: route all pending llm_knowledge fills through the same adversarial Gate B
+        # used by SafeEnumFillSource. Batched per product (1 LLM call). Retracted → DROP.
+        # Skip fills already verbatim-anchored to a fetched source (evidence tag
+        # "safe_enum:verbatim_gate" or source != LLM_KNOWLEDGE) — they are already gated.
+        # Off by default; enabled via LLM_KNOWLEDGE_ADVERSARIAL_ENABLED env flag.
+        if os.environ.get("LLM_KNOWLEDGE_ADVERSARIAL_ENABLED", "0") == "1":
+            all_values = await self._run_llm_knowledge_adversarial_pass(
+                all_values, targets, context, filled_so_far,
+            )
+
         # Stage 5: Finishing pass — focused re-extraction for empty required attributes
         all_values += await self._run_finishing(context, targets, all_values)
 
@@ -2455,6 +2469,22 @@ class PipelineOrchestrator:
         value_id ДО этого этапа (в _finalize и llm_resolve_tail), поэтому их
         корректно-резолвнутые значения НЕ затрагиваются.
         """
+        # Hard-drop: confidence <= 0.0 is always a zero-signal fill — drop globally
+        # before any merge. Catches Vision «ABS пластик» conf=0.0 / evidence=«No material
+        # listed» and any other source that emits a value it itself has no confidence in.
+        # «пусто честнее мусора» — owner rule. Applies to ALL sources, ALL targets.
+        conf_zero_dropped: list[AttributeValue] = []
+        for v in all_values:
+            if v.confidence <= 0.0:
+                logger.info(
+                    "[Pipeline] conf<=0 hard-drop: attr=%s value=%r source=%s conf=%s — "
+                    "zero-confidence fill never reaches filled set",
+                    v.attribute_id, v.value, v.source.value, v.confidence,
+                )
+                continue
+            conf_zero_dropped.append(v)
+        all_values = conf_zero_dropped
+
         # Placeholder pre-filter: «нет», «-», «n/a» etc. удаляем из enum-таргетов
         # ДО resolve_value_ids, чтобы они не осели как «filled» с value_id=None.
         targets_by_id = {t.id: t for t in targets}
@@ -2842,6 +2872,93 @@ class PipelineOrchestrator:
             return []
 
         return results
+
+    async def _run_llm_knowledge_adversarial_pass(
+        self,
+        all_values: list[AttributeValue],
+        targets: list[TargetAttribute],
+        context: ExtractionContext,
+        resolved_attrs: list[AttributeValue],
+    ) -> list[AttributeValue]:
+        """Stage 4.9: adversarial Gate B pass over all pending LLM_KNOWLEDGE fills.
+
+        llm_knowledge fills are world-knowledge values with NO verbatim anchor.
+        Self-reported confidence is meaningless for mud-detection (Бязь at conf=0.93).
+        This stage routes every unanchored llm_knowledge fill through the same Gate B
+        adversarial verifier used by SafeEnumFillSource — one batched LLM call.
+
+        Skips fills that are verbatim-anchored (evidence starts with
+        ``safe_enum:verbatim_gate``) — those already passed Gate A.
+        Skips non-llm_knowledge fills — they have independent verification (judges,
+        card-copy fidelity, verbatim extraction).
+
+        Retracted fills are DROPPED (empty > wrong). Errors retract all (fail-closed).
+        """
+        from app.services.enrichment.sources.safe_enum_fill_source import (
+            run_adversarial_verify,
+        )
+
+        # Separate llm_knowledge fills from everything else.
+        pending: list[AttributeValue] = []
+        keep_as_is: list[AttributeValue] = []
+        target_by_id: dict[int, TargetAttribute] = {t.id: t for t in targets}
+
+        for v in all_values:
+            if v.source != Source.LLM_KNOWLEDGE:
+                keep_as_is.append(v)
+                continue
+            # Skip verbatim-anchored fills — already confirmed by Gate A.
+            ev = (v.evidence or "")
+            if ev.startswith("safe_enum:verbatim_gate"):
+                keep_as_is.append(v)
+                continue
+            pending.append(v)
+
+        if not pending:
+            return all_values  # nothing to verify
+
+        # Build (attribute_id, attr_name, value) triples for the verifier.
+        proposals: list[tuple[int, str, str]] = []
+        for v in pending:
+            t = target_by_id.get(v.attribute_id)
+            attr_name = t.name if t else str(v.attribute_id)
+            proposals.append((v.attribute_id, attr_name, str(v.value)))
+
+        logger.info(
+            "[Pipeline] llm_knowledge adversarial pass: product=%s, %d fills to verify",
+            context.product_id, len(proposals),
+        )
+
+        try:
+            confirmed_ids = await run_adversarial_verify(
+                context,
+                proposals,
+                resolved_attrs=resolved_attrs,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Pipeline] llm_knowledge adversarial pass failed (all retracted): %s",
+                exc,
+            )
+            confirmed_ids = set()  # fail-closed: retract all on error
+
+        # Rebuild: keep confirmed fills, drop retracted.
+        result: list[AttributeValue] = list(keep_as_is)
+        for v in pending:
+            if v.attribute_id in confirmed_ids:
+                logger.info(
+                    "[Pipeline] llm_knowledge adversarial CONFIRMED: attr=%s value=%r",
+                    v.attribute_id, v.value,
+                )
+                result.append(v)
+            else:
+                logger.info(
+                    "[Pipeline] llm_knowledge adversarial RETRACTED (MUD): attr=%s value=%r "
+                    "source=%s — world-knowledge fill not strongly-implied-correct for "
+                    "this product",
+                    v.attribute_id, v.value, v.source.value,
+                )
+        return result
 
     async def _run_ozon_card_stage(
         self,

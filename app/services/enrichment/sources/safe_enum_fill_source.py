@@ -347,7 +347,8 @@ class SafeEnumFillSource(AttributeSource):
         adversarial_passed: list[_ProposedFill] = []
         if need_adversarial:
             confirmed_ids = await self._adversarial_verify(
-                context, need_adversarial, target_by_id
+                context, need_adversarial, target_by_id,
+                resolved_attrs=already_filled or [],
             )
             for prop in need_adversarial:
                 if prop.attribute_id in confirmed_ids:
@@ -504,11 +505,21 @@ class SafeEnumFillSource(AttributeSource):
         context: ExtractionContext,
         proposals: list[_ProposedFill],
         target_by_id: dict[int, TargetAttribute],
+        resolved_attrs: list[AttributeValue] | None = None,
     ) -> set[int]:
         """One batched LLM call verifies ALL proposals for this product.
 
         The verifier is told to RETRACT by default — it must actively confirm.
         Returns the set of attribute_ids whose proposed fill was CONFIRMED.
+
+        Parameters
+        ----------
+        resolved_attrs:
+            Already-merged/resolved AttributeValues from prior pipeline stages.
+            Passed to the verifier so it can RETRACT proposals that contradict
+            an already-established attribute value (e.g. Windows version proposed
+            when OS=«Без ОС» is already resolved; HDD count=1 when HDD=0).
+            General rule — no hardcoded attribute names.
         """
         if not proposals:
             return set()
@@ -523,6 +534,24 @@ class SafeEnumFillSource(AttributeSource):
         if not items_block:
             return set()
 
+        # Build a concise already-resolved context block for the verifier so it can
+        # detect contradictions (e.g. proposed Версия Windows=«Windows 11» when
+        # resolved OS=«Без ОС»). Generic — no hardcoded attribute names/ids.
+        resolved_block = ""
+        if resolved_attrs:
+            lines = [
+                f"  {av.attribute_id}: {av.value!r}"
+                for av in resolved_attrs
+                if av.value is not None
+            ]
+            if lines:
+                resolved_block = (
+                    "\nAlready-established attributes for this product "
+                    "(do NOT propose contradicting values):\n"
+                    + "\n".join(lines[:40])  # cap to keep prompt manageable
+                    + "\n"
+                )
+
         system_prompt = (
             "You are a strict product-data auditor. For each proposed attribute fill, "
             "decide: is this value correct for this product? Your default answer is "
@@ -535,6 +564,9 @@ class SafeEnumFillSource(AttributeSource):
             "well-known product-type defaults are fine to confirm.\n"
             "- NOT_CONFIRMED when the value is WRONG or contradicted by product knowledge "
             "(e.g. Бязь fabric for denim jeans, для дома purpose for outdoor jeans).\n"
+            "- NOT_CONFIRMED when the proposed value CONTRADICTS an already-established "
+            "attribute listed in the context (e.g. Windows version when OS=«Без ОС», "
+            "HDD count > 0 when HDD capacity=0).\n"
             "- NOT_CONFIRMED when the value is a baseless random guess with no connection "
             "to the product type, brand, or category.\n"
             "- Default to NOT_CONFIRMED only when genuinely uncertain — do not retract "
@@ -545,8 +577,9 @@ class SafeEnumFillSource(AttributeSource):
         user_text = (
             f"Product: {context.product_name}\n"
             f"Brand: {context.brand or 'unknown'}\n"
-            f"Category: {' / '.join(context.category_path) or 'n/a'}\n\n"
-            f"Proposed fills to verify:\n{items_block}\n\n"
+            f"Category: {' / '.join(context.category_path) or 'n/a'}\n"
+            + resolved_block
+            + f"\nProposed fills to verify:\n{items_block}\n\n"
             "Audit each fill. Default to NOT_CONFIRMED when unsure."
         )
 
@@ -576,3 +609,110 @@ class SafeEnumFillSource(AttributeSource):
         # values below SOURCE_CONFIDENCE_THRESHOLDS[SAFE_ENUM_FILL].
         from app.services.enrichment.judges.knowledge_judge import KnowledgeJudge
         return KnowledgeJudge()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public helper: standalone adversarial verify (DRY — reused by pipeline for
+# the LLM_KNOWLEDGE post-merge pass in addition to SafeEnumFillSource).
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+async def run_adversarial_verify(
+    context: ExtractionContext,
+    proposals: list[tuple[int, str, str]],
+    resolved_attrs: list[AttributeValue] | None = None,
+    llm_manager: Optional[StructuredLlmManager] = None,
+) -> set[int]:
+    """Standalone adversarial verifier — same Gate B used by SafeEnumFillSource.
+
+    Parameters
+    ----------
+    context:
+        Product extraction context (name, brand, category, etc.)
+    proposals:
+        List of (attribute_id, attr_name, proposed_value) triples to verify.
+    resolved_attrs:
+        Already-resolved AttributeValues from the product — used to detect
+        contradictions (e.g. Windows version when OS=«Без ОС»).
+    llm_manager:
+        LLM manager to use. Defaults to get_main_manager().
+
+    Returns
+    -------
+    Set of attribute_ids whose proposed fill was CONFIRMED by the verifier.
+    NOT_CONFIRMED (including on LLM error) → retract (fail-closed).
+    """
+    if not proposals:
+        return set()
+
+    llm = llm_manager or get_main_manager()
+
+    items_block = "\n".join([
+        f"- attribute_id={attr_id}, attr_name={attr_name!r}, proposed_value={value!r}"
+        for attr_id, attr_name, value in proposals
+    ])
+
+    resolved_block = ""
+    if resolved_attrs:
+        lines = [
+            f"  {av.attribute_id}: {av.value!r}"
+            for av in resolved_attrs
+            if av.value is not None
+        ]
+        if lines:
+            resolved_block = (
+                "\nAlready-established attributes for this product "
+                "(RETRACT any proposal that contradicts these):\n"
+                + "\n".join(lines[:40])
+                + "\n"
+            )
+
+    system_prompt = (
+        "You are a strict product-data auditor. For each proposed attribute fill, "
+        "decide: is this value strongly implied-correct for THIS specific product? "
+        "Your default answer is NOT_CONFIRMED — only confirm when the value is clearly "
+        "correct or strongly implied for this exact product.\n\n"
+        "Rules:\n"
+        "- CONFIRM when the value is clearly correct for this product or a well-known "
+        "default for this exact product TYPE (e.g. OS=Android for a Samsung Galaxy phone, "
+        "color from a product card for a specific variant).\n"
+        "- NOT_CONFIRMED when the value is WRONG or contradicted by product knowledge "
+        "(e.g. Бязь fabric for denim jeans, Series 3 model for a Series 9 watch listing).\n"
+        "- NOT_CONFIRMED when the proposed value CONTRADICTS an already-established "
+        "attribute listed in the context (e.g. True Wireless=Да for an over-ear headphone, "
+        "stereo 2.0 for a mono smart speaker).\n"
+        "- NOT_CONFIRMED when the value is a confident-sounding world-knowledge guess "
+        "that is NOT specifically anchored to THIS product.\n"
+        "- Fail closed: when uncertain → NOT_CONFIRMED.\n"
+        "Return 'verifications' list: {attribute_id, verdict: 'CONFIRMED'|'NOT_CONFIRMED'}."
+    )
+
+    user_text = (
+        f"Product: {context.product_name}\n"
+        f"Brand: {context.brand or 'unknown'}\n"
+        f"Category: {' / '.join(context.category_path) or 'n/a'}\n"
+        + resolved_block
+        + f"\nProposed fills to verify:\n{items_block}\n\n"
+        "For each fill: is this value strongly implied-correct for THIS specific product? "
+        "Default to NOT_CONFIRMED when unsure."
+    )
+
+    try:
+        parsed, _ = await llm.structured_request(
+            system_prompt=system_prompt,
+            user_text=user_text,
+            response_model=_AdversarialResponse,
+        )
+    except Exception as exc:
+        logger.warning("[AdversarialVerify] LLM call failed: %s", exc)
+        return set()  # fail closed — all proposals retracted on error
+
+    context.llm_calls_so_far += 1
+    if parsed is None:
+        return set()
+
+    confirmed: set[int] = set()
+    for v in parsed.verifications:
+        if v.verdict.upper().strip() == "CONFIRMED":
+            confirmed.add(v.attribute_id)
+    return confirmed
