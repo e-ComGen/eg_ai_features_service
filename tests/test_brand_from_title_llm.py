@@ -253,12 +253,14 @@ async def test_category_noun_returned_by_llm_dropped():
 
 
 # ---------------------------------------------------------------------------
-# (f) No options available → skips silently (no hallucination)
+# (f) No options available (both t.allowed_values and brand_options_fn empty)
+#     → free-text path: LLM IS called with unconstrained prompt; result validated
+#     by title-anchor + category-noun guards (enum-match guard skipped).
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_no_options_skips_silently():
-    """(f) brand_options_fn returns [] → no LLM call, field stays empty."""
+async def test_enum_free_brand_fills_yandex():
+    """(f1) Умная колонка Яндекс — free-text brand, no options → Яндекс filled."""
     ctx = _ctx("Умная колонка Яндекс Станция Мини 2",
                category_path=["Электроника", "Умная колонка"])
     target = _brand_target([])
@@ -267,11 +269,102 @@ async def test_no_options_skips_silently():
     with patch("app.services.enrichment.pipeline.get_main_manager", return_value=mock_llm):
         out = await _apply_brand_from_title_llm(
             [], [target], ctx,
-            brand_options_fn=lambda aid: [],  # empty dict
+            brand_options_fn=lambda aid: [],  # no dict → enum_free=True
+        )
+
+    v = _val_for(out)
+    assert v is not None and v.value == "Яндекс"
+    assert v.source == Source.DESCRIPTION
+    assert v.evidence == _BRAND_FROM_TITLE_LLM_EVIDENCE
+    assert v.value_id is None  # free-text: no enum id
+
+
+@pytest.mark.asyncio
+async def test_enum_free_brand_fills_pocketbook():
+    """(f2) Электронная книга PocketBook — free-text brand → PocketBook filled."""
+    ctx = _ctx("Электронная книга PocketBook 629 Verse",
+               category_path=["Электроника", "Электронная книга"])
+    target = _brand_target([])
+    mock_llm = _mock_llm_returning("PocketBook")
+
+    with patch("app.services.enrichment.pipeline.get_main_manager", return_value=mock_llm):
+        out = await _apply_brand_from_title_llm(
+            [], [target], ctx,
+            brand_options_fn=lambda aid: [],
+        )
+
+    v = _val_for(out)
+    assert v is not None and v.value == "PocketBook"
+
+
+@pytest.mark.asyncio
+async def test_enum_free_brand_fills_bosch():
+    """(f3) Стиральная машина Bosch — free-text brand → Bosch filled."""
+    ctx = _ctx("Стиральная машина Bosch WGG2540MOE",
+               category_path=["Бытовая техника", "Стиральная машина"])
+    target = _brand_target([])
+    mock_llm = _mock_llm_returning("Bosch")
+
+    with patch("app.services.enrichment.pipeline.get_main_manager", return_value=mock_llm):
+        out = await _apply_brand_from_title_llm(
+            [], [target], ctx,
+            brand_options_fn=lambda aid: [],
+        )
+
+    v = _val_for(out)
+    assert v is not None and v.value == "Bosch"
+
+
+@pytest.mark.asyncio
+async def test_enum_free_brand_fills_samsung():
+    """(f4) Микроволновая печь Samsung — free-text brand → Samsung filled."""
+    ctx = _ctx("Микроволновая печь Samsung MS23K3513AK",
+               category_path=["Бытовая техника", "Микроволновая печь"])
+    target = _brand_target([])
+    mock_llm = _mock_llm_returning("Samsung")
+
+    with patch("app.services.enrichment.pipeline.get_main_manager", return_value=mock_llm):
+        out = await _apply_brand_from_title_llm(
+            [], [target], ctx,
+            brand_options_fn=lambda aid: [],
+        )
+
+    v = _val_for(out)
+    assert v is not None and v.value == "Samsung"
+
+
+@pytest.mark.asyncio
+async def test_enum_free_mud_title_stays_empty():
+    """(f5) Mud title with no brand → LLM returns null → field stays empty."""
+    ctx = _ctx("Умная колонка Мини 2",
+               category_path=["Электроника", "Умная колонка"])
+    target = _brand_target([])
+    mock_llm = _mock_llm_returning(None)  # no brand identifiable
+
+    with patch("app.services.enrichment.pipeline.get_main_manager", return_value=mock_llm):
+        out = await _apply_brand_from_title_llm(
+            [], [target], ctx,
+            brand_options_fn=lambda aid: [],
         )
 
     assert _val_for(out) is None
-    assert mock_llm.structured_request.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_enum_free_hallucinated_brand_not_in_title_dropped():
+    """(f6) LLM hallucinates a brand not in the mud title → title-anchor drops it."""
+    ctx = _ctx("Умная колонка Мини 2",
+               category_path=["Электроника", "Умная колонка"])
+    target = _brand_target([])
+    mock_llm = _mock_llm_returning("Яндекс")  # "Яндекс" NOT in this title
+
+    with patch("app.services.enrichment.pipeline.get_main_manager", return_value=mock_llm):
+        out = await _apply_brand_from_title_llm(
+            [], [target], ctx,
+            brand_options_fn=lambda aid: [],
+        )
+
+    assert _val_for(out) is None  # title-anchor guard rejects it
 
 
 # ---------------------------------------------------------------------------

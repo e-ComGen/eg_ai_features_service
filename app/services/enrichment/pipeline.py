@@ -910,7 +910,7 @@ async def _apply_brand_from_title_llm(
     brand_options_fn: Optional[Callable[[int], list[str]]] = None,
     brand_id_fn: Optional[Callable[[int], dict[str, int]]] = None,
 ) -> list[AttributeValue]:
-    """POST-merge ASYNC brand filler: LLM picks brand from TITLE, constrained to enum.
+    """POST-merge ASYNC brand filler: LLM picks brand from TITLE.
 
     Runs ONLY for brand targets that are STILL EMPTY after _apply_brand_from_name.
     Scenario: "Умная колонка Яндекс Станция Мини 2" — the positional parser set
@@ -918,26 +918,31 @@ async def _apply_brand_from_title_llm(
     The dict scan also misses Яндекс when it's absent from the first 5000 brands.
     This LLM call bridges that gap.
 
-    Safety constraints (fail-closed — «пусто честнее мусора»):
-      1. TITLE-ANCHORED: the prompt explicitly forbids returning a brand not present
-         in the title. Returned value must pass _brand_in_name / _needle_brand_in_name
-         token check → drop if fails (empty > wrong).
-      2. ENUM-CONSTRAINED: the prompt receives the official allowed-brand list and
-         must return one of those values or null. Value not in the options list → drop.
-      3. NULL allowed: LLM returns null → field stays empty. No forced fills.
-      4. CATEGORY-NOUN GUARD: returned value is checked via _is_category_noun_brand;
-         category nouns are rejected even if LLM returns them.
-      5. Source=DESCRIPTION, evidence="brand_from_title_llm": naturally bypasses
-         _BRAND_GUESS_SOURCES guard (which only blocks VISION/WEB_SEARCH/
-         LLM_KNOWLEDGE/COMPETITOR_RAG). The DESCRIPTION source is authoritative
-         by convention — we are reading the product TITLE, not inferring from
-         world knowledge.
-      6. General LLM brand guessing (LLM_KNOWLEDGE source) remains DROPPED as
-         before. This path is exempt ONLY because it is title-anchored and
-         enum-constrained, not because we loosened the general guard.
+    Two sub-paths depending on whether the brand target has an allowed-values list:
 
-    value_id is resolved synchronously via brand_id_fn (same exact-match as
-    _apply_brand_from_name); brand survives drain-C (required-enum drop on None id).
+    ENUM-CONSTRAINED (enum_free=False, original behaviour):
+      The prompt receives the official allowed-brand list and must return one of
+      those values or null. Value not in the options list → drop.
+      value_id is resolved via brand_id_fn; survives drain-C (required-enum drop).
+
+    ENUM-FREE (enum_free=True, new path):
+      Brand target has no allowed_values — it is a free-text field. Applies to
+      categories where «Бренд» accepts arbitrary strings (Умная колонка, Электронная
+      книга, Стиральная машина, Микроволновая печь, …). Uses an unconstrained prompt
+      that asks "what brand name literally appears in the title?". All the same
+      safety guards apply (title-anchored, category-noun, gender/adj noise); only the
+      enum-match check is skipped (there is no enum). value_id stays None by design
+      (free-text) — drain-C (_drop_unresolved_required_enums) skips targets without
+      allowed_values, so None value_id is safe here.
+
+    Shared safety constraints (fail-closed — «пусто честнее мусора»):
+      1. TITLE-ANCHORED: returned value must pass _needle_brand_in_name token check.
+      2. NULL allowed: LLM returns null → field stays empty. No forced fills.
+      3. CATEGORY-NOUN GUARD: _is_category_noun_brand rejects category nouns.
+      4. GENDER/ADJ NOISE GUARD: _is_gender_noise_token / _is_adjective_noise_token.
+      5. Source=DESCRIPTION, evidence="brand_from_title_llm": bypasses
+         _BRAND_GUESS_SOURCES guard (reads the title, not world knowledge).
+      6. General LLM brand guessing (LLM_KNOWLEDGE source) remains DROPPED.
     """
     # Lazy import to avoid circular deps and keep LLM import at call site only.
     from pydantic import BaseModel as _PydanticBase, Field as _Field
@@ -961,8 +966,11 @@ async def _apply_brand_from_title_llm(
 
     all_cat_words = _all_category_words(context.category_path)
 
-    # Collect (attr_id, options_list) pairs that still need filling.
-    pending: list[tuple[int, list[str]]] = []
+    # Collect (attr_id, options_list, enum_free) triples that still need filling.
+    # enum_free=True  → brand target has NO allowed_values (free-text field).
+    #                   Use unconstrained title-extraction prompt; skip enum-match guard.
+    # enum_free=False → normal enum-constrained path (existing behaviour, unchanged).
+    pending: list[tuple[int, list[str], bool]] = []
     for attr_id, t in brand_targets.items():
         if attr_id in filled_attr_ids:
             continue  # already filled by deterministic path
@@ -982,10 +990,10 @@ async def _apply_brand_from_title_llm(
                     attr_id, exc,
                 )
 
-        if not options:
-            continue  # No enum to constrain against — skip (anti-hallucination).
-
-        pending.append((attr_id, options))
+        enum_free = not options
+        # enum_free targets: run unconstrained title-extraction (all safety guards kept).
+        # enum-constrained targets: run original allowed-list prompt.
+        pending.append((attr_id, options, enum_free))
 
     if not pending:
         return merged
@@ -994,125 +1002,238 @@ async def _apply_brand_from_title_llm(
     out = list(merged)
     llm = get_main_manager()
 
-    for attr_id, options in pending:
-        # Truncate to a safe size to keep prompt concise.
-        options_for_prompt = options[:_BRAND_FROM_TITLE_LLM_MAX_OPTIONS]
-        options_str = ", ".join(f'"{o}"' for o in options_for_prompt)
+    def _norm_cmp(s: str) -> str:
+        return s.strip().lower().replace("ё", "е")
 
-        class _BrandFromTitleResponse(_PydanticBase):
-            brand: Optional[str] = _Field(
-                None,
-                description=(
-                    "Exact brand value from the allowed list that is PRESENT in the title, "
-                    "or null if no allowed brand appears in the title."
-                ),
+    for attr_id, options, enum_free in pending:
+
+        if enum_free:
+            # ── FREE-TEXT brand path ────────────────────────────────────────────
+            # No allowed-list to constrain against; prompt asks for the exact
+            # manufacturer/brand name that literally appears in the title.
+
+            class _BrandFreeTextResponse(_PydanticBase):
+                brand: Optional[str] = _Field(
+                    None,
+                    description=(
+                        "The manufacturer/brand name that literally appears in the "
+                        "product title as a word or phrase (its exact spelling from "
+                        "the title), or null if no clear brand name is present."
+                    ),
+                )
+
+            system_prompt = (
+                "You are a brand-extraction assistant. Your ONLY job is to find the "
+                "manufacturer or brand name that is literally written in the product title.\n\n"
+                "RULES (non-negotiable):\n"
+                "1. Return the brand ONLY if it appears verbatim in the title as a word or phrase.\n"
+                "2. Do NOT infer brands from world knowledge or context. Read the title literally.\n"
+                "3. Category nouns are NOT brands: колонка, книга, машина, печь, телефон, "
+                "принтер, монитор, планшет, холодильник, пылесос and similar descriptive words "
+                "describe the product type, NOT the maker → return null for those.\n"
+                "4. Return the brand spelled EXACTLY as it appears in the title.\n"
+                "5. If the title contains no identifiable brand name → return null.\n"
+                "6. Null is always safer than a wrong answer."
+            )
+            user_text = (
+                f"Product title: {name}\n\n"
+                "What manufacturer or brand name appears literally in this title? "
+                "Return its exact spelling from the title, or null if none is present."
             )
 
-        system_prompt = (
-            "You are a brand-extraction assistant. Your ONLY job is to identify which brand "
-            "from the provided ALLOWED LIST is explicitly present in the product title.\n\n"
-            "RULES (non-negotiable):\n"
-            "1. Return a brand ONLY if it literally appears in the title as a word or phrase.\n"
-            "2. Do NOT guess or infer brands from world knowledge. If unsure → return null.\n"
-            "3. The returned value must be EXACTLY one of the allowed values (spelling must match).\n"
-            "4. If zero or multiple allowed brands appear in the title → return null.\n"
-            "5. Category nouns (колонка, книга, машина, печь, телефон, etc.) are NOT brands → null.\n"
-            "6. Return null rather than an incorrect brand. Empty is safer than wrong."
-        )
-        user_text = (
-            f"Product title: {name}\n\n"
-            f"Allowed brands: {options_str}\n\n"
-            "Which single brand from the allowed list appears in this title? "
-            "Return its exact spelling from the list, or null."
-        )
+            try:
+                parsed, _ = await llm.structured_request(
+                    system_prompt=system_prompt,
+                    user_text=user_text,
+                    response_model=_BrandFreeTextResponse,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[Pipeline] brand-from-title-llm (free-text): LLM call failed for attr %s: %s",
+                    attr_id, exc,
+                )
+                continue
 
-        try:
-            parsed, _ = await llm.structured_request(
-                system_prompt=system_prompt,
-                user_text=user_text,
-                response_model=_BrandFromTitleResponse,
-            )
-        except Exception as exc:
-            logger.warning(
-                "[Pipeline] brand-from-title-llm: LLM call failed for attr %s: %s",
-                attr_id, exc,
-            )
-            continue
+            context.llm_calls_so_far += 1
 
-        context.llm_calls_so_far += 1
+            if parsed is None or parsed.brand is None:
+                logger.info(
+                    "[Pipeline] brand-from-title-llm (free-text): attr %s — LLM returned null "
+                    "for title=%r",
+                    attr_id, name[:60],
+                )
+                continue
 
-        if parsed is None or parsed.brand is None:
+            brand_raw = str(parsed.brand).strip()
+            if not brand_raw:
+                continue
+
+            # Safety guard 1 (free-text): must appear verbatim in the title.
+            # Use _needle_brand_in_name (min-len=2) — brand comes from LLM reading the title,
+            # not from world-knowledge, so 2-char abbreviations (LG, HP) are acceptable.
+            if not _needle_brand_in_name(brand_raw, name_tokens):
+                logger.info(
+                    "[Pipeline] brand-from-title-llm (free-text): attr %s, '%s' NOT found in "
+                    "title tokens → drop (title-anchored constraint)",
+                    attr_id, brand_raw,
+                )
+                continue
+
+            # Safety guard 2 (free-text): category-noun filter.
+            if _is_category_noun_brand(brand_raw, all_cat_words):
+                logger.info(
+                    "[Pipeline] brand-from-title-llm (free-text): attr %s, '%s' is a category "
+                    "noun → drop",
+                    attr_id, brand_raw,
+                )
+                continue
+
+            # Safety guard 3 (free-text): adjective/gender noise.
+            b_tokens_ft = _brand_norm_tokens(brand_raw)
+            if len(b_tokens_ft) == 1 and (
+                _is_gender_noise_token(b_tokens_ft[0]) or _is_adjective_noise_token(b_tokens_ft[0])
+            ):
+                logger.info(
+                    "[Pipeline] brand-from-title-llm (free-text): attr %s, '%s' is "
+                    "gender/adj noise → drop",
+                    attr_id, brand_raw,
+                )
+                continue
+
+            # All free-text guards passed.
+            # value_id stays None — free-text brand has no enum to bind.
+            # drain-C (_drop_unresolved_required_enums) checks `not target.allowed_values`
+            # first and skips the whole target → None value_id is safe here.
             logger.info(
-                "[Pipeline] brand-from-title-llm: attr %s — LLM returned null for title=%r",
-                attr_id, name[:60],
+                "[Pipeline] brand-from-title-llm (free-text): attr %s ← '%s' from title=%r",
+                attr_id, brand_raw, name[:60],
             )
-            continue
+            out.append(AttributeValue(
+                attribute_id=attr_id,
+                value=brand_raw,
+                value_id=None,
+                confidence=_BRAND_FROM_TITLE_LLM_CONF,
+                source=Source.DESCRIPTION,
+                evidence=_BRAND_FROM_TITLE_LLM_EVIDENCE,
+            ))
 
-        brand_raw = str(parsed.brand).strip()
-        if not brand_raw:
-            continue
+        else:
+            # ── ENUM-CONSTRAINED brand path (original behaviour, unchanged) ────
+            # Truncate to a safe size to keep prompt concise.
+            options_for_prompt = options[:_BRAND_FROM_TITLE_LLM_MAX_OPTIONS]
+            options_str = ", ".join(f'"{o}"' for o in options_for_prompt)
 
-        # Safety guard 1: returned value must be in the options list (enum constraint).
-        def _norm_cmp(s: str) -> str:
-            return s.strip().lower().replace("ё", "е")
+            class _BrandFromTitleResponse(_PydanticBase):
+                brand: Optional[str] = _Field(
+                    None,
+                    description=(
+                        "Exact brand value from the allowed list that is PRESENT in the title, "
+                        "or null if no allowed brand appears in the title."
+                    ),
+                )
 
-        norm_raw = _norm_cmp(brand_raw)
-        matched_option: Optional[str] = None
-        for opt in options:
-            if _norm_cmp(opt) == norm_raw:
-                matched_option = opt
-                break
-        if matched_option is None:
+            system_prompt = (
+                "You are a brand-extraction assistant. Your ONLY job is to identify which brand "
+                "from the provided ALLOWED LIST is explicitly present in the product title.\n\n"
+                "RULES (non-negotiable):\n"
+                "1. Return a brand ONLY if it literally appears in the title as a word or phrase.\n"
+                "2. Do NOT guess or infer brands from world knowledge. If unsure → return null.\n"
+                "3. The returned value must be EXACTLY one of the allowed values (spelling must match).\n"
+                "4. If zero or multiple allowed brands appear in the title → return null.\n"
+                "5. Category nouns (колонка, книга, машина, печь, телефон, etc.) are NOT brands → null.\n"
+                "6. Return null rather than an incorrect brand. Empty is safer than wrong."
+            )
+            user_text = (
+                f"Product title: {name}\n\n"
+                f"Allowed brands: {options_str}\n\n"
+                "Which single brand from the allowed list appears in this title? "
+                "Return its exact spelling from the list, or null."
+            )
+
+            try:
+                parsed, _ = await llm.structured_request(
+                    system_prompt=system_prompt,
+                    user_text=user_text,
+                    response_model=_BrandFromTitleResponse,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[Pipeline] brand-from-title-llm: LLM call failed for attr %s: %s",
+                    attr_id, exc,
+                )
+                continue
+
+            context.llm_calls_so_far += 1
+
+            if parsed is None or parsed.brand is None:
+                logger.info(
+                    "[Pipeline] brand-from-title-llm: attr %s — LLM returned null for title=%r",
+                    attr_id, name[:60],
+                )
+                continue
+
+            brand_raw = str(parsed.brand).strip()
+            if not brand_raw:
+                continue
+
+            # Safety guard 1: returned value must be in the options list (enum constraint).
+            norm_raw = _norm_cmp(brand_raw)
+            matched_option: Optional[str] = None
+            for opt in options:
+                if _norm_cmp(opt) == norm_raw:
+                    matched_option = opt
+                    break
+            if matched_option is None:
+                logger.info(
+                    "[Pipeline] brand-from-title-llm: attr %s, LLM returned '%s' "
+                    "NOT in options list → drop (enum constraint)",
+                    attr_id, brand_raw,
+                )
+                continue
+
+            # Safety guard 2: must appear in the title (title-anchored, use needle min-len=2
+            # since these are known brands from the official enum, not arbitrary strings).
+            if not _needle_brand_in_name(matched_option, name_tokens):
+                logger.info(
+                    "[Pipeline] brand-from-title-llm: attr %s, '%s' NOT found in title tokens "
+                    "→ drop (title-anchored constraint)",
+                    attr_id, matched_option,
+                )
+                continue
+
+            # Safety guard 3: category-noun filter (same as needle path).
+            if _is_category_noun_brand(matched_option, all_cat_words):
+                logger.info(
+                    "[Pipeline] brand-from-title-llm: attr %s, '%s' is a category noun → drop",
+                    attr_id, matched_option,
+                )
+                continue
+
+            # Safety guard 4: adjective/gender noise.
+            b_tokens = _brand_norm_tokens(matched_option)
+            if len(b_tokens) == 1 and (
+                _is_gender_noise_token(b_tokens[0]) or _is_adjective_noise_token(b_tokens[0])
+            ):
+                logger.info(
+                    "[Pipeline] brand-from-title-llm: attr %s, '%s' is gender/adj noise → drop",
+                    attr_id, matched_option,
+                )
+                continue
+
+            # All guards passed — resolve value_id and emit.
+            vid = _resolve_brand_value_id(matched_option, attr_id, brand_id_fn)
             logger.info(
-                "[Pipeline] brand-from-title-llm: attr %s, LLM returned '%s' "
-                "NOT in options list → drop (enum constraint)",
-                attr_id, brand_raw,
+                "[Pipeline] brand-from-title-llm: attr %s ← '%s' (vid=%s) from title=%r",
+                attr_id, matched_option, vid, name[:60],
             )
-            continue
-
-        # Safety guard 2: must appear in the title (title-anchored, use needle min-len=2
-        # since these are known brands from the official enum, not arbitrary strings).
-        if not _needle_brand_in_name(matched_option, name_tokens):
-            logger.info(
-                "[Pipeline] brand-from-title-llm: attr %s, '%s' NOT found in title tokens "
-                "→ drop (title-anchored constraint)",
-                attr_id, matched_option,
-            )
-            continue
-
-        # Safety guard 3: category-noun filter (same as needle path).
-        if _is_category_noun_brand(matched_option, all_cat_words):
-            logger.info(
-                "[Pipeline] brand-from-title-llm: attr %s, '%s' is a category noun → drop",
-                attr_id, matched_option,
-            )
-            continue
-
-        # Safety guard 4: adjective/gender noise.
-        b_tokens = _brand_norm_tokens(matched_option)
-        if len(b_tokens) == 1 and (
-            _is_gender_noise_token(b_tokens[0]) or _is_adjective_noise_token(b_tokens[0])
-        ):
-            logger.info(
-                "[Pipeline] brand-from-title-llm: attr %s, '%s' is gender/adj noise → drop",
-                attr_id, matched_option,
-            )
-            continue
-
-        # All guards passed — resolve value_id and emit.
-        vid = _resolve_brand_value_id(matched_option, attr_id, brand_id_fn)
-        logger.info(
-            "[Pipeline] brand-from-title-llm: attr %s ← '%s' (vid=%s) from title=%r",
-            attr_id, matched_option, vid, name[:60],
-        )
-        out.append(AttributeValue(
-            attribute_id=attr_id,
-            value=matched_option,
-            value_id=vid,
-            confidence=_BRAND_FROM_TITLE_LLM_CONF,
-            source=Source.DESCRIPTION,
-            evidence=_BRAND_FROM_TITLE_LLM_EVIDENCE,
-        ))
+            out.append(AttributeValue(
+                attribute_id=attr_id,
+                value=matched_option,
+                value_id=vid,
+                confidence=_BRAND_FROM_TITLE_LLM_CONF,
+                source=Source.DESCRIPTION,
+                evidence=_BRAND_FROM_TITLE_LLM_EVIDENCE,
+            ))
 
     return out
 
