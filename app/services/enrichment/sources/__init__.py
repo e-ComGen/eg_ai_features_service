@@ -15,7 +15,6 @@ from .yandex_market_source import YandexMarketSource
 from .scrapfly_ozon_source import ScrapflyOzonSource
 from .safe_enum_fill_source import SafeEnumFillSource
 from .barcode_source import BarcodeSource
-from .title_cross_fill_source import TitleCrossFillSource
 
 __all__ = [
     "DescriptionSource",
@@ -34,5 +33,4 @@ __all__ = [
     "ScrapflyOzonSource",
     "SafeEnumFillSource",
     "BarcodeSource",
-    "TitleCrossFillSource",
 ]

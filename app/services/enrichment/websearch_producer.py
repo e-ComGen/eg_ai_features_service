@@ -121,12 +121,6 @@ class WebSearchProducer:
             self._use_serper = False
             self._serper = None
             self._extractor = None
-        # Raw page text from last _produce_via_serper call (before LLM summarisation).
-        # Set during each serper call; read by WebSearchSource right after produce_summary
-        # to extract verbatim spec pairs (OemSpecHarvest).  Thread-safety: asyncio
-        # pipeline processes one product at a time per WebSearchProducer instance.
-        self._last_page_text: Optional[str] = None
-
     # Language-specific query suffixes — anchor Serper towards spec-like pages
     # in each language. For unknown languages we fall back to English (which
     # Google's mixed-language ranking handles best).
@@ -265,12 +259,6 @@ class WebSearchProducer:
         timeout: int,
         lang: str = "ru",
     ) -> Optional[str]:
-        # Reset page-text cache only for the RU pass (preferred language for OEM
-        # spec-harvest).  In dual-lang mode both calls run concurrently; resetting
-        # only on RU prevents EN from clearing a RU result that finished first,
-        # and the write guard below ensures EN never overwrites RU.
-        if lang == "ru":
-            self._last_page_text = None
         # Build search query — MPN first (highest signal: точный код производителя),
         # then product_name + brand + ean (любые secondary identifiers).
         parts: list[str] = []
@@ -385,14 +373,6 @@ class WebSearchProducer:
                         + raw_page_text[:_PAGE_TEXT_CAP]
                         + "\n"
                     )
-                    # Expose raw page text for OemSpecHarvest verbatim pass.
-                    # Stored here (before LLM summarisation) so spec lines are
-                    # intact; the LLM summary loses the «Key: Value» structure.
-                    # RU-preference: only write when lang=="ru" OR when no RU
-                    # result has been stored yet (prevents EN from overwriting RU
-                    # in dual-lang concurrent execution).
-                    if lang == "ru" or self._last_page_text is None:
-                        self._last_page_text = raw_page_text[:_PAGE_TEXT_CAP]
                     logger.debug(
                         "WebSearchProducer (serper): fetched %d chars from %d page(s) for %r.",
                         len(raw_page_text),
