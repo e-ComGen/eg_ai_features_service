@@ -57,6 +57,11 @@ from app.services.enrichment.sources.wb_card_source import (
 # helper, что и wb_card_source._target_type_lemma/_card_subj_lemmas, чтобы
 # «Футболки»↔«Футболка» сходились без новой зависимости и без своей морфологии.
 from app.services.enrichment.sources.wb_card_source import _lemma as _type_lemma
+from app.services.enrichment.sources.icecat_numeric_normalizer import (
+    _detect_attr_unit,
+    _parse_float as _icecat_parse_float,
+    _format_number as _icecat_format_number,
+)
 from app.services.enrichment.intelligence import LlmClassifier, CostPredictor
 from app.services.providers.factory import get_main_manager
 from app.services.enrichment.confidence_aware_judge import ConfidenceAwareJudgeWrapper
@@ -1655,6 +1660,112 @@ def _apply_size_from_name(
 
 
 # ---------------------------------------------------------------------------
+# Lever 1: "Название" — fill the marketplace product-title target verbatim from
+# the input product name.
+#
+# The marketplace schema has a product-title attribute (name == "Название", or
+# synonyms like "Наименование товара") that is often left empty in the gap.
+# We already RECEIVE this value as context.product_name — fill it verbatim.
+# Conservative guards:
+#   - Only matches the STANDALONE title field ("Название" / "Наименование")
+#     NOT any compound attr with "название" embedded ("название цвета",
+#     "название бренда", etc.).
+#   - Only fills EMPTY targets — never overwrites.
+#   - Source=DESCRIPTION (the input product name is product-specific data).
+#   - Confidence 0.97 (verbatim, no inference) — above DESCRIPTION threshold.
+# ---------------------------------------------------------------------------
+_TITLE_FROM_INPUT_CONF = 0.97
+_TITLE_FROM_INPUT_EVIDENCE = "название:from_input"
+
+# Exact/bare standalone title field names (lower-stripped).
+# The match is: attr name lowercased == one of these strings EXACTLY,
+# OR attr name lowercased startswith one of these AND has no meaningful suffix.
+# We use an exact-match set — cheap and safe.
+_TITLE_FIELD_NAMES: frozenset[str] = frozenset({
+    "название",
+    "наименование",
+    "наименование товара",
+    "название товара",
+    "полное наименование",
+    "полное название",
+})
+
+# Substrings that disqualify an attr name — prevent matching "название цвета" etc.
+_TITLE_FIELD_DISQUALIFIERS: tuple[str, ...] = (
+    "цвет",
+    "бренд",
+    "марк",     # торговая марка
+    "модел",    # название модели
+    "серии",
+    "серия",
+    "вариант",
+    "типа",     # название типа
+)
+
+
+def _is_title_target(name: str) -> bool:
+    """True if the attribute is the standalone product-title field.
+
+    Matches 'Название', 'Наименование товара' etc. while rejecting compounds
+    like 'Название цвета', 'Название модели'.
+    """
+    low = name.lower().strip()
+    # Exact match first (fastest, most conservative)
+    if low in _TITLE_FIELD_NAMES:
+        return True
+    # Starts-with check: "название" or "наименование" as the first word
+    if not (low.startswith("название") or low.startswith("наименование")):
+        return False
+    # Disqualifier check: reject compound names
+    for dq in _TITLE_FIELD_DISQUALIFIERS:
+        if dq in low:
+            return False
+    return True
+
+
+def _apply_title_from_input(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+    context: ExtractionContext,
+) -> list[AttributeValue]:
+    """POST-merge verbatim filler for the product-title target attribute.
+
+    Fills STILL-EMPTY 'Название' / 'Наименование товара' targets verbatim
+    with context.product_name (the input product name received from the
+    marketplace request). Never overwrites an already-filled attr.
+
+    Source=DESCRIPTION (input name is product-specific, not inferred).
+    Confidence=0.97 — verbatim, no inference.
+    """
+    product_name = (context.product_name or "").strip()
+    if not product_name:
+        return merged
+
+    filled_attr_ids: set[int] = {v.attribute_id for v in merged}
+    title_targets = [
+        t for t in targets
+        if _is_title_target(t.name) and t.id not in filled_attr_ids
+    ]
+    if not title_targets:
+        return merged
+
+    out = list(merged)
+    for target in title_targets:
+        logger.info(
+            "[Pipeline] title-from-input: attr=%s '%s' ← '%s'",
+            target.id, target.name, product_name[:80],
+        )
+        out.append(AttributeValue(
+            attribute_id=target.id,
+            value=product_name,
+            confidence=_TITLE_FROM_INPUT_CONF,
+            source=Source.DESCRIPTION,
+            evidence=_TITLE_FROM_INPUT_EVIDENCE,
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Spec-from-title: deterministic filler for OPTIONAL enum attrs whose allowed
 # value is literally present (whole token sequence) in the product title.
 # Mirrors _apply_brand_from_name / _apply_type_from_category in spirit.
@@ -1792,18 +1903,38 @@ def _apply_spec_from_title(
 
 
 # ---------------------------------------------------------------------------
-# Lever 2: "Срок службы, лет" — verbatim numeric extractor from fetched text.
+# Lever 2 (GENERAL): verbatim numeric-spec extractor from fetched text.
 #
-# Scans product_description + evidence strings of already-fetched values for
-# phrases matching the "срок службы/эксплуатации … N лет/год/года" pattern.
-# The NUMBER must literally appear next to the phrase in the real fetched text —
-# no guessing, no derivation from warranty, no LLM.
+# Generalizes the original "срок службы" extractor to cover ANY numeric target
+# attribute (Время автономной работы, Время зарядки, Мощность, Срок службы, …).
 #
-# Confidence 0.97 (> DESCRIPTION threshold 0.95) — verbatim + grounded match,
-# no inference involved.
+# For each STILL-EMPTY numeric/free-text target, the extractor:
+#   1. Derives a distinctive keyword phrase from the attr name (lowercased, trimmed
+#      of trailing unit suffix such as ", ч" / ", лет").
+#   2. Determines the expected unit via _detect_attr_unit (icecat normalizer).
+#   3. Builds a regex that requires BOTH the keyword AND a number with the matching
+#      unit within a tight window (≤ 30 chars).
+#   4. Searches product_description and then evidence strings.
+#   5. Fills VERBATIM (number from text), Source=DESCRIPTION, conf=0.97.
+#
+# Cross-attribute bleed guard (critical, mud-sensitive):
+#   Each attr gets its OWN keyword from its name — "зарядка 2 часа" will NOT fill
+#   "время разговора" because the keyword for "время разговора" ("время разговора")
+#   must appear in the window around the number, not just any keyword.
+#
+# Special case: "срок службы / срок эксплуатации" uses the original dedicated regex
+# (Pattern A + B bidirectional) since these attrs often have no unit in their name
+# and use "лет/год/года" as the unit word.
+#
+# Confidence 0.97 (> DESCRIPTION threshold 0.95) — verbatim + grounded match.
 # ---------------------------------------------------------------------------
+_NUMSPEC_EVIDENCE_PREFIX = "numspec:"
+_NUMSPEC_CONF = 0.97
+
+# --- Service-life kept as a special case (backward-compat for existing tests) ---
+
 _SERVICE_LIFE_EVIDENCE_PREFIX = "срок_службы:verbatim:"
-_SERVICE_LIFE_CONF = 0.97
+_SERVICE_LIFE_CONF = _NUMSPEC_CONF
 
 # Match "срок службы/эксплуатации" (with punctuation) followed (within 0-25 chars)
 # by a number + year-word, OR a number followed by "срок службы/эксплуатации".
@@ -1858,40 +1989,165 @@ def _extract_service_life_number(text: str) -> Optional[str]:
     return f"{val:.1f}".rstrip("0").rstrip(".")
 
 
+# --- General numeric keyword extractor ---
+
+# Unit display tokens used in regex matching (value side). Each entry:
+#   canonical_unit → list of regex-ready alternatives (sorted longest-first).
+_UNIT_REGEX_TOKENS: dict[str, str] = {
+    "min":   r"(?:мин(?:ут[аы]?)?\.?|min(?:utes?)?)",
+    "hz":    r"(?:гц|hz|герц)",
+    "ms":    r"(?:мс|ms|мс\.?)",
+    "kg":    r"(?:кг|kg|килограмм(?:ов?)?)",
+    "g":     r"(?:гр?\.?|граммов?|gram(?:m?s?)?)",
+    "w":     r"(?:вт|w|ватт(?:ов?)?)",
+    "v":     r"(?:в(?:ольт(?:ов?)?)?|v(?:olts?)?)",
+    "mah":   r"(?:мач|mah|мa\.?ч\.?)",
+    "cm":    r"(?:см|cm|сантиметр(?:ов?)?)",
+    "mm":    r"(?:мм|mm|миллиметр(?:ов?)?)",
+    "m":     r"(?:метр(?:ов?)?|(?<!\w)м(?!\w)|(?<!\w)m(?!\w))",
+    "inch":  r"(?:дюйм(?:ов?)?|inch(?:es?)?|\")",
+    "cd/m2": r"(?:кд/м[²2]|cd/m[²2])",
+    "khz":   r"(?:кгц|khz)",
+    "ghz":   r"(?:ггц|ghz)",
+    "kwh":   r"(?:квтч|kwh)",
+    "ft":    r"(?:фут(?:ов?)?|ft|feet|foot)",
+}
+
+# Keyword extraction: strip unit suffixes from attr name to get the distinctive phrase.
+# e.g. "Время автономной работы, ч" → "время автономной работы"
+_ATTR_NAME_UNIT_SUFFIX_RE = re.compile(
+    r",?\s*(?:ч(?:асов?|\.)?|лет|год(?:а)?|мес(?:яц(?:ев?)?)?\.?|"
+    r"мин(?:ут[аы]?)?\.?|гц|hz|мс|ms|кг|kg|г,?|гр\.?|вт|w|в\b|v\b|мач|mah|"
+    r"см|cm|мм|mm|м\b|m\b|дюйм(?:ов?)?|inch(?:es?)?|кд/м[²2]|cd/m[²2]|"
+    r"кгц|khz|ггц|ghz|квтч|kwh)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _attr_keyword(attr_name: str) -> str:
+    """Derive a distinctive keyword phrase from attr name (strip unit suffix, lowercase)."""
+    stripped = _ATTR_NAME_UNIT_SUFFIX_RE.sub("", attr_name).strip().lower()
+    # Also strip trailing punctuation
+    return stripped.rstrip(",;:.").strip()
+
+
+def _build_numspec_regex(keyword: str, unit: str) -> Optional[re.Pattern[str]]:
+    """Build a regex matching keyword + number + unit (or unit + number + keyword).
+
+    Returns None if we can't build a meaningful pattern (unknown unit or empty keyword).
+
+    The pattern requires BOTH keyword AND number+unit within ≤30 chars of each other.
+    This is the cross-attribute bleed guard: only fires when the attr's OWN keyword
+    phrase is present near the number.
+    """
+    unit_rx = _UNIT_REGEX_TOKENS.get(unit)
+    if not unit_rx or not keyword:
+        return None
+    kw_rx = re.escape(keyword)
+    num_rx = r"\d+(?:[.,]\d+)?"
+    # Bridge between keyword and number (Pattern A: forward).
+    # Chars between keyword and number: non-digit, non-newline, non-sentence-end.
+    # Non-greedy: prevents consuming leading digits of the number.
+    bridge_fwd = r"[^\d\n.!?]{0,30}?"
+    # Bridge for Pattern B (backward: number unit ... keyword).
+    # Must NOT cross sentence boundary (period/newline): "90 мин. Время разговора"
+    # must NOT match for "время разговора" attr.
+    bridge_bwd = r"[^\d\n.!?]{0,20}?"
+    # Pattern A: keyword ... number unit (forward)
+    # Pattern B: number unit ... keyword (backward, same sentence only)
+    pattern = (
+        rf"{kw_rx}{bridge_fwd}({num_rx})\s*{unit_rx}\b"
+        rf"|"
+        rf"({num_rx})\s*{unit_rx}\b{bridge_bwd}{kw_rx}"
+    )
+    try:
+        return re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        return None
+
+
+def _extract_numspec_number(text: str, pattern: re.Pattern[str]) -> Optional[tuple[str, str]]:
+    """Search text for the attr-specific pattern; return (raw_number, snippet) or None.
+
+    Verbatim-only: number MUST appear adjacent to the attr's own keyword.
+    """
+    if not text:
+        return None
+    m = pattern.search(text)
+    if m is None:
+        return None
+    raw = m.group(1) or m.group(2)
+    if not raw:
+        return None
+    val = _icecat_parse_float(raw)
+    if val is None:
+        return None
+    # Format using icecat normalizer for consistency (drops trailing zeros, int for whole)
+    # Use unit from the pattern context — we don't have it here; use generic formatting.
+    raw_norm = raw.replace(",", ".")
+    try:
+        fval = float(raw_norm)
+    except ValueError:
+        return None
+    if fval == int(fval):
+        formatted = str(int(fval))
+    else:
+        formatted = raw_norm.rstrip("0").rstrip(".")
+    start = max(0, m.start() - 10)
+    end = min(len(text), m.end() + 10)
+    snippet = text[start:end].strip()
+    return formatted, snippet
+
+
 def _apply_service_life_from_text(
     merged: list[AttributeValue],
     targets: list[TargetAttribute],
     context: ExtractionContext,
 ) -> list[AttributeValue]:
-    """POST-merge verbatim filler for 'Срок службы, лет' / 'Срок эксплуатации'.
+    """Backward-compat wrapper: delegates to _apply_numeric_spec_from_text.
 
-    For each still-EMPTY target whose name matches 'срок службы' or 'срок
-    эксплуатации', scans the following text pools in priority order:
-      1. context.product_description — seller description text.
-      2. Evidence strings of all accumulated AttributeValues — web_search snippets,
-         icecat summaries, wb_card evidence, etc. are already in memory.
-
-    The NUMBER must appear VERBATIM next to the phrase (regex match, case-insensitive).
-    No LLM, no guessing, no derivation from warranty duration.
-
-    Guards (fail-closed — «пусто честнее мусора»):
-      - Only fires for EMPTY targets (already-filled attrs are never overwritten).
-      - Only fills free-text / numeric targets whose name signals service life
-        (detected by _is_service_life_target — no per-category hardcode).
-      - Number MUST appear in the real fetched text adjacent to the phrase.
-      - Returns high confidence (0.97 > DESCRIPTION threshold 0.95) so it
-        survives _merge and judge shortcut.
-
-    Source=DESCRIPTION (verbatim from product data, not inferred from world knowledge).
-    Evidence = _SERVICE_LIFE_EVIDENCE_PREFIX + the matched snippet.
+    POST-merge verbatim filler for 'Срок службы, лет' / 'Срок эксплуатации'.
+    Kept as a thin wrapper so existing callers and tests continue to work.
     """
-    # Find service-life targets that are currently empty
+    return _apply_numeric_spec_from_text(merged, targets, context)
+
+
+def _apply_numeric_spec_from_text(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+    context: ExtractionContext,
+) -> list[AttributeValue]:
+    """POST-merge verbatim filler for EMPTY numeric/free-text target attributes.
+
+    Generalised form of the original "срок службы" extractor. Handles:
+      - Срок службы / Срок эксплуатации (special dedicated regex — bidirectional)
+      - ANY other numeric target whose name encodes a known unit (via _detect_attr_unit)
+        AND whose keyword phrase is BOTH distinctive AND present next to the number
+        in the fetched text.
+
+    For each STILL-EMPTY numeric target:
+      1. If _is_service_life_target → use the dedicated _SERVICE_LIFE_RE (backward compat).
+      2. Otherwise: derive keyword from attr name, detect expected unit from name via
+         _detect_attr_unit, build keyword+unit regex, search text pools.
+
+    Cross-attribute bleed guard (critical): the attr's OWN keyword phrase must appear
+    in the window around the number. "зарядка 2 часа" will NOT fill "время разговора"
+    because "время разговора" must literally be present near any number it fills.
+
+    Text pools searched (priority order):
+      1. context.product_description
+      2. Evidence strings of accumulated AttributeValues (web_search snippets, etc.)
+
+    Source=DESCRIPTION, evidence="numspec:<keyword>:verbatim:<snippet>", conf=0.97.
+    """
     filled_attr_ids: set[int] = {v.attribute_id for v in merged}
-    sl_targets = [
+
+    # Candidates: empty numeric/free-text targets (no allowed_values constraint)
+    candidate_targets = [
         t for t in targets
-        if _is_service_life_target(t.name) and t.id not in filled_attr_ids
+        if t.id not in filled_attr_ids and not t.allowed_values
     ]
-    if not sl_targets:
+    if not candidate_targets:
         return merged
 
     # Build text corpus: description first (highest authority), then evidence strings
@@ -1906,40 +2162,81 @@ def _apply_service_life_from_text(
     if not text_pools:
         return merged
 
-    # Try each pool in order; stop at first hit (first pool = highest authority)
-    found_number: Optional[str] = None
-    found_snippet: str = ""
-    for text in text_pools:
-        number = _extract_service_life_number(text)
-        if number is not None:
-            found_number = number
-            # Build snippet: 80-char window around the match for evidence
-            m = _SERVICE_LIFE_RE.search(text)
-            if m:
-                start = max(0, m.start() - 10)
-                end = min(len(text), m.end() + 10)
-                found_snippet = text[start:end].strip()
-            break
-
-    if found_number is None:
-        return merged
-
-    evidence = _SERVICE_LIFE_EVIDENCE_PREFIX + found_snippet[:150]
     out = list(merged)
-    for target in sl_targets:
+    for target in candidate_targets:
+        # --- Special case: service-life uses dedicated bidirectional regex ---
+        if _is_service_life_target(target.name):
+            found_number: Optional[str] = None
+            found_snippet: str = ""
+            for text in text_pools:
+                number = _extract_service_life_number(text)
+                if number is not None:
+                    found_number = number
+                    m = _SERVICE_LIFE_RE.search(text)
+                    if m:
+                        start = max(0, m.start() - 10)
+                        end = min(len(text), m.end() + 10)
+                        found_snippet = text[start:end].strip()
+                    break
+            if found_number is None:
+                continue
+            evidence = _SERVICE_LIFE_EVIDENCE_PREFIX + found_snippet[:150]
+            logger.info(
+                "[Pipeline] numspec service-life: attr=%s '%s' ← '%s' (evidence=%r)",
+                target.id, target.name, found_number, found_snippet[:60],
+            )
+            out.append(AttributeValue(
+                attribute_id=target.id,
+                value=found_number,
+                confidence=_NUMSPEC_CONF,
+                source=Source.DESCRIPTION,
+                evidence=evidence,
+            ))
+            continue
+
+        # --- General case: keyword + unit proximity ---
+        unit = _detect_attr_unit(target.name)
+        if unit is None:
+            # No known unit encodable from this attr name → skip (conservative)
+            continue
+
+        keyword = _attr_keyword(target.name)
+        if len(keyword) < 4:
+            # Keyword too short → too many false positives → skip
+            continue
+
+        pattern = _build_numspec_regex(keyword, unit)
+        if pattern is None:
+            continue
+
+        found_result: Optional[tuple[str, str]] = None
+        for text in text_pools:
+            result = _extract_numspec_number(text, pattern)
+            if result is not None:
+                found_result = result
+                break
+
+        if found_result is None:
+            continue
+
+        num_str, snippet = found_result
+        evidence = f"{_NUMSPEC_EVIDENCE_PREFIX}{keyword}:verbatim:{snippet[:120]}"
         logger.info(
-            "[Pipeline] service-life verbatim: attr=%s '%s' ← '%s' лет "
-            "(evidence=%r)",
-            target.id, target.name, found_number, found_snippet[:60],
+            "[Pipeline] numspec: attr=%s '%s' ← '%s' (keyword=%r, unit=%s, "
+            "evidence=%r)",
+            target.id, target.name, num_str, keyword, unit, snippet[:60],
         )
         out.append(AttributeValue(
             attribute_id=target.id,
-            value=found_number,
-            confidence=_SERVICE_LIFE_CONF,
+            value=num_str,
+            confidence=_NUMSPEC_CONF,
             source=Source.DESCRIPTION,
             evidence=evidence,
         ))
+
     return out
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -2088,6 +2385,242 @@ def _apply_warranty_alias_cross_fill(
                 source=Source.DESCRIPTION,
                 evidence=_WARRANTY_ALIAS_EVIDENCE,
             ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Lever 3a: Boolean (Да/Нет) — stated-only verbatim fill.
+#
+# Fills STILL-EMPTY boolean target attributes with "Да" ONLY when the feature is
+# EXPLICITLY stated in the fetched text. Never fills "Да" by default or from absence.
+# Never fills "Нет" (absence of mention ≠ "Нет" — «пусто честнее мусора»).
+#
+# For each empty boolean target (allowed_values contains "Да"/"Нет"):
+#   1. Derive a distinctive keyword phrase from the attr name.
+#   2. Search product_description + evidence strings for the keyword.
+#   3. If found → fill "Да". If not found → leave empty.
+#
+# Keyword matching is CONSERVATIVE: requires the attr's own keyword phrase to appear
+# verbatim in the text. No category/product-type defaulting.
+#
+# Source=DESCRIPTION, evidence="bool:stated:<keyword>", conf=0.97.
+# ---------------------------------------------------------------------------
+_BOOL_STATED_CONF = 0.97
+_BOOL_STATED_EVIDENCE_PREFIX = "bool:stated:"
+
+# Per-keyword overrides for boolean attrs: maps distinctive keyword(s) from attr name
+# to the exact text phrase(s) that indicate "Да". Each entry is a list of alternatives
+# (any one match → "Да"). General: derived from attr name if no override.
+# Order matters: more-specific overrides first. All lowercase.
+_BOOL_KEYWORD_OVERRIDES: list[tuple[str, list[str]]] = [
+    # Управление со смартфона / через приложение
+    ("управление со смартфон", ["управление со смартфон", "через приложени", "мобильн.*приложени"]),
+    ("управление через приложени", ["управление через приложени", "через приложени", "мобильн.*приложени"]),
+    ("мобильн.*приложени", ["мобильн.*приложени", "через приложени"]),
+    # Серийный номер
+    ("серийн.*номер", ["серийн.*номер", "serial number", "серийный"]),
+    # Bluetooth
+    ("bluetooth", ["bluetooth", "блютус"]),
+    # Wi-Fi
+    ("wi-fi", ["wi-fi", "wifi", "вай-фай"]),
+    # NFC
+    ("nfc", ["nfc"]),
+    # USB
+    ("usb", ["usb"]),
+    # GPS
+    ("gps", ["gps", "глонасс"]),
+    # Подсветка
+    ("подсветк", ["подсветк"]),
+    # Таймер
+    ("таймер", ["таймер"]),
+]
+
+
+def _bool_stated_keywords(attr_name: str) -> list[re.Pattern[str]]:
+    """Return regex patterns that indicate "Да" for a boolean attr.
+
+    Checks _BOOL_KEYWORD_OVERRIDES first; falls back to using the attr name
+    (lowercased, stripped of noise) as the keyword.
+    """
+    low = attr_name.lower().strip()
+    # Check overrides
+    for key, phrases in _BOOL_KEYWORD_OVERRIDES:
+        if re.search(key, low):
+            return [re.compile(p, re.IGNORECASE) for p in phrases]
+    # Fallback: use attr name itself as keyword (stripped of trailing type hints)
+    keyword = _attr_keyword(attr_name)
+    if len(keyword) < 4:
+        return []
+    return [re.compile(re.escape(keyword), re.IGNORECASE)]
+
+
+def _is_bool_target(target: TargetAttribute) -> bool:
+    """True if the target is a boolean Да/Нет field."""
+    if not target.allowed_values:
+        return False
+    lower_vals = {v.lower() for v in target.allowed_values}
+    return "да" in lower_vals and "нет" in lower_vals
+
+
+def _apply_boolean_stated_from_text(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+    context: ExtractionContext,
+) -> list[AttributeValue]:
+    """POST-merge verbatim filler for EMPTY boolean (Да/Нет) target attributes.
+
+    Fills "Да" ONLY when the feature is EXPLICITLY stated in the fetched text.
+    NEVER defaults to "Да" based on category, product type, or absence of mention.
+    Never fills "Нет" (we cannot infer absence).
+
+    For each empty boolean target:
+      1. Derive keyword from attr name (or use override patterns).
+      2. Search product_description + evidence strings.
+      3. Keyword found → "Да". Not found → leave empty.
+
+    Guards (fail-closed — «пусто честнее мусора»):
+      - Only fires for EMPTY targets (never overwrites).
+      - Only fires when keyword is EXPLICITLY present in text.
+      - Keyword patterns come from attr name — NO per-category defaults.
+      - Source=DESCRIPTION, conf=0.97.
+    """
+    filled_attr_ids: set[int] = {v.attribute_id for v in merged}
+    bool_targets = [
+        t for t in targets
+        if _is_bool_target(t) and t.id not in filled_attr_ids
+    ]
+    if not bool_targets:
+        return merged
+
+    # Build text corpus
+    text_pools: list[str] = []
+    if context.product_description:
+        text_pools.append(context.product_description)
+    for v in merged:
+        ev = (v.evidence or "").strip()
+        if ev and len(ev) >= 10:
+            text_pools.append(ev)
+
+    if not text_pools:
+        return merged
+
+    combined_text = "\n".join(text_pools)
+
+    out = list(merged)
+    for target in bool_targets:
+        patterns = _bool_stated_keywords(target.name)
+        if not patterns:
+            continue
+
+        # "Да" only when ANY pattern matches EXPLICITLY in text
+        matched_keyword: Optional[str] = None
+        for pat in patterns:
+            if pat.search(combined_text):
+                matched_keyword = pat.pattern
+                break
+
+        if matched_keyword is None:
+            continue  # not stated → leave empty (пусто честнее мусора)
+
+        evidence = f"{_BOOL_STATED_EVIDENCE_PREFIX}{_attr_keyword(target.name)}"
+        logger.info(
+            "[Pipeline] bool-stated: attr=%s '%s' ← 'Да' (keyword=%r stated in text)",
+            target.id, target.name, matched_keyword[:60],
+        )
+        out.append(AttributeValue(
+            attribute_id=target.id,
+            value="Да",
+            confidence=_BOOL_STATED_CONF,
+            source=Source.DESCRIPTION,
+            evidence=evidence,
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Lever 3b: "Комплектация" — verbatim list from product description.
+#
+# Extracts the "в комплекте: …" / "комплектация: …" section from the product
+# description verbatim. Never defaults or infers.
+#
+# Source=DESCRIPTION, evidence="комплектация:verbatim", conf=0.97.
+# ---------------------------------------------------------------------------
+_KOMPLEKTATSIYA_CONF = 0.97
+_KOMPLEKTATSIYA_EVIDENCE = "комплектация:verbatim"
+
+# Regex to find "комплектация:" or "в комплекте:" section and capture list content.
+# Captures everything up to: blank line, next section header (word + colon + space),
+# or end of string. Max 400 chars captured.
+_KOMPLEKTATSIYA_RE = re.compile(
+    r"(?:комплектаци[яи]|в\s+комплект[еи])\s*:\s*([^\n]{3,400})",
+    re.IGNORECASE,
+)
+
+# Attr name keywords that identify the "Комплектация" field
+_KOMPLEKTATSIYA_ATTR_KEYWORDS: tuple[str, ...] = (
+    "комплектаци",
+    "в комплект",
+    "состав комплект",
+)
+
+
+def _is_komplektatsiya_target(name: str) -> bool:
+    """True if the attribute is a 'Комплектация' (kit contents) free-text field."""
+    low = name.lower().strip()
+    return any(kw in low for kw in _KOMPLEKTATSIYA_ATTR_KEYWORDS)
+
+
+def _apply_komplektatsiya_from_text(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+    context: ExtractionContext,
+) -> list[AttributeValue]:
+    """POST-merge verbatim filler for 'Комплектация' (kit contents) from description.
+
+    Extracts "комплектация: …" / "в комплекте: …" section verbatim from the
+    product description. Never infers contents or defaults.
+
+    Guards (fail-closed — «пусто честнее мусора»):
+      - Only fires for EMPTY targets whose name indicates 'комплектация'.
+      - Text section MUST contain the phrase 'комплектация:' or 'в комплекте:'.
+      - Verbatim-only: captured text directly from description.
+      - Source=DESCRIPTION, conf=0.97.
+    """
+    filled_attr_ids: set[int] = {v.attribute_id for v in merged}
+    komplek_targets = [
+        t for t in targets
+        if _is_komplektatsiya_target(t.name) and not t.allowed_values
+        and t.id not in filled_attr_ids
+    ]
+    if not komplek_targets:
+        return merged
+
+    # Only search product_description (description section — not evidence snippets)
+    desc = (context.product_description or "").strip()
+    if not desc:
+        return merged
+
+    m = _KOMPLEKTATSIYA_RE.search(desc)
+    if m is None:
+        return merged
+
+    value = m.group(1).strip()
+    if not value:
+        return merged
+
+    out = list(merged)
+    for target in komplek_targets:
+        logger.info(
+            "[Pipeline] комплектация-verbatim: attr=%s '%s' ← '%s'",
+            target.id, target.name, value[:80],
+        )
+        out.append(AttributeValue(
+            attribute_id=target.id,
+            value=value,
+            confidence=_KOMPLEKTATSIYA_CONF,
+            source=Source.DESCRIPTION,
+            evidence=_KOMPLEKTATSIYA_EVIDENCE,
+        ))
     return out
 
 
@@ -3086,13 +3619,28 @@ class PipelineOrchestrator:
             ).value_id,
         )
 
-        # Lever 2: "Срок службы, лет" verbatim numeric extractor.
-        # Scans product_description + evidence strings of already-fetched values
-        # for "срок службы/эксплуатации N лет" phrases. Verbatim-only (no guessing).
-        # Fires ONLY for still-EMPTY service-life targets. Source=DESCRIPTION, conf=0.97.
-        resolved = _apply_service_life_from_text(resolved, targets, context)
+        # Lever 1: "Название" — fill marketplace product-title attr from input name.
+        # Verbatim fill from context.product_name. Never overwrites. Source=DESCRIPTION.
+        resolved = _apply_title_from_input(resolved, targets, context)
 
-        # Lever 3: "Гарантия" ↔ "Гарантийный срок" alias cross-fill.
+        # Lever 2: General verbatim numeric-spec extractor.
+        # Covers "Срок службы, лет" (special regex) + all other numeric attrs whose
+        # name encodes a known unit AND whose keyword phrase appears near the number.
+        # Cross-attribute bleed guard: each attr requires its OWN keyword in window.
+        # Source=DESCRIPTION, conf=0.97, verbatim-only.
+        resolved = _apply_numeric_spec_from_text(resolved, targets, context)
+
+        # Lever 3a: Boolean Да/Нет — stated-only verbatim fill.
+        # Fills "Да" ONLY when feature keyword EXPLICITLY present in fetched text.
+        # NEVER defaults to "Да" from category/absence. Source=DESCRIPTION, conf=0.97.
+        resolved = _apply_boolean_stated_from_text(resolved, targets, context)
+
+        # Lever 3b: "Комплектация" — verbatim list from product description.
+        # Extracts "комплектация: …" / "в комплекте: …" section verbatim.
+        # Source=DESCRIPTION, conf=0.97.
+        resolved = _apply_komplektatsiya_from_text(resolved, targets, context)
+
+        # Lever 3 (original): "Гарантия" ↔ "Гарантийный срок" alias cross-fill.
         # Both are free-text String fields (no enum constraint). Verbatim copy only.
         # Fires ONLY when one alias is filled and its counterpart is empty.
         resolved = _apply_warranty_alias_cross_fill(resolved, targets)
