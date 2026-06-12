@@ -75,6 +75,16 @@ _SPEC_LINE_RE = re.compile(
     re.MULTILINE,
 )
 
+# Alternating-bullet pattern used by Ozon trafilatura output:
+#   - KeyName
+#   - ValueText
+# Each spec attribute is on a dash-prefixed line, alternating key then value.
+_BULLET_LINE_RE = re.compile(r"^-\s+(.{1,200})$", re.MULTILINE)
+
+# Max key length for alternating-bullet extraction (prevents stray long lines
+# from being treated as keys).
+_BULLET_KEY_MAX = 60
+
 
 def _norm_tokens(text: str) -> list[str]:
     """Normalised token list: ё→е, lowercase."""
@@ -90,19 +100,67 @@ def _token_overlap(key_tokens: list[str], attr_tokens: list[str]) -> float:
     return matched / len(attr_tokens)
 
 
+def _parse_bullet_spec_lines(text: str) -> list[tuple[str, str]]:
+    """Extract (key, value) pairs from alternating-bullet spec format.
+
+    Handles Ozon trafilatura output style:
+        - Сезон
+        - На любой сезон
+        - Материал
+        - Хлопок
+
+    Algorithm: collect all dash-bullet lines; iterate in pairs (even=key,
+    odd=value).  Accept only when the key is ≤ _BULLET_KEY_MAX chars (guards
+    against long description sentences that happen to start with a dash).
+    Requires that the bullet block is dense enough: at least 4 consecutive
+    bullet lines in the same block (avoids false positives from stray dash-lists
+    like navigation menus with 1-2 items).
+    """
+    bullet_lines = [m.group(1).strip() for m in _BULLET_LINE_RE.finditer(text)]
+    if len(bullet_lines) < 4:
+        return []  # not a dense enough spec block — skip
+
+    pairs: list[tuple[str, str]] = []
+    i = 0
+    while i + 1 < len(bullet_lines):
+        key = bullet_lines[i]
+        value = bullet_lines[i + 1]
+        # Key must be short (spec attribute names are rarely > 60 chars)
+        # and must not itself look like a value (e.g. a percentage / long sentence)
+        if key and value and len(key) <= _BULLET_KEY_MAX:
+            pairs.append((key, value))
+        i += 2
+    return pairs
+
+
 def _parse_spec_lines(text: str) -> list[tuple[str, str]]:
     """Extract (key, value) pairs from spec-like text lines.
 
-    Handles both «Key: Value» and «Key — Value» separators.
-    Strips surrounding whitespace from both parts.
+    Handles two formats:
+      1. Inline separator: «Key: Value» or «Key — Value» on a single line.
+      2. Alternating-bullet: «- Key\\n- Value» (Ozon trafilatura output style).
+
+    Deduplicates pairs; inline-separator results take precedence when both
+    formats produce the same key (different separators for the same attr).
     Returns only pairs where key ≤ 60 chars and value ≤ 200 chars.
     """
     pairs: list[tuple[str, str]] = []
+    seen_keys: set[str] = set()
+
+    # Format 1: inline separators (highest-fidelity)
     for m in _SPEC_LINE_RE.finditer(text):
         key = m.group(1).strip()
         value = m.group(2).strip()
         if key and value:
             pairs.append((key, value))
+            seen_keys.add(key.lower())
+
+    # Format 2: alternating-bullet (Ozon page style) — only add keys not yet seen
+    for key, value in _parse_bullet_spec_lines(text):
+        if key.lower() not in seen_keys and value:
+            pairs.append((key, value))
+            seen_keys.add(key.lower())
+
     return pairs
 
 

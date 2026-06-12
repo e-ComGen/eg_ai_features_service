@@ -280,7 +280,7 @@ def _normalize_for_corroboration(value: object) -> str:
 
 
 def _web_search_grounded_in_evidence(value: str, evidence: str | None) -> bool:
-    """Gate A: self-consistency check for WEB_SEARCH fills.
+    """Gate A: self-consistency check for WEB_SEARCH fills (single scalar value).
 
     The web_search `evidence` field is the REAL fetched page snippet, so we can
     ground-check the chosen value against it deterministically. Returns True when
@@ -299,6 +299,9 @@ def _web_search_grounded_in_evidence(value: str, evidence: str | None) -> bool:
       - evidence is None or empty → return True (no evidence to contradict; don't drop).
       - value normalises to a boolean ("да"/"нет") → skip check (booleans are not
         grounded by evidence text presence).
+
+    For LIST-valued fills use _filter_list_value_by_evidence instead — that helper
+    checks each element individually and returns the grounded subset (or None to drop).
     """
     if not evidence:
         return True  # nothing to check against — conservative, do not drop
@@ -316,6 +319,31 @@ def _web_search_grounded_in_evidence(value: str, evidence: str | None) -> bool:
         return True  # value too short to check — conservative, keep
 
     return any(tok in norm_evidence for tok in significant)
+
+
+def _filter_list_value_by_evidence(
+    elements: list,
+    evidence: str | None,
+) -> list | None:
+    """Gate A for LIST-valued WEB_SEARCH fills.
+
+    Checks each list element against the evidence individually via
+    _web_search_grounded_in_evidence.  Returns:
+      - the filtered list (only grounded elements) when ≥1 element passes, OR
+      - None when ALL elements fail (caller should drop the whole fill).
+
+    Conservative: an element with no significant tokens (too short / boolean)
+    is kept (delegates to _web_search_grounded_in_evidence's own conservative
+    edge-case handling).
+    """
+    if not evidence:
+        return elements  # no evidence → keep all, conservative
+
+    grounded = [
+        el for el in elements
+        if _web_search_grounded_in_evidence(str(el), evidence)
+    ]
+    return grounded if grounded else None
 
 
 def _apply_gender_guard(
@@ -3222,15 +3250,34 @@ class PipelineOrchestrator:
             # in its own evidence snippet (the REAL fetched page text).
             # llm_knowledge evidence is LLM-self-generated, so this check is only
             # meaningful for web_search where evidence is the actual page snippet.
-            if v.source == Source.WEB_SEARCH and not _web_search_grounded_in_evidence(
-                str(v.value), v.evidence
-            ):
-                logger.info(
-                    "[Pipeline] web_search Gate A DROP (value not in evidence): "
-                    "attr=%s value=%r evidence=%r — value token absent from own evidence",
-                    v.attribute_id, v.value, (v.evidence or "")[:120],
-                )
-                continue  # drop: value contradicts (or is absent from) its own evidence
+            if v.source == Source.WEB_SEARCH:
+                if isinstance(v.value, list):
+                    # LIST-valued fill: check each element; keep only grounded ones.
+                    grounded_elements = _filter_list_value_by_evidence(v.value, v.evidence)
+                    if grounded_elements is None:
+                        # All elements failed → drop the whole fill.
+                        logger.info(
+                            "[Pipeline] web_search Gate A DROP list (all elements ungrounded): "
+                            "attr=%s value=%r evidence=%r",
+                            v.attribute_id, v.value, (v.evidence or "")[:120],
+                        )
+                        continue
+                    if len(grounded_elements) < len(v.value):
+                        # Some elements dropped → replace value with filtered subset.
+                        dropped = [el for el in v.value if el not in grounded_elements]
+                        logger.info(
+                            "[Pipeline] web_search Gate A PARTIAL DROP list: "
+                            "attr=%s dropped=%r kept=%r evidence=%r",
+                            v.attribute_id, dropped, grounded_elements, (v.evidence or "")[:120],
+                        )
+                        v = v.model_copy(update={"value": grounded_elements})
+                elif not _web_search_grounded_in_evidence(str(v.value), v.evidence):
+                    logger.info(
+                        "[Pipeline] web_search Gate A DROP (value not in evidence): "
+                        "attr=%s value=%r evidence=%r — value token absent from own evidence",
+                        v.attribute_id, v.value, (v.evidence or "")[:120],
+                    )
+                    continue  # drop: value contradicts (or is absent from) its own evidence
             t = target_by_id.get(v.attribute_id)
             if t is not None and _is_objective_spec_attr(t):
                 spec_pending.append(v)

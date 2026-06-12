@@ -25,6 +25,7 @@ from app.services.enrichment.base import (
 from app.services.enrichment.pipeline import (
     _is_objective_spec_attr,
     _web_search_grounded_in_evidence,
+    _filter_list_value_by_evidence,
 )
 
 
@@ -126,6 +127,46 @@ class TestWebSearchGroundedInEvidence:
     def test_polyester_not_in_khlopok_evidence(self):
         """'Полиэстер' absent from 'хлопок' evidence → drop."""
         assert _web_search_grounded_in_evidence("Полиэстер", "100% хлопок, натуральный") is False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gate A: LIST-valued fills — _filter_list_value_by_evidence
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class TestFilterListValueByEvidence:
+    """_filter_list_value_by_evidence must check each element individually."""
+
+    def test_single_ungrounded_element_returns_none(self):
+        """value=['Бязь'] evidence='100% хлопок' → all ungrounded → None (drop)."""
+        result = _filter_list_value_by_evidence(["Бязь"], "Состав ткани: 100% хлопок")
+        assert result is None, "['Бязь'] not in 'хлопок' evidence — should return None (drop)"
+
+    def test_single_grounded_element_kept(self):
+        """value=['Хлопок'] evidence='состав: 100% хлопок' → kept."""
+        result = _filter_list_value_by_evidence(["Хлопок"], "состав: 100% хлопок")
+        assert result == ["Хлопок"], "['Хлопок'] present in evidence — should be kept"
+
+    def test_mixed_list_partial_drop(self):
+        """value=['хлопок','Бязь'] evidence='100% хлопок' → keeps only 'хлопок'."""
+        result = _filter_list_value_by_evidence(["хлопок", "Бязь"], "100% хлопок")
+        assert result == ["хлопок"], (
+            "mixed list: 'хлопок' grounded, 'Бязь' not — should keep only 'хлопок'"
+        )
+
+    def test_no_evidence_returns_all(self):
+        """No evidence → conservative: all elements kept."""
+        result = _filter_list_value_by_evidence(["Бязь", "Хлопок"], None)
+        assert result == ["Бязь", "Хлопок"]
+        result2 = _filter_list_value_by_evidence(["Бязь"], "")
+        assert result2 == ["Бязь"]
+
+    def test_both_elements_grounded(self):
+        """Both elements present in evidence → full list returned."""
+        result = _filter_list_value_by_evidence(
+            ["хлопок", "полиэстер"], "состав: 60% хлопок, 40% полиэстер"
+        )
+        assert result == ["хлопок", "полиэстер"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────

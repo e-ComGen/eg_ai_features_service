@@ -322,7 +322,9 @@ class WebSearchProducer:
         snippet_section = "\n\n".join(snippets)
 
         # --- Full-page fetch: top-1-2 HTTPS links from organic results ---
-        _PAGE_FETCH_TIMEOUT = 20      # seconds total for all page fetches
+        # Per-URL timeout so a slow Scrappey fallback on one URL cannot cancel
+        # a fast/cached result from another URL — partial results are always saved.
+        _PAGE_FETCH_TIMEOUT = 20      # seconds per individual URL fetch
         _PAGE_TEXT_CAP = 6000         # chars to keep per product (LLM context guard)
 
         top_urls = [
@@ -333,60 +335,70 @@ class WebSearchProducer:
 
         page_section = ""
         if top_urls:
-            try:
-                from app.services.url_fetcher import fetch_all as _fetch_all
-                raw_page_text = await asyncio.wait_for(
-                    _fetch_all(top_urls),
-                    timeout=_PAGE_FETCH_TIMEOUT,
-                )
-                if raw_page_text:
-                    # Каталог-страницы (asus.com/techspec и т.п.) повторяют спеки
-                    # для каждого SKU линейки 5-10 раз → boilerplate вытесняет
-                    # ключевые спеки за cap. Дедуп строк (order-preserving) даёт
-                    # ~38% сжатия, ключевое (USB/Wi-Fi/HDMI) влезает в окно.
-                    raw_page_text = "\n".join(dict.fromkeys(raw_page_text.split("\n")))
-                    # Boilerplate-гард: если страница — преимущественно
-                    # разметка/скрипты (антибот вернул JS/CSS-мусор вместо
-                    # контента) ИЛИ почти нет «спек-сигнала» — ОТБРОСИТЬ, чтобы
-                    # не разбавлять сниппеты. Эвристика генеричная, без хардкода.
-                    if self._looks_like_boilerplate(raw_page_text):
-                        logger.debug(
-                            "WebSearchProducer (serper): page text looks like boilerplate "
-                            "for %r — dropped, using snippets only.",
-                            product_name,
-                        )
-                    else:
-                        page_section = (
-                            "\n\n=== Текст страницы со спецификациями ===\n"
-                            + raw_page_text[:_PAGE_TEXT_CAP]
-                            + "\n"
-                        )
-                        # Expose raw page text for OemSpecHarvest verbatim pass.
-                        # Stored here (before LLM summarisation) so spec lines are
-                        # intact; the LLM summary loses the «Key: Value» structure.
-                        # RU-preference: only write when lang=="ru" OR when no RU
-                        # result has been stored yet (prevents EN from overwriting RU
-                        # in dual-lang concurrent execution).
-                        if lang == "ru" or self._last_page_text is None:
-                            self._last_page_text = raw_page_text[:_PAGE_TEXT_CAP]
-                        logger.debug(
-                            "WebSearchProducer (serper): fetched %d chars from %d page(s) for %r.",
-                            len(raw_page_text),
-                            len(top_urls),
-                            product_name,
-                        )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "WebSearchProducer (serper): page fetch timed out (%ds) for %r — using snippets only.",
-                    _PAGE_FETCH_TIMEOUT,
-                    product_name,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "WebSearchProducer (serper): page fetch failed for %r: %s — using snippets only.",
-                    product_name,
-                    exc,
-                )
+            from app.services.url_fetcher import fetch_url_content as _fetch_one
+
+            async def _fetch_with_timeout(url: str) -> Optional[str]:
+                """Fetch a single URL with per-URL timeout; return extracted text or None."""
+                try:
+                    result = await asyncio.wait_for(
+                        _fetch_one(url),
+                        timeout=_PAGE_FETCH_TIMEOUT,
+                    )
+                    return result.content if result is not None else None
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "WebSearchProducer (serper): fetch timed out (%ds) for %r.",
+                        _PAGE_FETCH_TIMEOUT,
+                        url,
+                    )
+                    return None
+                except Exception as exc:
+                    logger.warning(
+                        "WebSearchProducer (serper): fetch failed for %r: %s",
+                        url,
+                        exc,
+                    )
+                    return None
+
+            per_url_results = await asyncio.gather(*[_fetch_with_timeout(u) for u in top_urls])
+            raw_page_text = "\n".join(r for r in per_url_results if r)
+
+            if raw_page_text:
+                # Каталог-страницы (asus.com/techspec и т.п.) повторяют спеки
+                # для каждого SKU линейки 5-10 раз → boilerplate вытесняет
+                # ключевые спеки за cap. Дедуп строк (order-preserving) даёт
+                # ~38% сжатия, ключевое (USB/Wi-Fi/HDMI) влезает в окно.
+                raw_page_text = "\n".join(dict.fromkeys(raw_page_text.split("\n")))
+                # Boilerplate-гард: если страница — преимущественно
+                # разметка/скрипты (антибот вернул JS/CSS-мусор вместо
+                # контента) ИЛИ почти нет «спек-сигнала» — ОТБРОСИТЬ, чтобы
+                # не разбавлять сниппеты. Эвристика генеричная, без хардкода.
+                if self._looks_like_boilerplate(raw_page_text):
+                    logger.debug(
+                        "WebSearchProducer (serper): page text looks like boilerplate "
+                        "for %r — dropped, using snippets only.",
+                        product_name,
+                    )
+                else:
+                    page_section = (
+                        "\n\n=== Текст страницы со спецификациями ===\n"
+                        + raw_page_text[:_PAGE_TEXT_CAP]
+                        + "\n"
+                    )
+                    # Expose raw page text for OemSpecHarvest verbatim pass.
+                    # Stored here (before LLM summarisation) so spec lines are
+                    # intact; the LLM summary loses the «Key: Value» structure.
+                    # RU-preference: only write when lang=="ru" OR when no RU
+                    # result has been stored yet (prevents EN from overwriting RU
+                    # in dual-lang concurrent execution).
+                    if lang == "ru" or self._last_page_text is None:
+                        self._last_page_text = raw_page_text[:_PAGE_TEXT_CAP]
+                    logger.debug(
+                        "WebSearchProducer (serper): fetched %d chars from %d page(s) for %r.",
+                        len(raw_page_text),
+                        len(top_urls),
+                        product_name,
+                    )
         # -------------------------------------------------------------------
 
         # Snippets first (primary), page text appended after (secondary, guarded).
