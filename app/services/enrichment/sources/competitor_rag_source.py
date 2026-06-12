@@ -62,6 +62,13 @@ _DEFAULT_INDEX_PATH = os.path.join(
 # Имя коллекции в Qdrant
 _COLLECTION_NAME = "ozon_products"
 
+# Имя второй коллекции — внешние датасеты (OFF, OBF, Amazon, IKEA, …).
+# Управляется через QDRANT_DATASETS_COLLECTION; по умолчанию "datasets_rag".
+# Коллекция может не существовать — источник тогда молча пропускает её.
+_DATASETS_COLLECTION_NAME: str = os.environ.get(
+    "QDRANT_DATASETS_COLLECTION", "datasets_rag"
+)
+
 # Top-K соседей для поиска — увеличен до 10 для LLM-фильтрации
 _TOP_K = 10
 
@@ -107,6 +114,43 @@ def _get_embedding(text: str) -> list[float]:
 
 # Кэш загруженной модели (singleton per process)
 _model_cache = None
+
+
+def _merge_neighbors(
+    primary: list[dict],
+    secondary: list[dict],
+) -> list[dict]:
+    """Merge two neighbor lists, deduplicating by payload identity.
+
+    primary (ozon_products) comes first; secondary (datasets_rag) is appended
+    only if its payloads are not already present in primary.  Dedup key: the
+    `variantid` field when present, otherwise the object identity (id()) so
+    we never silently drop payloads that lack an explicit ID.
+
+    This is a pure function — no side effects, no I/O.
+    """
+    seen_ids: set = set()
+    result: list[dict] = []
+
+    def _add(payload: dict) -> None:
+        vid = payload.get("variantid") or payload.get("id")
+        if vid is not None:
+            if vid in seen_ids:
+                return
+            seen_ids.add(vid)
+        else:
+            # No stable ID — use object identity to avoid false dedup
+            oid = id(payload)
+            if oid in seen_ids:
+                return
+            seen_ids.add(oid)
+        result.append(payload)
+
+    for p in primary:
+        _add(p)
+    for p in secondary:
+        _add(p)
+    return result
 
 # Regex: detects raw colorway/SKU codes like "ftwwht/cblack/solred" or "ABCD-123/XY".
 # A slash-separated token where every segment is purely ASCII-alphanumeric (no Cyrillic).
@@ -330,18 +374,27 @@ class CompetitorRagSource(AttributeSource):
         embed_model_name: str = _EMBED_MODEL_NAME,
         llm_manager=None,
         qdrant_url: Optional[str] = None,
+        datasets_collection_name: Optional[str] = None,
     ):
         # QDRANT_URL env → HTTP server mode (preferred for 2M+ points).
         # Falls back to embedded local mode using index_path.
         self._qdrant_url = qdrant_url or os.environ.get("QDRANT_URL")
         self._index_path = os.path.abspath(index_path or _DEFAULT_INDEX_PATH)
         self._collection_name = collection_name
+        self._datasets_collection_name: str = (
+            datasets_collection_name
+            if datasets_collection_name is not None
+            else _DATASETS_COLLECTION_NAME
+        )
         self._top_k = top_k
         self._min_consensus = min_consensus
         self._embed_model_name = embed_model_name
         self._client = None   # lazy-init при первом использовании
         # True после graceful fallback на embedded-индекс (сервер был недоступен).
         self._fellback_to_embedded = False
+        # Cached once per instance: True when datasets_rag collection is confirmed absent.
+        # Avoids repeated failing calls per product for a collection not yet ingested.
+        self._datasets_collection_absent: bool = False
         self._judge = CompetitorRagJudge()
         # LLM-менеджер для relevance filter — инициализируется лениво
         self._llm_manager = llm_manager
@@ -514,12 +567,19 @@ class CompetitorRagSource(AttributeSource):
                     cat_filter_text = level
                     break
 
-        # Поиск в Qdrant (top-10)
+        # Поиск в ozon_products (с категорийным фильтром)
         try:
-            neighbors = self._search_neighbors(query_vector, cat_filter_text)
+            ozon_neighbors = self._search_neighbors(query_vector, cat_filter_text)
         except Exception as e:
             logger.warning("[CompetitorRag] qdrant search failed: %s", e)
             return []
+
+        # Поиск в datasets_rag (vector-only, молча пропускается если коллекция отсутствует)
+        datasets_neighbors = self._search_datasets_neighbors(query_vector)
+
+        # Merge: ozon_products first (higher-trust, Ozon-moderated), datasets second.
+        # Dedup by variantid/id field where present; payload identity otherwise.
+        neighbors = _merge_neighbors(ozon_neighbors, datasets_neighbors)
 
         if not neighbors:
             return []
@@ -693,6 +753,70 @@ class CompetitorRagSource(AttributeSource):
             ]
 
         return neighbors
+
+    def _search_datasets_neighbors(
+        self,
+        query_vector: list[float],
+    ) -> list[dict]:
+        """Vector-only search in the datasets_rag collection (no category filter).
+
+        The datasets_rag collection contains foreign-language product data
+        (OFF, OBF, Amazon, IKEA, …) whose category field is NOT in Russian,
+        so the RU MatchText filter used for ozon_products would wrongly exclude
+        all results.  We query by vector similarity only and let the downstream
+        LLM relevance filter + consensus remove off-topic noise.
+
+        Graceful degradation contract:
+          - If the collection does not exist (404 / UnexpectedResponse with 4xx),
+            set _datasets_collection_absent=True and return [] silently.
+          - If _datasets_collection_absent is already True, return [] immediately
+            (avoid repeated failing calls per product).
+          - Any other error is also caught and logged at DEBUG level (not WARNING)
+            to stay silent — the main ozon_products path already provides results.
+        """
+        if self._datasets_collection_absent:
+            return []
+
+        try:
+            response = self._get_client().query_points(
+                collection_name=self._datasets_collection_name,
+                query=query_vector,
+                limit=self._top_k,
+                with_payload=True,
+                query_filter=None,  # vector-only — no category pre-filter
+            )
+            neighbors = [hit.payload for hit in response.points if hit.payload]
+            return neighbors
+
+        except Exception as exc:
+            from qdrant_client.http.exceptions import UnexpectedResponse  # type: ignore
+            is_absent = False
+            if isinstance(exc, UnexpectedResponse):
+                status = getattr(exc, "status_code", None)
+                # 404 = collection not found; also treat 400 as absent (wrong collection name)
+                is_absent = status is not None and 400 <= status < 500
+            # ValueError/RuntimeError from embedded client when collection is missing
+            if not is_absent:
+                exc_text = f"{type(exc).__name__}: {exc}".lower()
+                is_absent = (
+                    "not found" in exc_text
+                    or "does not exist" in exc_text
+                    or "collection" in exc_text and ("missing" in exc_text or "404" in exc_text)
+                )
+
+            if is_absent:
+                self._datasets_collection_absent = True
+                logger.debug(
+                    "[CompetitorRag] datasets collection %r absent — "
+                    "will skip for the remainder of this run. (%s: %s)",
+                    self._datasets_collection_name, type(exc).__name__, exc,
+                )
+            else:
+                logger.debug(
+                    "[CompetitorRag] datasets query failed (non-fatal): %s: %s",
+                    type(exc).__name__, exc,
+                )
+            return []
 
     def _aggregate_consensus(
         self,

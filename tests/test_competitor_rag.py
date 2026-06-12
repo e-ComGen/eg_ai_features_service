@@ -53,18 +53,27 @@ def _make_rag_source_with_mock(
     neighbors: list[dict],
     llm_manager=None,
     top_k: int = 10,
+    datasets_neighbors: list[dict] | None = None,
 ) -> CompetitorRagSource:
-    """Создать CompetitorRagSource с замоканным _search_neighbors, _get_embedding и LLM."""
+    """Создать CompetitorRagSource с замоканным _search_neighbors, _get_embedding и LLM.
+
+    datasets_neighbors: список payload-соседей из datasets_rag (default: [] — коллекция отсутствует).
+    """
     source = CompetitorRagSource.__new__(CompetitorRagSource)
     source._index_path = "/fake/path"
     source._collection_name = "ozon_products"
+    source._datasets_collection_name = "datasets_rag"
     source._top_k = top_k
     source._min_consensus = 2
     source._embed_model_name = "fake-model"
     source._client = None
+    # Mark datasets collection absent by default — existing tests don't exercise it.
+    # Tests that want datasets hits pass datasets_neighbors explicitly.
+    source._datasets_collection_absent = datasets_neighbors is None
     from app.services.enrichment.judges.competitor_rag_judge import CompetitorRagJudge
     source._judge = CompetitorRagJudge()
     source._search_neighbors = MagicMock(return_value=neighbors)
+    source._search_datasets_neighbors = MagicMock(return_value=datasets_neighbors or [])
     source._llm_manager = llm_manager
     return source
 
@@ -698,3 +707,117 @@ def test_process_wide_embedded_singleton_is_reused():
 
     # Restore
     mod._embedded_client_singleton = original
+
+
+# ---------------------------------------------------------------------------
+# Test 16 (NEW): datasets_rag present → extra neighbors merged into consensus
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_datasets_neighbors_merged_into_consensus():
+    """When datasets_rag returns hits they are merged with ozon_products before consensus."""
+    import json
+
+    # ozon_products: 2 neighbors, both "Красный"
+    ozon_neighbors = _fake_neighbors([
+        {"Цвет товара": ["Красный"]},
+        {"Цвет товара": ["Красный"]},
+    ])
+    # datasets_rag: 2 extra neighbors, both "Красный" → total 4/4 agree
+    datasets_neighbors = [
+        {"id": 100, "imt_name": "Dataset product A",
+         "characteristics": json.dumps({"Цвет товара": ["Красный"]})},
+        {"id": 101, "imt_name": "Dataset product B",
+         "characteristics": json.dumps({"Цвет товара": ["Красный"]})},
+    ]
+    # LLM filter keeps all 4 (indices 0-3)
+    llm_mgr = _make_llm_manager_returning([0, 1, 2, 3])
+    source = _make_rag_source_with_mock(
+        ozon_neighbors, llm_manager=llm_mgr, datasets_neighbors=datasets_neighbors
+    )
+    targets = [_make_target(10, "Цвет товара")]
+    ctx = _make_context()
+
+    with patch("app.services.enrichment.sources.competitor_rag_source._get_embedding",
+               return_value=[0.1] * 128):
+        results = await source.extract(ctx, targets)
+
+    assert len(results) == 1, "datasets neighbors should contribute to consensus"
+    av = results[0]
+    assert av.value == "Красный"
+    assert "4/4" in av.evidence, "All 4 merged neighbors should be reflected in evidence"
+    assert av.confidence == pytest.approx(0.90, abs=0.01)  # 0.7 + 0.05*4 = 0.90
+
+    # Verify datasets query WAS called (not short-circuited by absent flag)
+    source._search_datasets_neighbors.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Test 17 (NEW): datasets_rag absent (404) → silently skipped, current behavior preserved
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_datasets_absent_silently_skipped():
+    """If datasets_rag raises 404/UnexpectedResponse the source behaves exactly as before."""
+    from qdrant_client.http.exceptions import UnexpectedResponse  # type: ignore
+
+    # Build source WITHOUT __new__ shortcut so _search_datasets_neighbors is the real method
+    source = CompetitorRagSource.__new__(CompetitorRagSource)
+    source._index_path = "/fake/path"
+    source._collection_name = "ozon_products"
+    source._datasets_collection_name = "datasets_rag"
+    source._top_k = 10
+    source._min_consensus = 2
+    source._embed_model_name = "fake-model"
+    source._client = None
+    source._datasets_collection_absent = False  # starts unknown
+    from app.services.enrichment.judges.competitor_rag_judge import CompetitorRagJudge
+    source._judge = CompetitorRagJudge()
+
+    # ozon_products returns 3 matching neighbors
+    ozon_neighbors = _fake_neighbors([
+        {"Цвет": ["Синий"]},
+        {"Цвет": ["Синий"]},
+        {"Цвет": ["Синий"]},
+    ])
+    source._search_neighbors = MagicMock(return_value=ozon_neighbors)
+    source._llm_manager = _make_llm_manager_returning([0, 1, 2])
+
+    # datasets_rag raises 404 (collection not yet ingested)
+    four_oh_four = UnexpectedResponse(
+        status_code=404,
+        reason_phrase="Not Found",
+        content=b'{"status":{"error":"Collection datasets_rag not found"}}',
+        headers={},
+    )
+    mock_client = MagicMock()
+    mock_client.query_points.side_effect = four_oh_four
+
+    with patch.object(source, "_get_client", return_value=mock_client), \
+         patch("app.services.enrichment.sources.competitor_rag_source._get_embedding",
+               return_value=[0.1] * 128):
+        results = await source.extract(_make_context(), [_make_target(10, "Цвет")])
+
+    # Should still return ozon-based result — datasets error silently swallowed
+    assert len(results) == 1, "ozon_products result must survive when datasets_rag is absent"
+    assert results[0].value == "Синий"
+    assert results[0].source == Source.COMPETITOR_RAG
+
+    # The absent flag must be set so subsequent calls skip the collection immediately
+    assert source._datasets_collection_absent is True
+
+
+# ---------------------------------------------------------------------------
+# Test 18 (NEW): datasets_rag absent flag caches — second call skips query entirely
+# ---------------------------------------------------------------------------
+
+def test_datasets_absent_flag_cached_skips_subsequent_calls():
+    """Once _datasets_collection_absent=True, _search_datasets_neighbors returns [] immediately."""
+    source = CompetitorRagSource.__new__(CompetitorRagSource)
+    source._datasets_collection_absent = True
+    source._datasets_collection_name = "datasets_rag"
+    # _get_client should never be called if absent flag is True
+    source._get_client = MagicMock(side_effect=AssertionError("_get_client must not be called"))
+
+    result = source._search_datasets_neighbors([0.1] * 384)
+    assert result == [], "Absent flag → immediate empty return without touching client"
