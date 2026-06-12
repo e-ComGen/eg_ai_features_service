@@ -82,7 +82,7 @@ PYEOF
 echo "[pod] === download indexer from HF ==="
 curl -fsSL \
     -H "Authorization: Bearer ${HF_TOKEN}" \
-    "https://huggingface.co/datasets/${HF_REPO_ID}/resolve/main/ingest_dataset_to_qdrant.py" \
+    "https://huggingface.co/datasets/${HF_REPO_ID}/resolve/${HF_REV:-main}/ingest_dataset_to_qdrant.py" \
     -o /workspace/ingest_dataset_to_qdrant.py
 ls -l /workspace/ingest_dataset_to_qdrant.py
 

@@ -80,8 +80,11 @@ def hf_create_dataset(repo_id: str) -> None:
             sys.exit(f"[HF] Create failed HTTP {e.code}: {body[:500]}")
 
 
-def hf_upload_folder(repo_id: str, files: list[tuple[Path, str]]) -> None:
-    """Upload multiple files in a single commit using HfApi.upload_folder."""
+def hf_upload_folder(repo_id: str, files: list[tuple[Path, str]]) -> str:
+    """Upload multiple files in a single commit using HfApi.upload_folder.
+
+    Returns the immutable commit SHA so callers can build cache-proof URLs.
+    """
     try:
         from huggingface_hub import HfApi
     except ImportError:
@@ -94,14 +97,17 @@ def hf_upload_folder(repo_id: str, files: list[tuple[Path, str]]) -> None:
         for src, dst in files:
             shutil.copy(src, td_path / dst)
         api = HfApi(token=HF_TOKEN)
-        api.upload_folder(
+        commit = api.upload_folder(
             folder_path=str(td_path),
             repo_id=repo_id,
             repo_type="dataset",
             commit_message="datasets-rag bootstrap scripts",
         )
+    sha: str = commit.oid
     for _, dst in files:
         print(f"[HF] uploaded {dst}")
+    print(f"[HF] commit SHA: {sha}")
+    return sha
 
 
 # ── RunPod helpers ─────────────────────────────────────────────────────────────
@@ -131,7 +137,7 @@ def runpod_graphql(query: str, variables: dict, allow_retry: bool = False) -> di
     return body["data"]
 
 
-def spawn_pod(hf_repo_id: str, run_sh_url: str) -> tuple[str, str]:
+def spawn_pod(hf_repo_id: str, run_sh_url: str, sha: str) -> tuple[str, str]:
     """Try each GPU candidate in order; return (pod_id, gpu_used)."""
     cache_bust = int(time.time())
     busted_url = f"{run_sh_url}?ts={cache_bust}"
@@ -171,6 +177,7 @@ def spawn_pod(hf_repo_id: str, run_sh_url: str) -> tuple[str, str]:
                 "env": [
                     {"key": "HF_TOKEN", "value": HF_TOKEN},
                     {"key": "HF_REPO_ID", "value": hf_repo_id},
+                    {"key": "HF_REV", "value": sha},
                 ],
             }
         }
@@ -202,7 +209,7 @@ def main() -> None:
     if not indexer.exists():
         sys.exit(f"[Error] Missing: {indexer}")
 
-    hf_upload_folder(
+    sha = hf_upload_folder(
         hf_repo_id,
         [
             (runner, "run.sh"),
@@ -210,8 +217,8 @@ def main() -> None:
         ],
     )
 
-    run_sh_url = f"https://huggingface.co/datasets/{hf_repo_id}/resolve/main/run.sh"
-    pod_id, gpu_used = spawn_pod(hf_repo_id, run_sh_url)
+    run_sh_url = f"https://huggingface.co/datasets/{hf_repo_id}/resolve/{sha}/run.sh"
+    pod_id, gpu_used = spawn_pod(hf_repo_id, run_sh_url, sha)
     print(f"[Pod] Created: {pod_id}  GPU: {gpu_used}")
 
     state = {
