@@ -131,10 +131,11 @@ def _normalize_free_text_rag(value: str) -> Optional[str]:
     Rules (all general — no per-category logic):
       1. Trim and collapse whitespace.
       2. Drop raw slash/dash colorway/SKU codes (e.g. "ftwwht/cblack/solred").
-      3. Drop non-Cyrillic strings that are NOT measurement-like — these are
-         foreign-language values (e.g. "Red", "100% Polyester", "UK 6") with no
-         clean RU form. Measurement-like values (e.g. "750W", "2.4GHz") are kept
-         because they are universal notation that does not need translation.
+      3. For non-Cyrillic strings that are NOT measurement-like: attempt whole-token
+         EN→RU translation via _EN_TO_RU_VALUES before dropping.
+         "Cotton" → "хлопок" (kept).  "Polyester" → "полиэстер" (kept).
+         Raw codes still dropped (step 2 fires first).
+         If still no Cyrillic after translation attempt → drop.
 
     Returns the cleaned value, or None if the value should be dropped entirely.
     """
@@ -144,12 +145,46 @@ def _normalize_free_text_rag(value: str) -> Optional[str]:
     # Drop raw slash/dash code tokens (e.g. "ftwwht/cblack/solred")
     if _RAW_CODE_RE.match(cleaned):
         return None
-    # Drop non-Cyrillic strings unless they look like a numeric measurement.
-    # "Red" → drop. "100% Polyester" → drop. "UK 6" → drop.
-    # "750W" → keep (measurement). "2.4GHz" → keep.
+    # Non-Cyrillic guard: attempt EN→RU translation before dropping.
     if _NO_CYRILLIC_RE.match(cleaned) and not _MEASUREMENT_LIKE_RE.match(cleaned):
+        try:
+            from app.services.enrichment.strategies.dictionaries.ozon_loader import (
+                _EN_TO_RU_VALUES,
+            )
+            translated = _EN_TO_RU_VALUES.get(cleaned.lower().strip())
+            if translated is not None:
+                return translated
+        except Exception:
+            pass
+        # Still no Cyrillic form found — drop.
         return None
     return cleaned
+
+
+def _translate_for_enum(raw_value: str) -> str:
+    """Translate raw EN enum value to RU form using _normalize_token + gender canon.
+
+    Applies:
+      1. _normalize_token: lower + EN→RU table + homoglyph fix + ё→е normalization.
+      2. normalize_gender_value: maps gender variants to Ozon canon (Мужской/Женский/…).
+
+    Returns the translated form if translation changed the input, otherwise returns
+    the original raw_value unchanged (so RU inputs are never corrupted).
+    Fallback: returns raw_value if imports fail.
+    """
+    try:
+        from app.services.enrichment.strategies.dictionaries.ozon_loader import (
+            _normalize_token,
+            normalize_gender_value,
+        )
+        normalized = _normalize_token(raw_value)
+        # Prefer gender canon over generic normalization for gender-typed values.
+        gender = normalize_gender_value(raw_value)
+        if gender is not None:
+            return gender
+        return normalized
+    except Exception:
+        return raw_value
 
 
 def _match_enum_value(raw_value: str, allowed_values: list[str]) -> Optional[str]:
@@ -158,21 +193,44 @@ def _match_enum_value(raw_value: str, allowed_values: list[str]) -> Optional[str
     Uses the project's MatcherService (fuzzy + vector, same as resolve_value_id).
     Returns the matched allowed option string, or None if no confident match found.
     Falls back gracefully if MatcherService is unavailable (sentence-transformers absent).
+
+    EN→RU translation:  before matching, the raw value is translated through
+    _normalize_token (which includes the full _EN_TO_RU_VALUES table) and
+    normalize_gender_value.  This recovers "Black"→"чёрный", "Yes"→"да",
+    "men's"→"Мужской" etc. that would otherwise silently fail fuzzy matching
+    across Latin/Cyrillic script boundaries.  Falls back to the original raw_value
+    if translation yields nothing different (no regression on already-RU values).
     """
+    translated_value = _translate_for_enum(raw_value)
     try:
         from app.services.enrichment.strategies.dictionaries.ozon_loader import get_matcher
         matcher = get_matcher()
         if matcher is None:
-            # No fuzzy matcher available — fall back to case-insensitive exact match only
-            raw_lower = raw_value.lower().strip()
-            for opt in allowed_values:
-                if opt.lower().strip() == raw_lower:
-                    return opt
+            # No fuzzy matcher available — fall back to case-insensitive exact match only.
+            # Try translated form first, then raw as fallback.
+            for candidate in _dedupe_ordered([translated_value, raw_value]):
+                cand_lower = candidate.lower().strip()
+                for opt in allowed_values:
+                    if opt.lower().strip() == cand_lower:
+                        return opt
             return None
-        return matcher.find_best_match(raw_value, allowed_values)
+        # Try translated form first; fall back to raw if translated yields nothing.
+        result = matcher.find_best_match(translated_value, allowed_values)
+        if result is None and translated_value != raw_value:
+            result = matcher.find_best_match(raw_value, allowed_values)
+        return result
     except Exception as exc:
         logger.debug("[CompetitorRag] enum matcher failed for %r: %s", raw_value, exc)
         return None
+
+
+def _dedupe_ordered(items: list[str]) -> list[str]:
+    """Return items with consecutive duplicates removed, preserving order."""
+    seen: list[str] = []
+    for item in items:
+        if not seen or seen[-1] != item:
+            seen.append(item)
+    return seen
 
 # ── Process-wide Qdrant embedded singleton ────────────────────────────────────
 # Embedded local mode loads ALL vectors into numpy RAM (~3.7 GB for ozon_rag).

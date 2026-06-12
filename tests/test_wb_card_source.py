@@ -730,3 +730,114 @@ def test_semantic_fallback_not_invoked_when_already_matched():
     )
     assert len(result) == 1, "Exact-match char must still be resolved"
     assert result[0].attribute_id == 42
+
+
+# ---------------------------------------------------------------------------
+# _extract_options: compositions[] field mapping (Task 1 — apparel surface)
+# ---------------------------------------------------------------------------
+
+class TestExtractOptionsCompositions:
+    """Verify _extract_options handles all WB compositions[] schema variants."""
+
+    def test_plain_value_field(self):
+        """compositions[{name, value}] → single 'Состав' entry with pct%."""
+        card = {
+            "compositions": [
+                {"name": "хлопок", "value": "80"},
+                {"name": "полиэстер", "value": "20"},
+            ]
+        }
+        opts = WbCardSource._extract_options(card)
+        sostav = next((o for o in opts if o["name"] == "Состав"), None)
+        assert sostav is not None, "_extract_options must emit 'Состав' from compositions[]"
+        assert "хлопок" in sostav["value"]
+        assert "полиэстер" in sostav["value"]
+
+    def test_percentage_field(self):
+        """compositions[{name, percentage}] — percentage key instead of value."""
+        card = {
+            "compositions": [
+                {"name": "шерсть", "percentage": 90},
+                {"name": "эластан", "percentage": 10},
+            ]
+        }
+        opts = WbCardSource._extract_options(card)
+        sostav = next((o for o in opts if o["name"] == "Состав"), None)
+        assert sostav is not None
+        assert "шерсть" in sostav["value"]
+        assert "90%" in sostav["value"]
+
+    def test_string_list_compositions(self):
+        """compositions[str] variant — list of plain strings."""
+        card = {"compositions": ["хлопок 80%", "полиэстер 20%"]}
+        opts = WbCardSource._extract_options(card)
+        sostav = next((o for o in opts if o["name"] == "Состав"), None)
+        assert sostav is not None
+        assert "хлопок" in sostav["value"]
+
+    def test_typed_composition_lining(self):
+        """compositions[{name, value, type: 'подкладка'}] → 'Материал подкладки' field."""
+        card = {
+            "compositions": [
+                {"name": "хлопок", "value": "100", "type": "основной"},
+                {"name": "полиэстер", "value": "100", "type": "подкладка"},
+            ]
+        }
+        opts = WbCardSource._extract_options(card)
+        names = [o["name"] for o in opts]
+        # Main composition under "Состав" (mapped from "основной" type)
+        assert "Состав" in names, f"Expected 'Состав' in {names}"
+        # Lining under "Материал подкладки"
+        assert "Материал подкладки" in names, f"Expected 'Материал подкладки' in {names}"
+
+    def test_typed_composition_insulation(self):
+        """compositions[{name, value, type: 'утеплитель'}] → 'Материал утеплителя'."""
+        card = {
+            "compositions": [
+                {"name": "синтепон", "value": "100", "type": "утеплитель"},
+            ]
+        }
+        opts = WbCardSource._extract_options(card)
+        names = [o["name"] for o in opts]
+        assert "Материал утеплителя" in names, f"Expected 'Материал утеплителя' in {names}"
+        mat_utep = next(o for o in opts if o["name"] == "Материал утеплителя")
+        assert "синтепон" in mat_utep["value"]
+
+    def test_options_plus_compositions_combined(self):
+        """options[] items AND compositions[] both appear in the output, deduped."""
+        card = {
+            "options": [
+                {"name": "Материал подкладки", "value": "вискоза"},
+                {"name": "Пол", "value": "Мужской"},
+                {"name": "Страна производства", "value": "Китай"},
+            ],
+            "compositions": [
+                {"name": "хлопок", "value": "80"},
+                {"name": "полиэстер", "value": "20"},
+            ],
+        }
+        opts = WbCardSource._extract_options(card)
+        names = [o["name"].lower() for o in opts]
+        # options[] fields present
+        assert "материал подкладки" in names
+        assert "пол" in names
+        assert "страна производства" in names
+        # compositions → Состав
+        assert "состав" in names
+
+    def test_compositions_does_not_duplicate_options_lining(self):
+        """If 'материал подкладки' is already in options[], typed comp should NOT emit duplicate."""
+        card = {
+            "options": [
+                {"name": "Материал подкладки", "value": "вискоза"},
+            ],
+            "compositions": [
+                {"name": "полиэстер", "value": "100", "type": "подкладка"},
+            ],
+        }
+        opts = WbCardSource._extract_options(card)
+        lining_entries = [o for o in opts if o["name"].lower() == "материал подкладки"]
+        # Dedup: only ONE entry for lining (the first wins — options[] came before compositions[])
+        assert len(lining_entries) == 1, (
+            "Dedup must prevent duplicate 'Материал подкладки' entries"
+        )

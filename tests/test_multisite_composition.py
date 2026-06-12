@@ -255,7 +255,8 @@ class TestFirstHitStopsLoop:
 
         assert result is not None, "Should return composition from first site"
         assert "хлопок" in result["composition"]
-        assert result["site"] == "kixbox.ru"
+        # The specific winning site depends on pool ordering; what matters is early exit.
+        assert result["site"] in ("kixbox.ru", "sneakerhead.ru")
         # Second URL should NOT have been fetched (early exit)
         assert len(fetch_call_urls) == 1, (
             f"Loop must stop after first hit, got {len(fetch_call_urls)} fetches"
@@ -956,3 +957,198 @@ class TestSpaAutoEscalation:
         # Graceful None — no composition from either httpx or browser
         assert result is None
         mock_bf.fetch.assert_called_once()  # escalation DID fire, just found nothing
+
+
+# ---------------------------------------------------------------------------
+# sneakerhead.ru structured extractor
+# ---------------------------------------------------------------------------
+
+from app.services.enrichment.sources.multisite_composition import extract_sneakerhead_fields
+
+
+class TestExtractSneakerheadFields:
+    """Unit tests for extract_sneakerhead_fields — no network, fixture HTML only."""
+
+    # Realistic sneakerhead PDP spec block (server-rendered)
+    SNEAKERHEAD_HTML = """
+    <html>
+    <head><title>Nike Air Force 1 '07 - sneakerhead.ru</title></head>
+    <body>
+    <div class="product-detail">
+      <h1>Nike Air Force 1 '07</h1>
+      <div class="product-specs">
+        <div class="spec-row">Состав: Кожа, синтетика, текстиль, резина</div>
+        <div class="spec-row">Пол: Унисекс</div>
+        <div class="spec-row">Страна: Китай</div>
+        <div class="spec-row">Артикул: DH2987-102</div>
+        <div class="spec-row">Цвет: Белый/Чёрный</div>
+        <div class="spec-row">Сезон: Демисезон</div>
+      </div>
+    </div>
+    </body>
+    </html>
+    """
+
+    def test_extracts_composition(self):
+        fields = extract_sneakerhead_fields(self.SNEAKERHEAD_HTML)
+        assert "Состав" in fields
+        assert "кожа" in fields["Состав"].lower()
+        assert "синтетика" in fields["Состав"].lower()
+
+    def test_extracts_pol(self):
+        fields = extract_sneakerhead_fields(self.SNEAKERHEAD_HTML)
+        assert "Пол" in fields
+        assert "Унисекс" in fields["Пол"]
+
+    def test_extracts_strana(self):
+        fields = extract_sneakerhead_fields(self.SNEAKERHEAD_HTML)
+        assert "Страна" in fields
+        assert "Китай" in fields["Страна"]
+
+    def test_extracts_artikul(self):
+        fields = extract_sneakerhead_fields(self.SNEAKERHEAD_HTML)
+        assert "Артикул" in fields
+        assert "DH2987-102" in fields["Артикул"]
+
+    def test_extracts_tsvet(self):
+        fields = extract_sneakerhead_fields(self.SNEAKERHEAD_HTML)
+        assert "Цвет" in fields
+        assert "Белый" in fields["Цвет"]
+
+    def test_extracts_sezon(self):
+        fields = extract_sneakerhead_fields(self.SNEAKERHEAD_HTML)
+        assert "Сезон" in fields
+        assert "Демисезон" in fields["Сезон"]
+
+    def test_returns_empty_on_no_match(self):
+        html = "<html><body><p>Купить кроссовки Nike Air Force 1. Бесплатная доставка.</p></body></html>"
+        fields = extract_sneakerhead_fields(html)
+        assert fields == {}
+
+    def test_returns_empty_on_empty_input(self):
+        assert extract_sneakerhead_fields("") == {}
+        assert extract_sneakerhead_fields(None) == {}
+
+    def test_no_duplicate_keys(self):
+        """Duplicate label lines → only first value kept."""
+        html = """
+        <div>Состав: Кожа</div>
+        <div>Состав: Резина</div>
+        """
+        fields = extract_sneakerhead_fields(html)
+        assert fields.get("Состав") == "Кожа"
+
+    def test_plain_text_works(self):
+        """Works on pre-flattened plain text (no HTML tags)."""
+        text = "Состав: 100% хлопок\nПол: Мужской\nСтрана: Россия"
+        fields = extract_sneakerhead_fields(text)
+        assert fields["Состав"] == "100% хлопок"
+        assert fields["Пол"] == "Мужской"
+        assert fields["Страна"] == "Россия"
+
+
+class TestSneakerheadInHarvestComposition:
+    """Integration: harvest_composition returns extra_fields from sneakerhead."""
+
+    SNEAKERHEAD_HTML = """
+    <html>
+    <head><title>Nike Air Force 1 '07 - sneakerhead.ru</title></head>
+    <body>
+    <div class="product-specs">
+      <div>Состав: Кожа, синтетика, текстиль, резина</div>
+      <div>Пол: Унисекс</div>
+      <div>Страна: Китай</div>
+      <div>Артикул: DH2987-102</div>
+    </div>
+    </body>
+    </html>
+    """
+
+    def test_extra_fields_present_in_result(self):
+        """harvest_composition on sneakerhead URL must include extra_fields dict."""
+        serper = MagicMock()
+        serper.search = AsyncMock(
+            return_value=_make_serper_results(["https://sneakerhead.ru/nike-af1/"])
+        )
+
+        async def mock_fetch_url(url, **kwargs):
+            fr = MagicMock()
+            fr.raw_html = self.SNEAKERHEAD_HTML
+            fr.content = self.SNEAKERHEAD_HTML
+            return fr
+
+        with (
+            patch(
+                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                return_value=False,
+            ),
+            patch(
+                "app.services.url_fetcher.fetch_url_content",
+                new=mock_fetch_url,
+            ),
+            patch(
+                "app.services.enrichment.sources.multisite_composition._INTER_REQUEST_DELAY",
+                0,
+            ),
+        ):
+            result = run(
+                harvest_composition(
+                    "Nike Air Force 1 07",
+                    "Nike",
+                    serper_client=serper,
+                )
+            )
+
+        assert result is not None, "sneakerhead hit must return a result"
+        assert "кожа" in result["composition"].lower()
+        assert result["site"] == "sneakerhead.ru"
+        # extra_fields must carry the non-composition structured fields
+        extra = result.get("extra_fields", {})
+        assert "Пол" in extra, f"Пол missing from extra_fields: {extra}"
+        assert "Страна" in extra, f"Страна missing from extra_fields: {extra}"
+        assert "Артикул" in extra, f"Артикул missing from extra_fields: {extra}"
+
+    def test_no_extra_fields_key_on_non_sneakerhead(self):
+        """Non-sneakerhead sites must NOT have extra_fields key in the result."""
+        html = (
+            "<html><head><title>Nike Tee - kixbox.ru</title></head>"
+            "<body><p>Состав: 100% хлопок</p></body></html>"
+        )
+
+        serper = MagicMock()
+        serper.search = AsyncMock(
+            return_value=_make_serper_results(["https://kixbox.ru/nike-tee/"])
+        )
+
+        async def mock_fetch_url(url, **kwargs):
+            fr = MagicMock()
+            fr.raw_html = html
+            fr.content = html
+            return fr
+
+        with (
+            patch(
+                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                return_value=False,
+            ),
+            patch(
+                "app.services.url_fetcher.fetch_url_content",
+                new=mock_fetch_url,
+            ),
+            patch(
+                "app.services.enrichment.sources.multisite_composition._INTER_REQUEST_DELAY",
+                0,
+            ),
+        ):
+            result = run(
+                harvest_composition(
+                    "Футболка Nike",
+                    "Nike",
+                    serper_client=serper,
+                )
+            )
+
+        assert result is not None
+        assert "extra_fields" not in result, (
+            "extra_fields must only appear for sneakerhead.ru, not other sites"
+        )

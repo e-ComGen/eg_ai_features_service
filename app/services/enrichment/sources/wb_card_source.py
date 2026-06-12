@@ -1153,23 +1153,56 @@ class WbCardSource(AttributeSource):
                     if isinstance(o, dict):
                         _push(o.get("name"), o.get("value"))
 
-        # 3. compositions → Состав. WB отдаёт либо список {name,value} (доля
-        #    материала), либо список строк. Собираем в одну пару «Состав».
-        comp_parts: list[str] = []
+        # 3. compositions → Состав (+ typed variants → Материал подкладки / утеплителя).
+        #
+        # WB schema variants observed in the wild:
+        #   a. [{"name": "хлопок", "value": "100"}]          — pct in value
+        #   b. [{"name": "хлопок", "percentage": 80}]         — pct in percentage
+        #   c. ["хлопок 80%"]                                  — plain string
+        #   d. [{"name": "хлопок", "value": "100", "type": "подкладка"}]
+        #      — typed sub-composition: group by type, emit as "Материал подкладки", etc.
+        #
+        # Typed variants map: type value → canonical field name.
+        _COMP_TYPE_TO_FIELD: dict[str, str] = {
+            "подкладка":  "Материал подкладки",
+            "утеплитель": "Материал утеплителя",
+            "верх":       "Материал верха",
+            "подошва":    "Материал подошвы",
+            "основной":   "Состав",  # explicit "основной" type → main composition
+        }
+        # Buckets: None-key = untyped (→ "Состав"), other keys → specific fields.
+        comp_buckets: dict[str | None, list[str]] = {}
         for c in card.get("compositions") or []:
             if isinstance(c, dict):
                 cname = str(c.get("name") or "").strip()
+                # Accept value from "value" or "percentage" field.
                 cval = c.get("value")
+                if cval is None:
+                    cval = c.get("percentage")
                 cval_str = str(cval).strip() if isinstance(cval, (str, int, float)) else ""
-                if cname and cval_str:
-                    comp_parts.append(f"{cname} {cval_str}")
-                elif cname:
-                    comp_parts.append(cname)
+                ctype_raw = str(c.get("type") or "").strip().lower()
+                ctype: str | None = ctype_raw if ctype_raw else None
+                token = f"{cname} {cval_str}%" if (
+                    cname and cval_str and str(cval_str).isdigit()
+                ) else (f"{cname} {cval_str}" if cname and cval_str else cname)
+                if token:
+                    comp_buckets.setdefault(ctype, []).append(token)
             elif isinstance(c, str) and c.strip():
-                comp_parts.append(c.strip())
-        if comp_parts and "состав" not in seen:
-            seen.add("состав")
-            out.append({"name": "Состав", "value": ", ".join(comp_parts), "value_ids": []})
+                comp_buckets.setdefault(None, []).append(c.strip())
+
+        # Emit each bucket as a separate field.
+        for ctype, parts in comp_buckets.items():
+            if not parts:
+                continue
+            # Resolve field name: typed → mapped name; untyped → "Состав".
+            if ctype is None:
+                field_name = "Состав"
+            else:
+                field_name = _COMP_TYPE_TO_FIELD.get(ctype, f"Материал {ctype}")
+            field_name_low = field_name.lower()
+            if field_name_low not in seen:
+                seen.add(field_name_low)
+                out.append({"name": field_name, "value": ", ".join(parts), "value_ids": []})
 
         return out
 

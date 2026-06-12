@@ -37,6 +37,7 @@ from app.services.enrichment.sources import (
     YandexMarketSource,
     ScrapflyOzonSource,
     BarcodeSource,
+    RegardSource,
 )
 from app.services.enrichment.sources.ozon_card_source import (
     _extract_gender_signal,
@@ -2931,6 +2932,7 @@ class PipelineOrchestrator:
         tnved_source: Optional[TnvedSource] = None,
         scrapfly_ozon_source: Optional[ScrapflyOzonSource] = None,
         barcode_source: Optional[BarcodeSource] = None,
+        regard_source: Optional[RegardSource] = None,
         classifier: Optional[LlmClassifier] = None,
         cost_predictor: Optional[CostPredictor] = None,
         strategy: Optional[MarketplaceStrategy] = None,
@@ -2990,6 +2992,11 @@ class PipelineOrchestrator:
         # BarcodeSource: verbatim EAN/barcode extractor — zero LLM, zero cost.
         # Always created (cheap singleton, no external deps).
         self._barcode: BarcodeSource = barcode_source or BarcodeSource()
+        # RegardSource: verbatim electronics specs from regard.ru (plain httpx).
+        # Fires Stage 0.57 (after IceCat, before CompetitorRAG) for electronics
+        # categories where IceCat is weak (CPU/RAM/storage/GPU specs).
+        # None → regard stage skipped.
+        self._regard: Optional[RegardSource] = regard_source
         # ScrapflyOzonSource: last-resort Ozon card gap-filler via Scrapfly.
         # Fires ONLY when OzonCardSource (Scrappey) returned 0 results AND
         # SCRAPFLY_OZON_FALLBACK_ENABLED=true AND there are still-empty targets.
@@ -3026,6 +3033,12 @@ class PipelineOrchestrator:
         if self._wb_card is not None:
             self._judges[Source.WB_CARD] = ConfidenceAwareJudgeWrapper(
                 self._wb_card.get_judge()
+            )
+        # Judge для RegardSource: emits Source.WB_CARD — register only when
+        # WB_CARD judge not already set (WbCardSource takes precedence).
+        if self._regard is not None and Source.WB_CARD not in self._judges:
+            self._judges[Source.WB_CARD] = ConfidenceAwareJudgeWrapper(
+                self._regard.get_judge()
             )
         # Judge для YandexMarket (если source передан).
         # YandexMarketSource эмитит Source.OZON_CARD — переиспользуем тот же judge
@@ -3182,6 +3195,22 @@ class PipelineOrchestrator:
         if self._icecat is not None:
             new_avs = await self._run_icecat_stage(context, remaining, already_filled=filled_so_far)
             icecat_filled_count = len([v for v in new_avs if v.is_confident()])
+            all_values += new_avs
+            filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
+            remaining = self._remaining_targets(targets, all_values)
+            if not remaining:
+                all_values += await self._run_finishing(context, targets, all_values)
+                all_values += await self._generate_annotation(context, targets, all_values)
+                return await self._finalize_async(all_values, targets, context)
+
+        # Stage 0.57: RegardSource — verbatim electronics specs from regard.ru.
+        # Fires after IceCat: fills CPU/RAM/storage/GPU specs IceCat missed.
+        # Only when remaining > 0 (skip-guard inside source: ≥80% filled → []).
+        # Cost: 1 Serper + 1 plain httpx GET (~$0.001 + free).
+        if self._regard is not None and remaining:
+            new_avs = await self._run_regard_stage(
+                context, remaining, already_filled=filled_so_far,
+            )
             all_values += new_avs
             filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
             remaining = self._remaining_targets(targets, all_values)
@@ -4295,6 +4324,38 @@ class PipelineOrchestrator:
         # The URL is available in logs; wiring actual attribute extraction from the found URL
         # (fetch + parse + map) is straightforward once this stage is proven in live testing.
         return []
+
+    async def _run_regard_stage(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: Optional[list[AttributeValue]] = None,
+    ) -> list[AttributeValue]:
+        """Run RegardSource (Stage 0.57) + WB_CARD judge. Errors don't interrupt pipeline."""
+        if self._regard is None:
+            return []
+        judge_wrapper = self._judges.get(Source.WB_CARD)
+        try:
+            extracted = await self._regard.extract(
+                context, targets, already_filled=already_filled
+            )
+        except Exception as e:
+            logger.warning("[Pipeline] regard source failed: %s", e, exc_info=True)
+            return []
+        if judge_wrapper is None:
+            return extracted
+        results: list[AttributeValue] = []
+        for value in extracted:
+            try:
+                judged = await judge_wrapper.maybe_validate(value, context)
+                if judged is not None:
+                    results.append(judged)
+            except Exception as e:
+                logger.warning(
+                    "[Pipeline] regard judge failed for attr %s: %s",
+                    value.attribute_id, e,
+                )
+        return results
 
     async def _run_icecat_stage(
         self,

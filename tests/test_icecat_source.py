@@ -804,3 +804,69 @@ async def test_positive_bool_value_not_treated_as_negative(monkeypatch):
     assert len(results) == 1, "Позитивное значение 'Yes' должно давать fill"
     assert results[0].value == "Yes", f"Ожидаем 'Yes', получили {results[0].value!r}"
     assert "stated_negative" not in results[0].evidence
+
+
+# ---------------------------------------------------------------------------
+# Test 18: GTIN fallback — brand+MPN all 404, GTIN present → GTIN request issued + parsed
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_gtin_fallback_issued_when_brand_mpn_miss():
+    """brand+MPN all 404 AND context.ean present → _fetch_features_by_gtin called, AVs returned."""
+    features = [("Форм-фактор", "ATX"), ("Мощность", "850 Вт")]
+    source = IceCatSource(email="x", token="y")
+
+    # All brand+code lookups → 404; disable MPN lookup by pre-caching None
+    source._fetch_features = AsyncMock(return_value="404")
+    source.lookup_mpn = AsyncMock(return_value=None)
+    # GTIN lookup → success
+    gtin_features = source._parse_response(_make_icecat_response(features))
+    source._fetch_features_by_gtin = AsyncMock(return_value=gtin_features)
+
+    targets = [_make_target(103, "Форм-фактор"), _make_target(104, "Мощность, Вт")]
+    ctx = _make_context(ean="4901780197392")
+    results = await source.extract(ctx, targets)
+
+    source._fetch_features_by_gtin.assert_called_once_with("4901780197392")
+    assert len(results) > 0, "GTIN hit должен вернуть AVs"
+    assert all(av.source == Source.ICECAT for av in results)
+
+
+# ---------------------------------------------------------------------------
+# Test 19: no GTIN → _fetch_features_by_gtin NOT called (unchanged behavior)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_no_gtin_gtin_lookup_not_called():
+    """When context.ean is absent → _fetch_features_by_gtin is never invoked."""
+    source = IceCatSource(email="x", token="y")
+    source._fetch_features = AsyncMock(return_value="404")
+    source.lookup_mpn = AsyncMock(return_value=None)
+    source._fetch_features_by_gtin = AsyncMock(return_value="404")
+
+    targets = [_make_target(103, "Форм-фактор")]
+    ctx = _make_context()  # no ean field → ean=None
+    results = await source.extract(ctx, targets)
+
+    source._fetch_features_by_gtin.assert_not_called()
+    assert results == []
+
+
+# ---------------------------------------------------------------------------
+# Test 20: GTIN request error → graceful skip, no crash, extract returns []
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_gtin_request_error_graceful_skip():
+    """_fetch_features_by_gtin returns '404' (error/not found) → graceful skip, extract returns []."""
+    source = IceCatSource(email="x", token="y")
+    source._fetch_features = AsyncMock(return_value="404")
+    source.lookup_mpn = AsyncMock(return_value=None)
+    source._fetch_features_by_gtin = AsyncMock(return_value="404")
+
+    targets = [_make_target(103, "Форм-фактор")]
+    ctx = _make_context(ean="0000000000000")
+    results = await source.extract(ctx, targets)
+
+    source._fetch_features_by_gtin.assert_called_once()
+    assert results == [], "GTIN error → graceful [], без исключений"

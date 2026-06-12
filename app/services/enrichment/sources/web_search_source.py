@@ -49,6 +49,34 @@ _ATTR_MATERIAL = 4496           # enum "Материал"
 _COMPOSITION_CONFIDENCE = 0.72
 
 
+def _find_target_by_label(
+    label_norm: str,
+    targets: list["TargetAttribute"],
+) -> "Optional[TargetAttribute]":
+    """Match a sneakerhead label (lowercase) to a TargetAttribute by name.
+
+    Matching order (first match wins):
+      1. Exact case-insensitive equality: label == target.name.lower()
+      2. Substring: label is contained in target.name.lower()
+      3. Substring (reverse): target.name.lower() is contained in label
+
+    Returns None if no target matches.
+    """
+    # Pass 1: exact
+    for t in targets:
+        if t.name.lower() == label_norm:
+            return t
+    # Pass 2: label ⊆ target name
+    for t in targets:
+        if label_norm in t.name.lower():
+            return t
+    # Pass 3: target name ⊆ label (e.g. label="страна производства" vs name="страна")
+    for t in targets:
+        if t.name.lower() in label_norm:
+            return t
+    return None
+
+
 class _WebExtractedAttr(BaseModel):
     model_config = {"populate_by_name": True}
     attribute_id: int = Field(..., validation_alias=AliasChoices("attribute_id", "id"))
@@ -342,6 +370,7 @@ class WebSearchSource(AttributeSource):
         compositions: list[str] = []
         harvest_source_url: Optional[str] = None
         harvest_evidence: Optional[str] = None
+        harvest_extra_fields: dict[str, str] = {}
 
         # ------------------------------------------------------------------
         # Path A: adaptive multi-site harvester (harvest_composition)
@@ -370,11 +399,13 @@ class WebSearchSource(AttributeSource):
                         f"[{result.get('site', '')}] {result.get('evidence', '')}"
                         f" (route={result.get('route', 'open')})"
                     )
+                    harvest_extra_fields = result.get("extra_fields") or {}
                     logger.info(
                         "WebSearchSource: harvest_composition HIT site=%r "
-                        "composition=%r route=%s",
+                        "composition=%r route=%s extra_fields=%s",
                         result.get("site"), result["composition"][:80],
                         result.get("route", "open"),
+                        list(harvest_extra_fields.keys()),
                     )
             except Exception as exc:
                 logger.warning(
@@ -477,6 +508,146 @@ class WebSearchSource(AttributeSource):
                         "WebSearchSource: Материал(4496) %r could not be resolved — skipped",
                         dom_mat,
                     )
+
+        # Extra fields from sneakerhead structured block (Пол, Страна, Цвет, etc.)
+        # Only present when harvest_composition hit sneakerhead.ru.
+        if harvest_extra_fields:
+            extra_avs = self._emit_extra_fields_avs(
+                extra_fields=harvest_extra_fields,
+                effective_targets=effective_targets,
+                filled_ids=filled_ids,
+                context=context,
+                site=harvest_source_url or "sneakerhead.ru",
+            )
+            avs.extend(extra_avs)
+
+        return avs
+
+    # ------------------------------------------------------------------
+    # Extra-fields emission helper (sneakerhead structured block)
+    # ------------------------------------------------------------------
+
+    def _emit_extra_fields_avs(
+        self,
+        extra_fields: dict[str, str],
+        effective_targets: list[TargetAttribute],
+        filled_ids: set[int],
+        context: ExtractionContext,
+        site: str,
+    ) -> list[AttributeValue]:
+        """Emit AttributeValues for sneakerhead extra_fields (Пол, Страна, Цвет, etc.).
+
+        Matching strategy (label → target):
+          - Normalise the sneakerhead label to lowercase.
+          - Match against target.name (case-insensitive substring: label in name OR
+            name in label).  Prefers the target whose name most closely contains the
+            label.
+          - Skip targets already present in filled_ids (never overwrite).
+
+        Enum gate (fail-closed):
+          - If target.type == "enum" AND target.allowed_values is present: value MUST
+            pass _try_match_one_value against allowed_values; drop if no match.
+          - If target.type == "enum" AND ozon_type_id known: also attempt resolve_value_id
+            to obtain value_id; emit with value_id when resolved.
+          - Free-text / numeric targets: take verbatim value; no fabricated value_ids.
+
+        Source attribution mirrors the composition AVs:
+          source=Source.WEB_SEARCH, evidence="sneakerhead:<label>:verbatim".
+        """
+        from app.services.enrichment.strategies.dictionaries.ozon_loader import (
+            resolve_value_id,
+            _try_match_one_value,  # type: ignore[attr-defined]
+        )
+
+        avs: list[AttributeValue] = []
+
+        for label, verbatim_value in extra_fields.items():
+            if not verbatim_value:
+                continue
+
+            label_norm = label.strip().lower()
+
+            # Find a matching target by name (case-insensitive substring)
+            target = _find_target_by_label(label_norm, effective_targets)
+            if target is None:
+                logger.debug(
+                    "WebSearchSource extra_fields: label=%r — no matching target, skipped",
+                    label,
+                )
+                continue
+
+            if target.id in filled_ids:
+                logger.debug(
+                    "WebSearchSource extra_fields: label=%r target_id=%d already filled, skipped",
+                    label, target.id,
+                )
+                continue
+
+            value_id: Optional[int] = None
+
+            if target.type == "enum":
+                # Gate 1: verify value against target.allowed_values list (if present).
+                # We use _try_match_one_value with sentinel ids (1) so we can detect
+                # string-level match independently of value_id resolution.
+                if target.allowed_values:
+                    sentinel_list = [{"value": v, "id": 1} for v in target.allowed_values]
+                    sentinel_hit = _try_match_one_value(verbatim_value, sentinel_list)
+                    if sentinel_hit is None:
+                        # No string match in allowed_values — drop (fail-closed)
+                        logger.debug(
+                            "WebSearchSource extra_fields: label=%r value=%r — "
+                            "no match in allowed_values for target %d, dropped",
+                            label, verbatim_value, target.id,
+                        )
+                        continue
+                    # String matched; fall through to resolve_value_id for real value_id
+
+                # Gate 2: resolve_value_id for value_id (fail-closed when type_id known)
+                type_id = getattr(context, "ozon_type_id", None)
+                if type_id is not None:
+                    try:
+                        value_id = resolve_value_id(
+                            context.category_id, type_id, target.id, verbatim_value
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "WebSearchSource extra_fields: resolve_value_id(%d, %r) failed: %s",
+                            target.id, verbatim_value, exc,
+                        )
+
+                    if value_id is None:
+                        # enum with type_id available but no dict match — drop (fail-closed)
+                        logger.debug(
+                            "WebSearchSource extra_fields: label=%r value=%r — "
+                            "resolve_value_id returned None for target %d, dropped",
+                            label, verbatim_value, target.id,
+                        )
+                        continue
+                elif not target.allowed_values:
+                    # enum with no type_id AND no allowed_values — cannot gate, skip
+                    logger.debug(
+                        "WebSearchSource extra_fields: label=%r value=%r — "
+                        "enum target %d has no allowed_values and no ozon_type_id, dropped",
+                        label, verbatim_value, target.id,
+                    )
+                    continue
+                # else: type_id is None but allowed_values matched — emit without value_id
+
+            av = AttributeValue(
+                attribute_id=target.id,
+                value=verbatim_value,
+                confidence=_COMPOSITION_CONFIDENCE,
+                source=Source.WEB_SEARCH,
+                evidence=f"sneakerhead:{label}:verbatim via {site}",
+                semantic_type=target.semantic_type,
+                is_collection=target.is_collection,
+                value_id=value_id,
+            )
+            avs.append(av)
+            logger.info(
+                "WebSearchSource extra_fields: emitting %s(%d)=%r value_id=%s",
+                target.name, target.id, verbatim_value, value_id,
+            )
 
         return avs
 

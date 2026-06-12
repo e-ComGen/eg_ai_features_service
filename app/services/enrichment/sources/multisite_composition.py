@@ -55,8 +55,10 @@ class SiteEntry:
 
 APPAREL_SITE_POOL: list[SiteEntry] = [
     # --- Open sites (plain httpx) — cheap, fast, tried first ---
-    SiteEntry("kixbox.ru",       needs_browser=False),
+    # sneakerhead.ru leads: server-rendered structured label-value PDP pages with
+    # full apparel surface (Состав, Пол, Страна, Цвет, Артикул) — best footwear hit.
     SiteEntry("sneakerhead.ru",  needs_browser=False),
+    SiteEntry("kixbox.ru",       needs_browser=False),
     SiteEntry("basketshop.ru",   needs_browser=False),
     SiteEntry("brandshop.ru",    needs_browser=False),
     SiteEntry("street-beat.ru",  needs_browser=False),
@@ -77,6 +79,65 @@ _SITE_QUERY_FRAGMENT = " OR ".join(f"site:{s.domain}" for s in APPAREL_SITE_POOL
 
 # Inter-request politeness delay (seconds)
 _INTER_REQUEST_DELAY = 3.5
+
+# ---------------------------------------------------------------------------
+# sneakerhead.ru structured label-value extractor
+# ---------------------------------------------------------------------------
+# sneakerhead PDP pages are server-rendered and expose a structured spec block:
+#   Состав: Кожа, синтетика, текстиль, резина
+#   Пол: Унисекс
+#   Страна: Китай
+#   Артикул: DH2987-102
+#   Цвет: Белый/Чёрный
+#
+# We parse these as verbatim label→value pairs.  The label set is intentionally
+# limited to fields that are product-invariant (safe to generalise across SKUs).
+
+# Canonical sneakerhead label names → our normalised field names (lowercase key).
+_SNEAKERHEAD_LABEL_MAP: dict[str, str] = {
+    "состав":   "Состав",
+    "материал": "Материал",
+    "пол":      "Пол",
+    "страна":   "Страна",
+    "артикул":  "Артикул",
+    "цвет":     "Цвет",
+    "сезон":    "Сезон",
+}
+
+# Regex: matches "Label: Value" lines (colon separator, any leading whitespace).
+# Captures the label and value verbatim; stops at end-of-line.
+_SNEAKERHEAD_LABEL_RE = re.compile(
+    r"^\s*(?P<label>" + "|".join(re.escape(k) for k in _SNEAKERHEAD_LABEL_MAP) + r")\s*:\s*"
+    r"(?P<value>[^\n\r]{1,200})",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def extract_sneakerhead_fields(html_or_text: str) -> dict[str, str]:
+    """Parse sneakerhead.ru structured spec block into {field_name: verbatim_value}.
+
+    Works on both raw HTML (strips tags first) and plain text.
+    Returns only the fields present in _SNEAKERHEAD_LABEL_MAP; empty dict if none found.
+    Values are returned verbatim (no normalisation) — callers do enum-matching.
+    """
+    if not html_or_text:
+        return {}
+
+    from app.services.enrichment.composition_extractor import _flatten_html
+    flat = _flatten_html(html_or_text)
+
+    result: dict[str, str] = {}
+    for m in _SNEAKERHEAD_LABEL_RE.finditer(flat):
+        label_low = m.group("label").strip().lower()
+        field_name = _SNEAKERHEAD_LABEL_MAP.get(label_low)
+        if field_name is None:
+            continue
+        value = m.group("value").strip().rstrip(".,;:")
+        if value and field_name not in result:
+            result[field_name] = value
+
+    return result
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -376,8 +437,28 @@ async def harvest_composition(
                     await asyncio.sleep(_INTER_REQUEST_DELAY)
                 continue
 
-            # --- Composition extraction ---
-            compositions = extract_composition(html)
+            # --- Composition extraction (+ sneakerhead structured fields) ---
+            # sneakerhead.ru: server-rendered label-value spec block — parse the full
+            # structured surface (Состав, Пол, Страна, Цвет, Артикул, Сезон) verbatim.
+            # The composition string is taken from the "Состав" or "Материал" field.
+            # All other fields are collected into extra_fields for the caller to use.
+            extra_fields: dict[str, str] = {}
+            if host == "sneakerhead.ru" or host.endswith(".sneakerhead.ru"):
+                sneaker_fields = extract_sneakerhead_fields(html)
+                if sneaker_fields:
+                    logger.info(
+                        "harvest_composition: sneakerhead structured fields on %s: %s",
+                        url, list(sneaker_fields.keys()),
+                    )
+                    # Surface composition from the structured block if present.
+                    comp_from_struct = sneaker_fields.pop("Состав", None) \
+                        or sneaker_fields.pop("Материал", None)
+                    extra_fields = sneaker_fields  # remaining fields (Пол, Страна, etc.)
+                    compositions = [comp_from_struct] if comp_from_struct else extract_composition(html)
+                else:
+                    compositions = extract_composition(html)
+            else:
+                compositions = extract_composition(html)
 
             # --- SPA auto-escalation (open sites only) ---
             # If httpx returned an unrendered SPA shell (spec block is in the JS
@@ -429,7 +510,7 @@ async def harvest_composition(
                 host, route, composition_str, url,
             )
 
-            return {
+            result: dict = {
                 "composition": composition_str,
                 "material": _primary_material_token(composition_str),
                 "source_url": url,
@@ -438,6 +519,9 @@ async def harvest_composition(
                 "route": route,
                 "all_compositions": compositions,
             }
+            if extra_fields:
+                result["extra_fields"] = extra_fields
+            return result
 
             # Unreachable, but keeps the loop logic clear
             await asyncio.sleep(_INTER_REQUEST_DELAY)  # noqa: unreachable

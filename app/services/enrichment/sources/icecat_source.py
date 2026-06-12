@@ -545,6 +545,9 @@ class IceCatSource(AttributeSource):
              - 404 → пробуем следующий.
           3. Если все 404 → MPN Lookup: Serper + LLM извлекают реальный ProductCode.
              Если MPN найден → повторяем _fetch_features(brand, mpn).
+          4. Если всё ещё нет результата AND context.ean задан → GTIN lookup.
+             IceCat принимает GTIN= вместо Brand+ProductCode (unique within all IceCat).
+             Это детерминированный авторитетный lookup без дополнительных LLM/Serper.
 
         Возвращает:
           - list[tuple[str, str]] при первом 200 (список (feature_name, value))
@@ -640,6 +643,37 @@ class IceCatSource(AttributeSource):
                     "[IceCat] MPN '%s' также дал %s для brand='%s'",
                     mpn, result, brand,
                 )
+
+        # Step 4: GTIN (EAN) fallback — deterministic authoritative lookup.
+        # IceCat accepts GTIN= as an alternative to Brand+ProductCode.
+        # "GTIN is unique within all Icecat, you may search with GTIN only."
+        # Only attempted when brand+MPN paths all missed (avoids duplicate call
+        # if brand+MPN already succeeded above). Skips gracefully on any error.
+        gtin = (context.ean or "").strip() if context else ""
+        if gtin:
+            logger.info(
+                "[IceCat] GTIN fallback: ean='%s' brand='%s' product='%s'",
+                gtin, brand, product_name[:60],
+            )
+            gtin_result = await self._fetch_features_by_gtin(gtin)
+            if gtin_result == "403":
+                closed_brands[brand] += 1
+                logger.info(
+                    "[IceCat] 403 on GTIN='%s' brand='%s' — Full IceCat only",
+                    gtin, brand,
+                )
+                return "403"
+            if isinstance(gtin_result, list):
+                open_brands[brand] += 1
+                logger.info(
+                    "[IceCat] 200 via GTIN='%s' brand='%s' → %d features",
+                    gtin, brand, len(gtin_result),
+                )
+                return gtin_result
+            logger.debug(
+                "[IceCat] GTIN='%s' дал %s для brand='%s'",
+                gtin, gtin_result, brand,
+            )
 
         return None
 
@@ -815,6 +849,68 @@ class IceCatSource(AttributeSource):
                     data = await resp.json(content_type=None)
         except Exception as e:
             logger.warning("[IceCat] HTTP ошибка для brand='%s' code='%s': %s", brand, code, e)
+            return "404"
+
+        features = self._parse_response(data)
+        self._cache[cache_key] = features
+        return features
+
+    async def _fetch_features_by_gtin(
+        self,
+        gtin: str,
+    ) -> list[tuple[str, str]] | str:
+        """Запросить IceCat API по GTIN (EAN/UPC) без Brand+ProductCode.
+
+        Endpoint: GET https://live.icecat.biz/api
+        Параметры: UserName, content_token, lang, GTIN=<ean>
+        IceCat docs: "GTIN is unique within all Icecat, you may search with GTIN only."
+
+        Кэш: отдельный namespace ("__gtin__", gtin.lower()) чтобы не конфликтовать
+        с brand+code кэшем.
+
+        Возвращает:
+          - list[tuple[str, str]] при 200
+          - "403" при 403 (Full tier)
+          - "404" при 404 / ошибке (graceful)
+        """
+        cache_key = ("__gtin__", gtin.lower())
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        import aiohttp  # lazy import
+
+        url = "https://live.icecat.biz/api"
+        params = {
+            "UserName": self._email,
+            "lang": "ru",
+            "GTIN": gtin,
+            "content_token": self._token,
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=self._timeout),
+                ) as resp:
+                    if resp.status == 403:
+                        self._cache[cache_key] = "403"
+                        return "403"
+                    if resp.status == 404:
+                        self._cache[cache_key] = "404"
+                        return "404"
+                    if resp.status != 200:
+                        logger.warning(
+                            "[IceCat/GTIN] неожиданный HTTP %d для GTIN='%s'",
+                            resp.status, gtin,
+                        )
+                        self._cache[cache_key] = "404"
+                        return "404"
+
+                    data = await resp.json(content_type=None)
+        except Exception as e:
+            logger.warning("[IceCat/GTIN] HTTP ошибка для GTIN='%s': %s", gtin, e)
             return "404"
 
         features = self._parse_response(data)
