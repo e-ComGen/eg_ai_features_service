@@ -1791,6 +1791,306 @@ def _apply_spec_from_title(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Lever 2: "Срок службы, лет" — verbatim numeric extractor from fetched text.
+#
+# Scans product_description + evidence strings of already-fetched values for
+# phrases matching the "срок службы/эксплуатации … N лет/год/года" pattern.
+# The NUMBER must literally appear next to the phrase in the real fetched text —
+# no guessing, no derivation from warranty, no LLM.
+#
+# Confidence 0.97 (> DESCRIPTION threshold 0.95) — verbatim + grounded match,
+# no inference involved.
+# ---------------------------------------------------------------------------
+_SERVICE_LIFE_EVIDENCE_PREFIX = "срок_службы:verbatim:"
+_SERVICE_LIFE_CONF = 0.97
+
+# Match "срок службы/эксплуатации" (with punctuation) followed (within 0-25 chars)
+# by a number + year-word, OR a number followed by "срок службы/эксплуатации".
+# Captures the numeric string (group 1) in both orderings.
+#
+# Pattern A:  срок службы/эксплуатации ... N лет/год/года
+# Pattern B:  N лет/год ... срок службы (value before phrase — rarer but occurs)
+#
+# Case-insensitive; allows spaces, colon, dash between phrase and number.
+_SERVICE_LIFE_RE = re.compile(
+    r"срок\s+(?:службы|эксплуатации)\W{0,10}(\d+(?:[.,]\d+)?)\s*(?:лет|год(?:а)?)\b"
+    r"|"
+    r"(\d+(?:[.,]\d+)?)\s*(?:лет|год(?:а)?)\W{0,30}срок\s+(?:службы|эксплуатации)",
+    re.IGNORECASE,
+)
+
+
+def _is_service_life_target(name: str) -> bool:
+    """True if the attribute name matches 'срок службы' or 'срок эксплуатации'."""
+    low = name.lower()
+    return "срок службы" in low or "срок эксплуатации" in low
+
+
+def _extract_service_life_number(text: str) -> Optional[str]:
+    """Extract the first verbatim numeric value from a 'срок службы' phrase in text.
+
+    Returns the number as a clean string (comma→dot, no trailing zeros), or None
+    if no matching phrase is found.
+
+    Verbatim-only: the number MUST literally appear adjacent to a 'срок службы/
+    эксплуатации' phrase in the real text. No guessing.
+    """
+    if not text:
+        return None
+    m = _SERVICE_LIFE_RE.search(text)
+    if m is None:
+        return None
+    # Group 1: number comes after the phrase; Group 2: number comes before
+    raw = m.group(1) or m.group(2)
+    if not raw:
+        return None
+    # Normalise: comma→dot decimal separator, strip trailing zeros
+    raw = raw.replace(",", ".")
+    try:
+        val = float(raw)
+    except ValueError:
+        return None
+    # Format: integer if whole number, else keep decimal
+    if val == int(val):
+        return str(int(val))
+    # Up to 1 decimal place (срок службы usually whole years)
+    return f"{val:.1f}".rstrip("0").rstrip(".")
+
+
+def _apply_service_life_from_text(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+    context: ExtractionContext,
+) -> list[AttributeValue]:
+    """POST-merge verbatim filler for 'Срок службы, лет' / 'Срок эксплуатации'.
+
+    For each still-EMPTY target whose name matches 'срок службы' or 'срок
+    эксплуатации', scans the following text pools in priority order:
+      1. context.product_description — seller description text.
+      2. Evidence strings of all accumulated AttributeValues — web_search snippets,
+         icecat summaries, wb_card evidence, etc. are already in memory.
+
+    The NUMBER must appear VERBATIM next to the phrase (regex match, case-insensitive).
+    No LLM, no guessing, no derivation from warranty duration.
+
+    Guards (fail-closed — «пусто честнее мусора»):
+      - Only fires for EMPTY targets (already-filled attrs are never overwritten).
+      - Only fills free-text / numeric targets whose name signals service life
+        (detected by _is_service_life_target — no per-category hardcode).
+      - Number MUST appear in the real fetched text adjacent to the phrase.
+      - Returns high confidence (0.97 > DESCRIPTION threshold 0.95) so it
+        survives _merge and judge shortcut.
+
+    Source=DESCRIPTION (verbatim from product data, not inferred from world knowledge).
+    Evidence = _SERVICE_LIFE_EVIDENCE_PREFIX + the matched snippet.
+    """
+    # Find service-life targets that are currently empty
+    filled_attr_ids: set[int] = {v.attribute_id for v in merged}
+    sl_targets = [
+        t for t in targets
+        if _is_service_life_target(t.name) and t.id not in filled_attr_ids
+    ]
+    if not sl_targets:
+        return merged
+
+    # Build text corpus: description first (highest authority), then evidence strings
+    text_pools: list[str] = []
+    if context.product_description:
+        text_pools.append(context.product_description)
+    for v in merged:
+        ev = (v.evidence or "").strip()
+        if ev and len(ev) >= 10:
+            text_pools.append(ev)
+
+    if not text_pools:
+        return merged
+
+    # Try each pool in order; stop at first hit (first pool = highest authority)
+    found_number: Optional[str] = None
+    found_snippet: str = ""
+    for text in text_pools:
+        number = _extract_service_life_number(text)
+        if number is not None:
+            found_number = number
+            # Build snippet: 80-char window around the match for evidence
+            m = _SERVICE_LIFE_RE.search(text)
+            if m:
+                start = max(0, m.start() - 10)
+                end = min(len(text), m.end() + 10)
+                found_snippet = text[start:end].strip()
+            break
+
+    if found_number is None:
+        return merged
+
+    evidence = _SERVICE_LIFE_EVIDENCE_PREFIX + found_snippet[:150]
+    out = list(merged)
+    for target in sl_targets:
+        logger.info(
+            "[Pipeline] service-life verbatim: attr=%s '%s' ← '%s' лет "
+            "(evidence=%r)",
+            target.id, target.name, found_number, found_snippet[:60],
+        )
+        out.append(AttributeValue(
+            attribute_id=target.id,
+            value=found_number,
+            confidence=_SERVICE_LIFE_CONF,
+            source=Source.DESCRIPTION,
+            evidence=evidence,
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Lever 3: "Гарантия" ↔ "Гарантийный срок" alias cross-fill.
+#
+# COMPATIBILITY VERIFIED (2026-06-12, ozon dictionary):
+#   - "Гарантия"         (id=10400): type=String, allowed_values=[]  → free-text
+#   - "Гарантийный срок" (id=4385):  type=String, allowed_values=[]  → free-text
+#   - "Гарантийный срок" (id=8802):  type=String, allowed_values=[]  → free-text
+# Both are String free-text with no enum constraint — genuinely compatible aliases.
+# "Гарантия на товар, мес." (id=4164, Integer) is NOT an alias — different format.
+#
+# Cross-fill rule (general, no per-category hardcode):
+#   If ONE alias is filled and its NAME-EQUIVALENT counterpart is empty and
+#   BOTH have no allowed_values (same format: free-text) → copy the value verbatim.
+#
+# Alias map is a small general dict of equivalent name pairs (case-insensitive).
+# ---------------------------------------------------------------------------
+_WARRANTY_ALIAS_EVIDENCE = "warranty_alias_cross_fill:verbatim"
+_WARRANTY_ALIAS_CONF = 0.97  # verbatim copy, same confidence as service-life
+
+# Canonical alias groups: each group = frozenset of lowercased name fragments
+# that identify mutually equivalent warranty-duration attrs.
+# «Гарантия» alone: matches "гарантия" WITHOUT "товар"/"мес"/"лет" qualifiers
+# (to exclude "Гарантия на товар, мес." which has different semantics/type).
+_WARRANTY_ALIAS_GROUPS: list[frozenset[str]] = [
+    frozenset({"гарантийный срок", "гарантия"}),
+    frozenset({"срок гарантии", "гарантийный срок"}),
+]
+
+
+def _warranty_alias_key(name: str) -> Optional[frozenset[str]]:
+    """Return the alias group a target name belongs to, or None.
+
+    Matching is conservative:
+      - "гарантийный срок" → matches (contains exact phrase)
+      - "гарантия"         → matches ONLY when the name is EXACTLY "гарантия"
+        or contains it WITHOUT extra qualifier words "товар", "мес", "лет".
+        This prevents matching "Гарантия на товар, мес." (different type).
+      - General: no per-category or per-attr-id hardcode; matches by name only.
+    """
+    low = name.lower().strip()
+    for group in _WARRANTY_ALIAS_GROUPS:
+        for fragment in group:
+            if fragment in low:
+                # Extra guard for bare "гарантия": reject if qualifier words present
+                if fragment == "гарантия":
+                    has_qualifier = any(
+                        q in low for q in ("товар", "мес", "лет", "год", "внутренний", "дополнительн")
+                    )
+                    if has_qualifier:
+                        continue
+                return group
+    return None
+
+
+def _is_free_text_target(target: TargetAttribute) -> bool:
+    """True if the target is a free-text field (no allowed_values constraint)."""
+    return not target.allowed_values
+
+
+def _apply_warranty_alias_cross_fill(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+) -> list[AttributeValue]:
+    """POST-merge alias cross-fill for Гарантия ↔ Гарантийный срок.
+
+    Both "Гарантия" and "Гарантийный срок" are String free-text fields in the
+    Ozon dictionary (type=String, no allowed_values). They are genuine aliases —
+    same semantics, same format, same unit (months/years as free text).
+
+    Rule (general, verbatim-only):
+      For each alias group where:
+        (a) exactly ONE target in the group is currently FILLED with a value, AND
+        (b) at least ONE other target in the same group is EMPTY, AND
+        (c) BOTH the filled and empty targets have no allowed_values (free-text),
+      → copy the filled value to the empty target verbatim.
+
+    Safety (fail-closed — «пусто честнее мусора»):
+      - Only fires for free-text targets (no enum constraint mismatch possible).
+      - Never copies when the value could be an enum-incompatible value.
+      - If MULTIPLE targets in the group are filled → ambiguous, no cross-fill.
+      - Source=DESCRIPTION (verbatim from product data, no inference).
+      - Evidence tag: warranty_alias_cross_fill:verbatim.
+    """
+    # Index targets by alias group
+    # For each group, find the (attr_id → target) mapping for members of that group
+    targets_by_id: dict[int, TargetAttribute] = {t.id: t for t in targets}
+
+    # Group targets into alias buckets
+    alias_buckets: dict[int, list[TargetAttribute]] = {}  # bucket_idx → [targets]
+    target_bucket: dict[int, int] = {}  # attr_id → bucket_idx
+    for t in targets:
+        group = _warranty_alias_key(t.name)
+        if group is None:
+            continue
+        # Use id(group) as bucket key (each frozenset object is unique per group)
+        bucket_idx = id(group)
+        alias_buckets.setdefault(bucket_idx, []).append(t)
+        target_bucket[t.id] = bucket_idx
+
+    if not alias_buckets:
+        return merged
+
+    # Build current fill state by attr_id (best confidence wins)
+    filled: dict[int, AttributeValue] = {}
+    for v in merged:
+        prev = filled.get(v.attribute_id)
+        if prev is None or v.confidence > prev.confidence:
+            filled[v.attribute_id] = v
+
+    out = list(merged)
+    for bucket_idx, bucket_targets in alias_buckets.items():
+        # Partition into filled + empty, restricting to free-text only
+        filled_in_bucket: list[tuple[TargetAttribute, AttributeValue]] = []
+        empty_in_bucket: list[TargetAttribute] = []
+        for t in bucket_targets:
+            if not _is_free_text_target(t):
+                continue  # enum target — skip (type mismatch possible)
+            if t.id in filled:
+                filled_in_bucket.append((t, filled[t.id]))
+            else:
+                empty_in_bucket.append(t)
+
+        # Safety: only when EXACTLY ONE filled in bucket (no ambiguity)
+        if len(filled_in_bucket) != 1 or not empty_in_bucket:
+            continue
+
+        source_target, source_av = filled_in_bucket[0]
+        value_to_copy = source_av.value
+
+        for dest_target in empty_in_bucket:
+            if not _is_free_text_target(dest_target):
+                continue  # already guarded above, belt-and-suspenders
+            logger.info(
+                "[Pipeline] warranty-alias cross-fill: attr=%s '%s' ← attr=%s '%s' "
+                "value=%r (verbatim copy)",
+                dest_target.id, dest_target.name,
+                source_target.id, source_target.name,
+                value_to_copy,
+            )
+            out.append(AttributeValue(
+                attribute_id=dest_target.id,
+                value=value_to_copy,
+                confidence=_WARRANTY_ALIAS_CONF,
+                source=Source.DESCRIPTION,
+                evidence=_WARRANTY_ALIAS_EVIDENCE,
+            ))
+    return out
+
+
 def _merge_winner(
     challenger: AttributeValue, incumbent: AttributeValue
 ) -> AttributeValue:
@@ -2785,6 +3085,17 @@ class PipelineOrchestrator:
                 context,
             ).value_id,
         )
+
+        # Lever 2: "Срок службы, лет" verbatim numeric extractor.
+        # Scans product_description + evidence strings of already-fetched values
+        # for "срок службы/эксплуатации N лет" phrases. Verbatim-only (no guessing).
+        # Fires ONLY for still-EMPTY service-life targets. Source=DESCRIPTION, conf=0.97.
+        resolved = _apply_service_life_from_text(resolved, targets, context)
+
+        # Lever 3: "Гарантия" ↔ "Гарантийный срок" alias cross-fill.
+        # Both are free-text String fields (no enum constraint). Verbatim copy only.
+        # Fires ONLY when one alias is filled and its counterpart is empty.
+        resolved = _apply_warranty_alias_cross_fill(resolved, targets)
 
         # ПОСЛЕ полной резолюции value_id (детерминированный + LLM-хвост):
         # 1. Дроп OPTIONAL enum-значений без value_id (fake-fill, Ozon отклонит).

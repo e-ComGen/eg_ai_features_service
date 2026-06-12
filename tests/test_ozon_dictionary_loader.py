@@ -739,3 +739,150 @@ class TestEnToRuValueTranslation:
         assert _translate_en_to_ru("Aluminium") == "алюминий"
         assert _translate_en_to_ru("Bluetooth") == "Bluetooth"   # unchanged
         assert _translate_en_to_ru("SomeWeirdTerm") == "SomeWeirdTerm"  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# Tests: country EN→RU normalization for «Страна-изготовитель» enum attribute.
+# ---------------------------------------------------------------------------
+
+# Fixture dict with «Страна-изготовитель» enum (attr id 4389) carrying Russian
+# country names as Ozon stores them. Input values come in English from IceCat/WB.
+_DICT_COUNTRY = {
+    "schema_version": 2,
+    "source": "ozon_seller_api",
+    "categories": {
+        "700:300": {
+            "description_category_id": 700,
+            "type_id": 300,
+            "name": "Страна тест",
+            "path": ["Тест"],
+            "characteristics": [
+                {
+                    "id": 4389,
+                    "name": "Страна-изготовитель",
+                    "type": "Option",
+                    "is_required": False,
+                    "is_collection": False,
+                    "description": "Страна производства товара",
+                    "values": [
+                        {"id": 6001, "value": "Китай"},
+                        {"id": 6002, "value": "Германия"},
+                        {"id": 6003, "value": "Вьетнам"},
+                        {"id": 6004, "value": "Южная Корея"},
+                        {"id": 6005, "value": "США"},
+                        {"id": 6006, "value": "Россия"},
+                        {"id": 6007, "value": "Тайвань"},
+                        {"id": 6008, "value": "Италия"},
+                        {"id": 6009, "value": "Япония"},
+                        {"id": 6010, "value": "Турция"},
+                        {"id": 6011, "value": "Индия"},
+                    ],
+                },
+            ],
+        }
+    },
+}
+
+
+class TestCountryEnRuNormalization:
+    """Country EN→RU normalization: IceCat/WB return 'China', Ozon enum expects 'Китай'.
+
+    The normalization is injected into _EN_TO_RU_VALUES (whole-token exact match,
+    case-insensitive) BEFORE the enum-option fuzzy matcher, so the translated value
+    must still resolve to a valid Ozon option (no hallucination — drop if not found).
+    """
+
+    def setup_method(self):
+        _reset_cache()
+        import app.services.enrichment.strategies.dictionaries.ozon_loader as mod
+        mod._matcher_instance = None
+        mod._matcher_attempted = True  # disable semantic matcher for deterministic tests
+
+    def _resolve_country(self, tmp_path, value: str):
+        import json as _json
+        (tmp_path / "ozon_dictionary.json").write_text(
+            _json.dumps(_DICT_COUNTRY), encoding="utf-8"
+        )
+        with patch(
+            "app.services.enrichment.strategies.dictionaries.ozon_loader.DATA_DIR",
+            tmp_path,
+        ):
+            _reset_cache()
+            import app.services.enrichment.strategies.dictionaries.ozon_loader as mod
+            mod._matcher_instance = None
+            mod._matcher_attempted = True
+            from app.services.enrichment.strategies.dictionaries.ozon_loader import resolve_value_id
+            return resolve_value_id(700, 300, 4389, value)
+
+    def test_china_en_resolves_to_kitai(self, tmp_path):
+        """'China' (IceCat EN) → Китай value_id 6001."""
+        assert self._resolve_country(tmp_path, "China") == 6001
+
+    def test_china_lowercase_resolves(self, tmp_path):
+        """'china' (lowercase) → Китай value_id 6001."""
+        assert self._resolve_country(tmp_path, "china") == 6001
+
+    def test_germany_en_resolves_to_germaniya(self, tmp_path):
+        """'Germany' → Германия value_id 6002."""
+        assert self._resolve_country(tmp_path, "Germany") == 6002
+
+    def test_vietnam_en_resolves(self, tmp_path):
+        """'Vietnam' → Вьетнам value_id 6003."""
+        assert self._resolve_country(tmp_path, "Vietnam") == 6003
+
+    def test_south_korea_en_resolves(self, tmp_path):
+        """'South Korea' → Южная Корея value_id 6004."""
+        assert self._resolve_country(tmp_path, "South Korea") == 6004
+
+    def test_usa_en_resolves(self, tmp_path):
+        """'USA' abbreviation → США value_id 6005."""
+        assert self._resolve_country(tmp_path, "USA") == 6005
+
+    def test_united_states_en_resolves(self, tmp_path):
+        """'United States' → США value_id 6005."""
+        assert self._resolve_country(tmp_path, "United States") == 6005
+
+    def test_russia_en_resolves(self, tmp_path):
+        """'Russia' → Россия value_id 6006."""
+        assert self._resolve_country(tmp_path, "Russia") == 6006
+
+    def test_taiwan_en_resolves(self, tmp_path):
+        """'Taiwan' → Тайвань value_id 6007."""
+        assert self._resolve_country(tmp_path, "Taiwan") == 6007
+
+    def test_italy_en_resolves(self, tmp_path):
+        """'Italy' → Италия value_id 6008."""
+        assert self._resolve_country(tmp_path, "Italy") == 6008
+
+    def test_japan_en_resolves(self, tmp_path):
+        """'Japan' → Япония value_id 6009."""
+        assert self._resolve_country(tmp_path, "Japan") == 6009
+
+    def test_turkey_en_resolves(self, tmp_path):
+        """'Turkey' → Турция value_id 6010."""
+        assert self._resolve_country(tmp_path, "Turkey") == 6010
+
+    def test_india_en_resolves(self, tmp_path):
+        """'India' → Индия value_id 6011."""
+        assert self._resolve_country(tmp_path, "India") == 6011
+
+    def test_russian_value_passes_through_unchanged(self, tmp_path):
+        """Russian 'Китай' already matches without translation — must still resolve."""
+        assert self._resolve_country(tmp_path, "Китай") == 6001
+
+    def test_unknown_country_returns_none(self, tmp_path):
+        """Country not in Ozon enum returns None — drop, no fabricated id."""
+        # 'Burkina Faso' is not in the Ozon enum above
+        result = self._resolve_country(tmp_path, "Burkina Faso")
+        assert result is None, "Must return None when country not in allowed enum options"
+
+    def test_translate_en_to_ru_country_unit(self):
+        """_translate_en_to_ru returns lowercase RU for country names."""
+        from app.services.enrichment.strategies.dictionaries.ozon_loader import _translate_en_to_ru
+        # Country values are stored with initial capital in the map
+        assert _translate_en_to_ru("china") == "Китай"
+        assert _translate_en_to_ru("China") == "Китай"
+        assert _translate_en_to_ru("germany") == "Германия"
+        assert _translate_en_to_ru("Vietnam") == "Вьетнам"
+        assert _translate_en_to_ru("usa") == "США"
+        assert _translate_en_to_ru("Japan") == "Япония"

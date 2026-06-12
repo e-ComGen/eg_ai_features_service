@@ -753,7 +753,7 @@ class TestWebSearchAdversarialPass:
             value="Чёрный",
             source=Source.WEB_SEARCH,
             confidence=0.88,
-            evidence="web search: color is black from product page",
+            evidence="цвет чёрный, найдено на странице товара Nike Air Max 270",
         )
         targets = [_target(2000, "Цвет")]
         context = _ctx(product_name="Кроссовки Nike Air Max 270 чёрные", brand="Nike")
