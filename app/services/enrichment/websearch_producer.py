@@ -265,8 +265,12 @@ class WebSearchProducer:
         timeout: int,
         lang: str = "ru",
     ) -> Optional[str]:
-        # Reset page-text cache for this product before fetch.
-        self._last_page_text = None
+        # Reset page-text cache only for the RU pass (preferred language for OEM
+        # spec-harvest).  In dual-lang mode both calls run concurrently; resetting
+        # only on RU prevents EN from clearing a RU result that finished first,
+        # and the write guard below ensures EN never overwrites RU.
+        if lang == "ru":
+            self._last_page_text = None
         # Build search query — MPN first (highest signal: точный код производителя),
         # then product_name + brand + ean (любые secondary identifiers).
         parts: list[str] = []
@@ -360,7 +364,11 @@ class WebSearchProducer:
                         # Expose raw page text for OemSpecHarvest verbatim pass.
                         # Stored here (before LLM summarisation) so spec lines are
                         # intact; the LLM summary loses the «Key: Value» structure.
-                        self._last_page_text = raw_page_text[:_PAGE_TEXT_CAP]
+                        # RU-preference: only write when lang=="ru" OR when no RU
+                        # result has been stored yet (prevents EN from overwriting RU
+                        # in dual-lang concurrent execution).
+                        if lang == "ru" or self._last_page_text is None:
+                            self._last_page_text = raw_page_text[:_PAGE_TEXT_CAP]
                         logger.debug(
                             "WebSearchProducer (serper): fetched %d chars from %d page(s) for %r.",
                             len(raw_page_text),

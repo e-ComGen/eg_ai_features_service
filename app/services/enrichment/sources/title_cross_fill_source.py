@@ -72,11 +72,14 @@ _TITLE_FREETEXT_FILL_ENABLED: bool = (
 )
 
 # Confidence: verbatim from title, deterministic, no inference.
-_TITLE_FILL_CONFIDENCE: float = 0.88
+# Must clear SOURCE_CONFIDENCE_THRESHOLDS[Source.DESCRIPTION] = 0.95 in the
+# pipeline merge so title fills survive is_confident() and are not overwritten.
+_TITLE_FILL_CONFIDENCE: float = 0.95
 
 # Minimum total character count across all normalised tokens of a value
-# before we consider it safe to match (avoids accidental hits on 1-2 char tokens).
-_TITLE_MIN_VALUE_LEN: int = 3
+# before we consider it safe to match (avoids accidental hits on 1-char tokens).
+# Lowered from 3→2 to accept short-but-valid tokens like "5G" or "AC".
+_TITLE_MIN_VALUE_LEN: int = 2
 
 # Attr-name brand detection — exclude brand targets (handled by dedicated logic).
 _BRAND_NAME_RE = re.compile(r"бренд|brand|торгов\w*\s+марк", re.IGNORECASE)

@@ -190,8 +190,11 @@ _OBJECTIVE_SPEC_NAME_FRAGMENTS: tuple[str, ...] = (
     "разъем",
     # Audio / video configuration
     "звуковая схема",
+    "звуковая система",
     "акустическая система",
     "количество каналов",
+    "аудиоканал",
+    "конфигурация каналов",
     # Wireless / binary feature flags
     "true wireless",
     "активное шумоподавление",
@@ -274,6 +277,45 @@ def _normalize_for_corroboration(value: object) -> str:
     norm = norm.replace("ё", "е")
     norm = " ".join(norm.split())
     return norm
+
+
+def _web_search_grounded_in_evidence(value: str, evidence: str | None) -> bool:
+    """Gate A: self-consistency check for WEB_SEARCH fills.
+
+    The web_search `evidence` field is the REAL fetched page snippet, so we can
+    ground-check the chosen value against it deterministically. Returns True when
+    the value is present (any of its significant tokens) in the evidence text.
+
+    Algorithm:
+      1. Normalise both value and evidence (ё→е, lower-case, collapse whitespace).
+      2. Tokenise the value via _matcher_token_re (same tokeniser used in brand-matching).
+         Filter tokens shorter than 3 chars — too short to disambiguate (e.g. "нт").
+      3. Require AT LEAST ONE significant value-token to appear literally in the
+         normalised evidence text.  This is conservative: a single matching token
+         is sufficient to keep the fill (protects the ~113 correct fills while
+         catching clear mismatches like "Бязь" vs "100% хлопок").
+
+    Edge cases:
+      - evidence is None or empty → return True (no evidence to contradict; don't drop).
+      - value normalises to a boolean ("да"/"нет") → skip check (booleans are not
+        grounded by evidence text presence).
+    """
+    if not evidence:
+        return True  # nothing to check against — conservative, do not drop
+
+    norm_value = _normalize_for_corroboration(value)
+    if norm_value in ("да", "нет"):
+        return True  # boolean fills don't appear as tokens in evidence text
+
+    norm_evidence = evidence.lower().replace("ё", "е")
+
+    # Tokenise the normalised value
+    tokens = _matcher_token_re.findall(norm_value)
+    significant = [t for t in tokens if len(t) >= 3]
+    if not significant:
+        return True  # value too short to check — conservative, keep
+
+    return any(tok in norm_evidence for tok in significant)
 
 
 def _apply_gender_guard(
@@ -3176,6 +3218,19 @@ class PipelineOrchestrator:
             if (v.evidence or "").startswith("safe_enum:verbatim_gate"):
                 keep_as_is.append(v)
                 continue
+            # ── Gate A (WEB_SEARCH only): self-consistency — value token must appear
+            # in its own evidence snippet (the REAL fetched page text).
+            # llm_knowledge evidence is LLM-self-generated, so this check is only
+            # meaningful for web_search where evidence is the actual page snippet.
+            if v.source == Source.WEB_SEARCH and not _web_search_grounded_in_evidence(
+                str(v.value), v.evidence
+            ):
+                logger.info(
+                    "[Pipeline] web_search Gate A DROP (value not in evidence): "
+                    "attr=%s value=%r evidence=%r — value token absent from own evidence",
+                    v.attribute_id, v.value, (v.evidence or "")[:120],
+                )
+                continue  # drop: value contradicts (or is absent from) its own evidence
             t = target_by_id.get(v.attribute_id)
             if t is not None and _is_objective_spec_attr(t):
                 spec_pending.append(v)
