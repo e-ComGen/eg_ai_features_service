@@ -289,6 +289,20 @@ def parse_args() -> argparse.Namespace:
         "--print-sample", type=int, default=1, metavar="N",
         help="Print N mapped+embedded points to stdout for quality inspection. Default: 1",
     )
+    p.add_argument(
+        "--out-parquet", metavar="DIR", default=None,
+        help=(
+            "Output mode: write embedded rows to parquet shards in DIR instead of "
+            "upserting to Qdrant. Columns: id(str), vector(list[float] len=384), "
+            "name(str), categories(str), characteristics(str JSON), source(str). "
+            "Shards named file_0000.parquet, file_0001.parquet, … every 100k rows. "
+            "Requires pyarrow. Device='cuda' if available (GPU pod)."
+        ),
+    )
+    p.add_argument(
+        "--parquet-shard-size", type=int, default=100_000, metavar="N",
+        help="Rows per parquet shard file. Default: 100000.",
+    )
     return p.parse_args()
 
 
@@ -307,17 +321,26 @@ def _hash_uuid(value: str) -> str:
 # ── Embedding ─────────────────────────────────────────────────────────────────
 
 _model_cache = None
+_embed_device: Optional[str] = None
 
 
-def get_model():
-    global _model_cache
+def get_model(device: Optional[str] = None):
+    global _model_cache, _embed_device
     if _model_cache is None:
         try:
             from sentence_transformers import SentenceTransformer  # type: ignore
         except ImportError:
             sys.exit("[Error] sentence-transformers not installed.")
-        print(f"[Ingest] Loading embed model: {EMBED_MODEL_NAME} ...")
-        _model_cache = SentenceTransformer(EMBED_MODEL_NAME)
+        # Auto-select device: explicit arg > cuda if available > cpu
+        if device is None:
+            try:
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                device = "cpu"
+        _embed_device = device
+        print(f"[Ingest] Loading embed model: {EMBED_MODEL_NAME} (device={device}) ...")
+        _model_cache = SentenceTransformer(EMBED_MODEL_NAME, device=device)
         get_dim = getattr(
             _model_cache,
             "get_embedding_dimension",
@@ -1014,6 +1037,155 @@ def stream_gsmarena(limit: int) -> Iterator[tuple[str, str, dict]]:
         print(f"[GSMArena] Error: {e}")
 
 
+# ── Parquet export (pod GPU path) ─────────────────────────────────────────────
+
+def run_parquet_export(
+    source_stream: Iterator[tuple[str, str, dict]],
+    out_dir: str,
+    encode_batch_size: int,
+    shard_size: int,
+    limit: int,
+    print_sample: int = 1,
+) -> None:
+    """Embed + write to parquet shards; no Qdrant required.
+
+    Parquet schema
+    --------------
+    id            : str   — stable UUID5 / SHA-1 hash
+    vector        : list[float]  length 384
+    name          : str
+    categories    : str
+    characteristics : str  — JSON
+    source        : str
+    """
+    try:
+        import pyarrow as pa  # type: ignore
+        import pyarrow.parquet as pq  # type: ignore
+    except ImportError:
+        sys.exit("[Error] pyarrow not installed — needed for --out-parquet mode.")
+
+    # Pre-load model now (uses cuda if available)
+    get_model()
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    schema = pa.schema([
+        pa.field("id", pa.string()),
+        pa.field("vector", pa.list_(pa.float32())),
+        pa.field("name", pa.string()),
+        pa.field("categories", pa.string()),
+        pa.field("characteristics", pa.string()),
+        pa.field("source", pa.string()),
+    ])
+
+    shard_idx = 0
+    total_written = 0
+    total_skipped = 0
+    printed = 0
+
+    # Buffers for the current batch
+    id_buf: list[str] = []
+    text_buf: list[str] = []
+    payload_buf: list[dict] = []
+
+    # Rows for the current shard
+    shard_rows: list[dict] = []
+
+    t0 = time.time()
+
+    def flush_embed_to_shard() -> None:
+        nonlocal total_written
+        if not text_buf:
+            return
+        vecs = embed_batch(text_buf)
+        for pid, vec, pl in zip(id_buf, vecs, payload_buf):
+            shard_rows.append({
+                "id": pid,
+                "vector": vec,
+                "name": pl["name"],
+                "categories": pl["categories"],
+                "characteristics": pl["characteristics"],
+                "source": pl["source"],
+            })
+            total_written += 1
+        id_buf.clear()
+        text_buf.clear()
+        payload_buf.clear()
+
+    def flush_shard() -> None:
+        nonlocal shard_idx
+        if not shard_rows:
+            return
+        shard_file = out_path / f"file_{shard_idx:04d}.parquet"
+        table = pa.table(
+            {
+                "id":              [r["id"] for r in shard_rows],
+                "vector":          [r["vector"] for r in shard_rows],
+                "name":            [r["name"] for r in shard_rows],
+                "categories":      [r["categories"] for r in shard_rows],
+                "characteristics": [r["characteristics"] for r in shard_rows],
+                "source":          [r["source"] for r in shard_rows],
+            },
+            schema=schema,
+        )
+        pq.write_table(table, shard_file, compression="snappy")
+        elapsed = time.time() - t0
+        speed = total_written / elapsed if elapsed > 0 else 0
+        print(
+            f"[Parquet] Shard {shard_idx:04d} → {shard_file.name} "
+            f"({len(shard_rows):,} rows | {total_written:,} total | {speed:.0f} rows/s)"
+        )
+        shard_rows.clear()
+        shard_idx += 1
+
+    for point_id, embed_text, payload in source_stream:
+        if limit and total_written + len(text_buf) >= limit:
+            break
+
+        if not embed_text.strip():
+            total_skipped += 1
+            continue
+
+        if printed < print_sample:
+            print(f"\n[Sample point #{printed + 1}]")
+            print(f"  id         : {point_id}")
+            print(f"  embed_text : {embed_text[:120]}")
+            print(f"  name       : {payload.get('name', '')[:80]}")
+            print(f"  source     : {payload.get('source', '')}")
+            printed += 1
+
+        id_buf.append(point_id)
+        text_buf.append(embed_text)
+        payload_buf.append(payload)
+
+        if len(text_buf) >= encode_batch_size:
+            flush_embed_to_shard()
+            rows_done = total_written + total_skipped
+            if rows_done % 10_000 == 0 and rows_done > 0:
+                elapsed = time.time() - t0
+                speed = total_written / elapsed if elapsed > 0 else 0
+                print(f"[Parquet] {total_written:,} rows embedded | {speed:.0f} rows/s | {elapsed:.0f}s")
+
+        if len(shard_rows) >= shard_size:
+            flush_shard()
+
+    # Flush remaining buffer and final shard
+    flush_embed_to_shard()
+    flush_shard()
+
+    elapsed = time.time() - t0
+    speed = total_written / elapsed if elapsed > 0 else 0
+    print(f"\n[Parquet] === Done ===")
+    print(f"  Written  : {total_written:,} rows in {shard_idx} shard(s)")
+    print(f"  Skipped  : {total_skipped:,}")
+    print(f"  Time     : {elapsed:.1f}s  ({speed:.0f} rows/s)")
+    print(f"  Out dir  : {out_path}")
+    for f in sorted(out_path.glob("file_*.parquet")):
+        size_mb = f.stat().st_size / (1024 * 1024)
+        print(f"    {f.name}  {size_mb:.1f} MB")
+
+
 # ── Core ingest loop ──────────────────────────────────────────────────────────
 
 def run_ingest(
@@ -1189,17 +1361,29 @@ def main() -> None:
 
     source = dataset_map[args.dataset]()
 
-    run_ingest(
-        source_stream=source,
-        collection=collection,
-        qdrant_url=args.qdrant_url,
-        limit=limit,
-        encode_batch_size=args.encode_batch,
-        upsert_batch_size=args.batch,
-        recreate=args.recreate,
-        no_text_index=args.no_text_index,
-        print_sample=args.print_sample,
-    )
+    if args.out_parquet:
+        print(f"  mode       : parquet export → {args.out_parquet}")
+        print(f"  shard_size : {args.parquet_shard_size:,}")
+        run_parquet_export(
+            source_stream=source,
+            out_dir=args.out_parquet,
+            encode_batch_size=args.encode_batch,
+            shard_size=args.parquet_shard_size,
+            limit=limit,
+            print_sample=args.print_sample,
+        )
+    else:
+        run_ingest(
+            source_stream=source,
+            collection=collection,
+            qdrant_url=args.qdrant_url,
+            limit=limit,
+            encode_batch_size=args.encode_batch,
+            upsert_batch_size=args.batch,
+            recreate=args.recreate,
+            no_text_index=args.no_text_index,
+            print_sample=args.print_sample,
+        )
 
 
 if __name__ == "__main__":
