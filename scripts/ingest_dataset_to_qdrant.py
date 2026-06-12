@@ -1,90 +1,178 @@
-"""Generic product-dataset → Qdrant ingest scaffold.
+"""Unified product-dataset → Qdrant indexer.
 
-Streams a SMALL sample (few hundred rows) from a HuggingFace dataset,
-builds an embed text, embeds via paraphrase-multilingual-MiniLM-L12-v2
-(same model as ozon_products), and upserts into a named Qdrant collection.
+Streams product records from external datasets, maps them to a common payload
+schema, embeds the product NAME with paraphrase-multilingual-MiniLM-L12-v2
+(same model as ozon_products), and upserts into a Qdrant collection so that
+CompetitorRagSource can read them identically to Ozon cards.
+
+PAYLOAD SCHEMA (matches CompetitorRagSource._coerce_characteristics)
+----------------------------------------------------------------------
+  name            : str  — embedded text (product name)
+  categories      : str  — category path / text (used by MatchText filter)
+  characteristics : str  — JSON-encoded dict {attr_name: [val1, val2] | val}
+  source          : str  — dataset id ("off" / "obf" / "opff" / "amazon" /
+                           "abo" / "ikea" / "rebrickable") — traceable/deletable
 
 SUPPORTED DATASETS
 ------------------
 
-1. Open Food Facts  (ODbL)
-   HF id   : openfoodfacts/product-database
-   Config  : (no config arg; splits are 'food' and 'beauty')
-   Split   : food  (beauty is cosmetics)
-   Schema  : 111 fields; key fields for embedding:
-     product_name  – list[{lang, text}]; first EN or 'main' entry
-     brands        – str
-     categories    – str  (EN taxonomy, comma-separated)
-     ingredients_text – list[{lang, text}]
-     quantity      – str  (e.g. "350 g")
-     packaging     – str
-     nutriments    – list[{name, 100g, unit}]
-     code          – EAN barcode (used as point ID)
-   Scale   : ~3.9M food products + ~900K beauty (Parquet, ~6 GB total)
-   Full-run plan:
-     ~4.8M rows × ~0.005s/row CPU embed = ~6.7 hours CPU
-     GPU (T4, RunPod): ~40 min
-     Qdrant storage: ~384×4×4.8M ≈ 7.4 GB vectors + ~3 GB payload
-     Disk total: ~11 GB
+1. Open Food Facts  (ODbL)   --dataset off
+   HF: openfoodfacts/product-database  split=food  (~3.9M rows, ~5 GB parquet)
+   Confirmed fields: product_name (list[{lang,text}]), brands (str),
+   categories (str), ingredients_text (list[{lang,text}]),
+   quantity (str), packaging (str), nutriments (dict|None), code (EAN str)
+   Full-run: ~3.9M rows; GPU T4 ≈ 25 min embed; Qdrant ≈ 7 GB
 
-2. Amazon Reviews 2023 – product metadata  (non-commercial research)
-   HF id   : McAuley-Lab/Amazon-Reviews-2023
-   NOTE    : The dataset's loading script is broken in datasets>=3.x
-             (RuntimeError: Dataset scripts are no longer supported).
-             Load directly from parquet via data_files= (implemented here).
-   Parquet : raw_meta_<Category>/full-*.parquet  (per-category splits)
-   Schema  : 16 fields:
-     title          – str  (product title, EN)
-     main_category  – str
-     categories     – list[str]
-     description    – list[str]
-     features       – list[str]
-     details        – dict  {"Package Dimensions": "...", "UPC": "...",
-                             "Item model number": "...", "Color": "...",
-                             "Material": "..."}  — key attribute source
-     store          – str  (brand/seller)
-     price          – str  (may be None)
-     parent_asin    – str  (used as point ID)
-   Scale   : ~48M products across 34 categories (~4 GB parquet total)
-   Full-run plan (all categories):
-     ~48M rows × ~0.005s/row CPU embed = ~67 hours CPU
-     Better: run per-category (e.g. Electronics = ~3M rows ≈ 4 hours)
-     GPU (T4): ~30 min per large category
-     Qdrant storage: ~384×4×48M ≈ 74 GB vectors + ~20 GB payload
-     Realistic scope: pick 5–10 most relevant categories ≈ 10–15M rows
+2. Open Beauty Facts  (ODbL)  --dataset obf
+   HF: openfoodfacts/product-database  split=beauty  (~900K rows)
+   Same schema as OFF. characteristics: INCI/ingredients, brands, quantity,
+   packaging.
+   Full-run: ~900K rows; GPU T4 ≈ 6 min embed; Qdrant ≈ 1.7 GB
+
+3. Open Pet Food Facts  (ODbL)  --dataset opff
+   Source: https://static.openpetfoodfacts.org/data/openpetfoodfacts-products.jsonl.gz
+   Confirmed fields: product_name (str), brands (str), categories_tags
+   (list[str]), ingredients_text_en / ingredients_text_with_allergens (str),
+   quantity (str)
+   Full-run: ~300K rows; GPU T4 ≈ 2 min; Qdrant ≈ 0.5 GB
+
+4. Amazon Reviews 2023 product metadata  (non-commercial research)  --dataset amazon
+   HF: McAuley-Lab/Amazon-Reviews-2023  raw_meta_<Category>/full-*.parquet
+   Confirmed fields: title (str), main_category (str), categories (list[str]),
+   features (list[str]), details (JSON str → dict), store (str),
+   parent_asin (str)
+   Full-run (all 24 cats): ~48M rows; GPU T4 ≈ 5 hours; Qdrant ≈ 74 GB
+   Recommended: pick 5–10 categories (10–15M rows)
+
+5. Amazon Berkeley Objects  (CC BY 4.0)  --dataset abo
+   Source: s3://amazon-berkeley-objects (--no-sign-request)
+     listings/metadata/listings_0.json.gz … listings_9.json.gz  (~10 shards)
+   Confirmed fields: item_name (list[{language_tag,value}]),
+   brand/color/style/bullet_point (list[{language_tag?,value}]),
+   product_type (list[{value}]), item_id (ASIN)
+   Full-run: ~147K items; GPU T4 ≈ 1 min; Qdrant ≈ 0.3 GB
+
+6. IKEA US Products 2025  (public)  --dataset ikea
+   HF: jeffreyszhou/ikea-us-products-2025  split=train
+   Confirmed fields: title (str), materials (str), care_instructions (str),
+   category_tree (str), style (str), price (str|float), product_id (str)
+   Full-run: ~25K rows; GPU T4 < 1 min; Qdrant ≈ 0.05 GB
+
+7. Rebrickable LEGO sets  (CC BY)  --dataset rebrickable
+   Source: https://cdn.rebrickable.com/media/downloads/sets.csv.gz
+   Confirmed fields: set_num, name, year, theme_id, num_parts, img_url
+   Full-run: ~20K rows; GPU T4 < 1 min; Qdrant ≈ 0.04 GB
+
+8. GSMArena phones  --dataset gsmarena
+   Source: Kaggle arwinneil/gsmarena-phone-dataset  (requires KAGGLE_USERNAME +
+   KAGGLE_KEY env vars OR ~/.kaggle/kaggle.json)
+   SKIPPED GRACEFULLY if credentials absent.
+
+RUNPOD FULL-RUN PLAN
+--------------------
+See the RUNPOD_RUN_PLAN section at the bottom of this docstring.
 
 USAGE
 -----
-# Open Food Facts, sample 300 rows:
-python scripts/ingest_dataset_to_qdrant.py --dataset off --sample-size 300
-
-# Amazon Reviews (All_Beauty category), sample 300:
+# Sample 200 rows → throwaway test collection (safe, won't touch ozon_products):
 python scripts/ingest_dataset_to_qdrant.py \\
-    --dataset amazon --amazon-category All_Beauty --sample-size 300
+    --dataset off --collection rag_ingest_test --sample 200
 
-# Full OFT ingest (overnight):
-python scripts/ingest_dataset_to_qdrant.py --dataset off --full
-
-# Full Amazon Electronics ingest:
+# Sample beauty:
 python scripts/ingest_dataset_to_qdrant.py \\
-    --dataset amazon --amazon-category Electronics --full
+    --dataset obf --collection rag_ingest_test --sample 200
+
+# Sample Amazon:
+python scripts/ingest_dataset_to_qdrant.py \\
+    --dataset amazon --amazon-category All_Beauty \\
+    --collection rag_ingest_test --sample 200
+
+# Sample ABO:
+python scripts/ingest_dataset_to_qdrant.py \\
+    --dataset abo --collection rag_ingest_test --sample 200
+
+# Sample IKEA:
+python scripts/ingest_dataset_to_qdrant.py \\
+    --dataset ikea --collection rag_ingest_test --sample 200
+
+# Full OFF into ozon_products (RunPod overnight):
+python scripts/ingest_dataset_to_qdrant.py \\
+    --dataset off --collection ozon_products --full --batch 512 --encode-batch 256
+
+# Validate + clean test collection after run:
+python scripts/ingest_dataset_to_qdrant.py \\
+    --dataset off --collection rag_ingest_test --sample 50 --validate-only
+
+# Delete the throwaway collection:
+python scripts/ingest_dataset_to_qdrant.py --delete-collection rag_ingest_test
 
 REQUIREMENTS
 ------------
     pip install datasets sentence-transformers qdrant-client python-dotenv
-    # HF_TOKEN in .env (faster downloads, gated datasets)
+    # Optional for ABO:
+    pip install boto3   # or use no-sign requests directly (default)
+    # HF_TOKEN in .env or env var  (faster downloads, gated datasets)
+
+RUNPOD FULL-RUN PLAN
+--------------------
+Pod recommended: RunPod GPU pod, RTX 3090 or A40 (24 GB VRAM), 100 GB disk.
+Qdrant: must be running at localhost:6333 (set QDRANT_URL=http://localhost:6333).
+Collection: use ozon_products (existing) — new points are UPSERTED, not overwriting.
+
+STEP 1 — start the pod and set up environment:
+    git clone <repo>
+    cd cpAiFeatures
+    python -m venv venv && source venv/bin/activate
+    pip install datasets sentence-transformers qdrant-client python-dotenv
+    # Restore ozon_products snapshot first (from scripts/qdrant_restore.sh)
+    bash scripts/qdrant_restore.sh
+
+STEP 2 — verify Qdrant is healthy:
+    curl http://localhost:6333/healthz
+
+STEP 3 — run each dataset (can be parallelised across multiple pods):
+
+Dataset         Rows     GPU T4 estimate  Qdrant size  Command
+----------      ------   ---------------  -----------  -------
+OFF (food)      3.9M     ~25 min          ~7 GB        --dataset off  --full
+OBF (beauty)    0.9M     ~6 min           ~1.7 GB      --dataset obf  --full
+OPFF (pet)      0.3M     ~2 min           ~0.5 GB      --dataset opff --full
+Amazon-Beauty   0.2M     ~2 min           ~0.4 GB      --dataset amazon --amazon-category All_Beauty --full
+Amazon-Electr.  3.0M     ~20 min          ~6 GB        --dataset amazon --amazon-category Electronics --full
+Amazon-Fashion  1.5M     ~10 min          ~3 GB        --dataset amazon --amazon-category Amazon_Fashion --full
+ABO             0.15M    <1 min           ~0.3 GB      --dataset abo  --full
+IKEA            0.025M   <1 min           ~0.05 GB     --dataset ikea --full
+Rebrickable     0.02M    <1 min           ~0.04 GB     --dataset rebrickable --full
+
+STEP 4 — build text index on categories field (ONCE after all ingest):
+    python scripts/build_rag_text_index.py  (or use --no-text-index and run separately)
+
+STEP 5 — snapshot and download:
+    bash scripts/qdrant_extract.sh   # creates .tar.gz snapshot
+    # Download to local WSL: rsync / scp
+
+All datasets except GSMArena need only public network (no creds).
+GSMArena requires KAGGLE_USERNAME + KAGGLE_KEY env vars.
+
+Total for recommended subset (OFF+OBF+OPFF+Amazon 3 cats+ABO+IKEA+Rebrickable):
+  ~10M rows, ~1 hour on RTX 3090, ~20 GB Qdrant storage added.
 """
 from __future__ import annotations
 
 import argparse
+import csv
+import gzip
 import hashlib
+import io
 import json
 import os
 import sys
 import time
+import urllib.request
 import uuid
+import zlib
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Optional
 
 # Windows DLL ordering fix.
 try:
@@ -96,6 +184,12 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Windows: force UTF-8 on stdout/stderr so non-ASCII product names print safely.
+if sys.platform == "win32":
+    import io as _io
+    sys.stdout = _io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = _io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
 from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -106,12 +200,9 @@ HF_TOKEN: str = os.environ.get("HF_TOKEN", "")
 EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 VECTOR_DIM = 384
 QDRANT_URL_DEFAULT = os.environ.get("QDRANT_URL", "http://localhost:6333")
+DEFAULT_COLLECTION = "ozon_products"
+DEFAULT_SAMPLE = 200
 
-DEFAULT_COLLECTION_OFT = "open_food_facts"
-DEFAULT_COLLECTION_AMZ = "amazon_products"
-DEFAULT_SAMPLE_SIZE = 300
-
-# Full list of Amazon raw_meta categories (subset most relevant to product attributes):
 AMAZON_CATEGORIES = [
     "All_Beauty", "Amazon_Fashion", "Appliances", "Arts_Crafts_and_Sewing",
     "Automotive", "Baby_Products", "Beauty_and_Personal_Care", "Books",
@@ -123,41 +214,47 @@ AMAZON_CATEGORIES = [
     "Toys_and_Games", "Video_Games",
 ]
 
+ABO_SHARDS = [
+    f"https://amazon-berkeley-objects.s3.amazonaws.com/listings/metadata/listings_{i}.json.gz"
+    for i in range(10)
+]
+OPFF_URL = "https://static.openpetfoodfacts.org/data/openpetfoodfacts-products.jsonl.gz"
+REBRICKABLE_URL = "https://cdn.rebrickable.com/media/downloads/sets.csv.gz"
+
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Generic product dataset → Qdrant ingest scaffold",
+        description="Unified product dataset → Qdrant ingest",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     p.add_argument(
-        "--dataset", choices=["off", "amazon"], required=True,
-        help="'off' = Open Food Facts, 'amazon' = Amazon Reviews 2023 metadata",
+        "--dataset",
+        choices=["off", "obf", "opff", "amazon", "abo", "ikea", "rebrickable", "gsmarena"],
+        help="Dataset id to ingest.",
     )
     p.add_argument(
         "--amazon-category", default="All_Beauty",
-        choices=AMAZON_CATEGORIES,
-        metavar="CATEGORY",
-        help=(f"Amazon category to ingest. Default: All_Beauty. "
-              f"Choices: {', '.join(AMAZON_CATEGORIES)}"),
+        choices=AMAZON_CATEGORIES, metavar="CATEGORY",
+        help="Amazon category (used with --dataset amazon).",
     )
     p.add_argument(
-        "--collection", metavar="NAME",
-        help="Qdrant collection name override. Default: open_food_facts or amazon_products",
+        "--collection", default=DEFAULT_COLLECTION, metavar="NAME",
+        help=f"Qdrant collection name. Default: {DEFAULT_COLLECTION}",
     )
     p.add_argument(
         "--qdrant-url", default=QDRANT_URL_DEFAULT,
         help=f"Qdrant server URL. Default: {QDRANT_URL_DEFAULT}",
     )
     p.add_argument(
-        "--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE,
-        help=f"Rows to ingest in sample mode (default: {DEFAULT_SAMPLE_SIZE}). Ignored with --full.",
+        "--sample", type=int, default=DEFAULT_SAMPLE, metavar="N",
+        help=f"Rows to ingest in sample mode (default: {DEFAULT_SAMPLE}). Ignored with --full.",
     )
     p.add_argument(
         "--full", action="store_true",
-        help="Full ingest (no row limit). OVERNIGHT JOB — see module docstring for scale.",
+        help="Full ingest (no row limit). Overnight job — see module docstring for scale.",
     )
     p.add_argument(
         "--batch", type=int, default=256,
@@ -173,13 +270,33 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--no-text-index", action="store_true",
-        help="Skip creating payload text index on the primary text field.",
+        help="Skip creating payload text index on 'categories' field.",
     )
     p.add_argument(
-        "--off-split", choices=["food", "beauty"], default="food",
-        help="Open Food Facts split. Default: food",
+        "--validate-only", action="store_true",
+        help="Run only the post-ingest query validation (no ingest).",
+    )
+    p.add_argument(
+        "--delete-collection", metavar="NAME",
+        help="Delete the named collection and exit.",
+    )
+    p.add_argument(
+        "--print-sample", type=int, default=1, metavar="N",
+        help="Print N mapped+embedded points to stdout for quality inspection. Default: 1",
     )
     return p.parse_args()
+
+
+# ── ID helpers ────────────────────────────────────────────────────────────────
+
+def _stable_uuid(namespace: str, key: str) -> str:
+    """Deterministic UUID5 from namespace:key — idempotent upserts."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{namespace}:{key}"))
+
+
+def _hash_uuid(value: str) -> str:
+    """Fallback: UUID from SHA-1 of the string (for records without natural IDs)."""
+    return str(uuid.UUID(hashlib.sha1(value.encode("utf-8", errors="replace")).hexdigest()[:32]))
 
 
 # ── Embedding ─────────────────────────────────────────────────────────────────
@@ -196,8 +313,12 @@ def get_model():
             sys.exit("[Error] sentence-transformers not installed.")
         print(f"[Ingest] Loading embed model: {EMBED_MODEL_NAME} ...")
         _model_cache = SentenceTransformer(EMBED_MODEL_NAME)
-        dim = getattr(_model_cache, "get_embedding_dimension",
-                      _model_cache.get_sentence_embedding_dimension)()
+        get_dim = getattr(
+            _model_cache,
+            "get_embedding_dimension",
+            getattr(_model_cache, "get_sentence_embedding_dimension", lambda: VECTOR_DIM),
+        )
+        dim = get_dim()
         print(f"[Ingest] Model ready (dim={dim})")
     return _model_cache
 
@@ -228,7 +349,7 @@ def ensure_collection(client, name: str, recreate: bool) -> None:
             client.delete_collection(name)
         else:
             info = client.get_collection(name)
-            print(f"[Ingest] '{name}' exists ({info.points_count or 0} pts). Resume.")
+            print(f"[Ingest] '{name}' exists ({info.points_count or 0} pts). Resuming (upsert).")
             return
     print(f"[Ingest] Creating '{name}' (dim={VECTOR_DIM}, COSINE) ...")
     client.create_collection(
@@ -237,7 +358,7 @@ def ensure_collection(client, name: str, recreate: bool) -> None:
     )
 
 
-def create_text_index(client, collection: str, field: str) -> None:
+def create_text_index(client, collection: str, field: str = "categories") -> None:
     from qdrant_client.models import PayloadSchemaType  # type: ignore
     try:
         client.create_payload_index(
@@ -253,78 +374,125 @@ def create_text_index(client, collection: str, field: str) -> None:
             print(f"[Ingest] Warning: text index failed: {e}")
 
 
-def _stable_uuid(namespace: str, key: str) -> str:
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{namespace}:{key}"))
+def delete_collection(client, name: str) -> None:
+    existing = [c.name for c in client.get_collections().collections]
+    if name in existing:
+        client.delete_collection(name)
+        print(f"[Ingest] Deleted collection '{name}'.")
+    else:
+        print(f"[Ingest] Collection '{name}' does not exist — nothing to delete.")
 
 
-def _hash_uuid(value: str) -> str:
-    """Generate a UUID from any string via SHA-1 (fallback for missing IDs)."""
-    return str(uuid.UUID(hashlib.sha1(value.encode()).hexdigest()[:32]))
+# ── Common field helpers ──────────────────────────────────────────────────────
+
+def _str(v: Any, maxlen: int = 300) -> str:
+    if v is None:
+        return ""
+    return str(v).strip()[:maxlen]
 
 
-# ── Open Food Facts adapter ───────────────────────────────────────────────────
-
-def _oft_product_name(row: dict) -> str:
-    """Extract best product name: prefer English, then 'main', then any."""
-    names = row.get("product_name") or []
-    if not isinstance(names, list):
-        return str(names)[:300]
-    for lang_pref in ("en", "main"):
-        for item in names:
-            if isinstance(item, dict) and item.get("lang") == lang_pref:
-                text = item.get("text", "")
-                if text and text.strip():
-                    return text.strip()[:300]
-    # Any non-empty
-    for item in names:
-        if isinstance(item, dict):
-            text = item.get("text", "")
-            if text and text.strip():
-                return text.strip()[:300]
-    return ""
-
-
-def _oft_text_list(field: Any) -> str:
-    """Flatten a list[{lang, text}] or list[str] into a plain string."""
+def _list_str(field: Any, max_items: int = 5, maxlen: int = 100) -> str:
+    """Flatten list[str|dict] → joined str."""
     if not field:
         return ""
     if isinstance(field, str):
-        return field[:300]
+        return field[:500]
     if isinstance(field, list):
-        texts = []
-        for item in field:
+        parts = []
+        for item in field[:max_items]:
             if isinstance(item, dict):
-                t = item.get("text", "")
+                t = item.get("text") or item.get("value") or ""
                 if t:
-                    texts.append(str(t)[:200])
+                    parts.append(str(t)[:maxlen])
             elif item:
-                texts.append(str(item)[:200])
-        return " | ".join(texts)[:500]
+                parts.append(str(item)[:maxlen])
+        return " | ".join(parts)
     return str(field)[:300]
 
 
-def _oft_nutriments_str(nutriments: Any) -> str:
-    if not isinstance(nutriments, list):
+def _encode_characteristics(d: dict) -> str:
+    """JSON-encode characteristics dict so _coerce_characteristics can parse it.
+
+    Format: {attr_name: [val1, val2, ...] | scalar_val}
+    Values that are lists are kept as lists; scalars are passed through.
+    Matches what CompetitorRagSource._coerce_characteristics expects:
+      - isinstance(raw, str) → json.loads(raw) → dict
+    """
+    return json.dumps(d, ensure_ascii=False)
+
+
+# ── OFF / OBF adapter ─────────────────────────────────────────────────────────
+
+def _off_product_name(row: dict) -> str:
+    """product_name is list[{lang, text}] — prefer ru then en then main."""
+    names = row.get("product_name") or []
+    if isinstance(names, str):
+        return names.strip()[:300]
+    if not isinstance(names, list):
         return ""
-    parts = []
-    for n in nutriments[:8]:
-        if isinstance(n, dict):
-            name = n.get("name", "")
-            val = n.get("100g")
-            unit = n.get("unit", "")
-            if name and val is not None:
-                parts.append(f"{name}:{val}{unit}")
-    return " ".join(parts)
+    for lang in ("ru", "en", "main"):
+        for item in names:
+            if isinstance(item, dict) and item.get("lang") == lang:
+                t = item.get("text", "").strip()
+                if t:
+                    return t[:300]
+    for item in names:
+        if isinstance(item, dict):
+            t = item.get("text", "").strip()
+            if t:
+                return t[:300]
+    return ""
+
+
+def _off_ingredients(row: dict) -> str:
+    """ingredients_text is list[{lang, text}] in OFF HF parquet."""
+    field = row.get("ingredients_text")
+    if not field:
+        return ""
+    if isinstance(field, str):
+        return field.strip()[:500]
+    if isinstance(field, list):
+        # Prefer ru then en then main
+        for lang in ("ru", "en", "main"):
+            for item in field:
+                if isinstance(item, dict) and item.get("lang") == lang:
+                    t = item.get("text", "").strip()
+                    if t:
+                        return t[:500]
+        # Any non-empty
+        for item in field:
+            if isinstance(item, dict):
+                t = item.get("text", "").strip()
+                if t:
+                    return t[:500]
+    return str(field)[:300]
+
+
+def _off_nutriments(nutriments: Any, max_keys: int = 8) -> dict:
+    """nutriments is a dict or None; pick the most nutritionally informative keys."""
+    if not isinstance(nutriments, dict):
+        return {}
+    KEEP = {"energy-kcal_100g", "fat_100g", "saturated-fat_100g",
+            "carbohydrates_100g", "sugars_100g", "proteins_100g",
+            "salt_100g", "fiber_100g"}
+    out = {}
+    for k, v in nutriments.items():
+        if k in KEEP and v is not None:
+            out[k] = str(v)
+        if len(out) >= max_keys:
+            break
+    return out
 
 
 def stream_off(split: str, limit: int) -> Iterator[tuple[str, str, dict]]:
-    """Yield (point_id, embed_text, payload) for Open Food Facts rows."""
+    """Yield (point_id, embed_text, payload) for OFF/OBF rows."""
     try:
         from datasets import load_dataset  # type: ignore
     except ImportError:
         sys.exit("[Error] datasets not installed.")
 
-    print(f"[OFT] Loading openfoodfacts/product-database split={split} streaming ...")
+    source_id = "off" if split == "food" else "obf"
+    print(f"[{source_id.upper()}] Loading openfoodfacts/product-database split={split} streaming ...")
     ds = load_dataset(
         "openfoodfacts/product-database",
         split=split,
@@ -336,36 +504,130 @@ def stream_off(split: str, limit: int) -> Iterator[tuple[str, str, dict]]:
     for row in ds:
         if limit and count >= limit:
             break
-        name = _oft_product_name(row)
+        name = _off_product_name(row)
         if not name:
             continue
 
-        brands = str(row.get("brands") or "")
-        categories = str(row.get("categories") or "")
-        ingredients = _oft_text_list(row.get("ingredients_text"))
-        quantity = str(row.get("quantity") or "")
-        packaging = str(row.get("packaging") or "")
-        nutriments = _oft_nutriments_str(row.get("nutriments"))
+        brands = _str(row.get("brands"), 200)
+        categories = _str(row.get("categories"), 400)
+        ingredients = _off_ingredients(row)
+        quantity = _str(row.get("quantity"), 100)
+        packaging = _str(row.get("packaging"), 200)
+        nutriments_dict = _off_nutriments(row.get("nutriments"))
+        code = _str(row.get("code"), 50)
 
         embed_text = " | ".join(p for p in [
-            name, brands, categories[:200], ingredients[:200], quantity, packaging
+            name, brands, categories[:200], ingredients[:200]
         ] if p)
 
-        code = str(row.get("code") or "")
-        point_id = _stable_uuid("off", code) if code else _hash_uuid(embed_text)
+        characteristics = {}
+        if ingredients:
+            characteristics["Состав"] = [ingredients]
+        if brands:
+            characteristics["Бренд"] = [brands]
+        if quantity:
+            characteristics["Количество"] = [quantity]
+        if packaging:
+            characteristics["Упаковка"] = [packaging]
+        for k, v in nutriments_dict.items():
+            characteristics[k] = [v]
+
+        point_id = _stable_uuid(source_id, code) if code else _hash_uuid(embed_text)
 
         payload = {
-            "source": "open_food_facts",
-            "product_name": name,
-            "brands": brands[:200],
-            "categories": categories[:300],
-            "ingredients_text": ingredients[:400],
-            "quantity": quantity,
-            "packaging": packaging[:200],
-            "nutriments_summary": nutriments,
-            "code": code,
-            "countries": str(row.get("countries_tags") or "")[:200],
-            "labels": str(row.get("labels") or "")[:200],
+            "name": name,
+            "categories": categories,
+            "characteristics": _encode_characteristics(characteristics),
+            "source": source_id,
+        }
+
+        yield point_id, embed_text, payload
+        count += 1
+
+
+# ── Open Pet Food Facts adapter ───────────────────────────────────────────────
+
+def _stream_jsonl_gz(url: str) -> Iterator[dict]:
+    """Stream line-by-line from a remote jsonl.gz via zlib streaming decompressor."""
+    req = urllib.request.Request(url, headers={"User-Agent": "eg-ingest/1.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        d = zlib.decompressobj(zlib.MAX_WBITS | 16)  # gzip mode
+        buf = ""
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                # Flush remaining decompressor output
+                try:
+                    remainder = d.flush()
+                    if remainder:
+                        buf += remainder.decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                break
+            try:
+                buf += d.decompress(chunk).decode("utf-8", errors="replace")
+            except Exception:
+                break
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                line = line.strip()
+                if line:
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+        # Trailing line without newline
+        if buf.strip():
+            try:
+                yield json.loads(buf.strip())
+            except Exception:
+                pass
+
+
+def stream_opff(limit: int) -> Iterator[tuple[str, str, dict]]:
+    """Yield (point_id, embed_text, payload) for Open Pet Food Facts."""
+    print(f"[OPFF] Streaming from {OPFF_URL} ...")
+    count = 0
+    for row in _stream_jsonl_gz(OPFF_URL):
+        if limit and count >= limit:
+            break
+        # product_name is a plain str in OPFF (unlike OFF HF parquet)
+        name = _str(row.get("product_name") or row.get("product_name_en"), 300)
+        if not name:
+            continue
+
+        brands = _str(row.get("brands"), 200)
+        categories_tags = row.get("categories_tags") or []
+        categories = " | ".join(str(t) for t in categories_tags[:6])
+        ingredients = (
+            _str(row.get("ingredients_text_en"), 500)
+            or _str(row.get("ingredients_text"), 500)
+            or _str(row.get("ingredients_text_with_allergens"), 500)
+        )
+        quantity = _str(row.get("quantity"), 100)
+        code = _str(row.get("code"), 50)
+
+        embed_text = " | ".join(p for p in [name, brands, categories[:200]] if p)
+
+        characteristics = {}
+        if ingredients:
+            characteristics["Состав"] = [ingredients]
+        if brands:
+            characteristics["Бренд"] = [brands]
+        if quantity:
+            characteristics["Количество"] = [quantity]
+        # Species/type from categories
+        species = [t.replace("en:", "") for t in categories_tags if "cat-food" in t or "dog-food" in t]
+        if species:
+            characteristics["Вид животного"] = species[:3]
+
+        point_id = _stable_uuid("opff", code) if code else _hash_uuid(embed_text)
+
+        payload = {
+            "name": name,
+            "categories": categories,
+            "characteristics": _encode_characteristics(characteristics),
+            "source": "opff",
         }
 
         yield point_id, embed_text, payload
@@ -374,30 +636,19 @@ def stream_off(split: str, limit: int) -> Iterator[tuple[str, str, dict]]:
 
 # ── Amazon Reviews 2023 adapter ───────────────────────────────────────────────
 
-def _amz_details_str(details: Any) -> str:
-    """Convert the details dict/str into a compact attribute string."""
+def _amz_details_dict(details: Any) -> dict:
+    """details field is a JSON string in the parquet — parse it."""
     if not details:
-        return ""
+        return {}
     if isinstance(details, str):
         try:
-            details = json.loads(details)
+            parsed = json.loads(details)
+            return parsed if isinstance(parsed, dict) else {}
         except Exception:
-            return details[:300]
+            return {}
     if isinstance(details, dict):
-        parts = []
-        for k, v in details.items():
-            if v and str(v).strip():
-                parts.append(f"{k}: {str(v)[:80]}")
-        return " | ".join(parts[:15])
-    return str(details)[:300]
-
-
-def _amz_list_str(field: Any, max_items: int = 5) -> str:
-    if not field:
-        return ""
-    if isinstance(field, list):
-        return " | ".join(str(x)[:100] for x in field[:max_items] if x)
-    return str(field)[:300]
+        return details
+    return {}
 
 
 def stream_amazon(category: str, limit: int) -> Iterator[tuple[str, str, dict]]:
@@ -407,32 +658,24 @@ def stream_amazon(category: str, limit: int) -> Iterator[tuple[str, str, dict]]:
     except ImportError:
         sys.exit("[Error] datasets not installed.")
 
-    # The dataset's loading script fails in datasets>=3.x; load parquet directly.
-    parquet_url = (
-        f"hf://datasets/McAuley-Lab/Amazon-Reviews-2023/"
-        f"raw_meta_{category}/full-00000-of-*"
-    )
-    # For streaming we load the first shard explicitly (avoids glob resolution latency).
-    parquet_shard_0 = (
+    parquet_shard = (
         f"hf://datasets/McAuley-Lab/Amazon-Reviews-2023/"
         f"raw_meta_{category}/full-00000-of-00001.parquet"
     )
-    # Try single-shard first; some categories have multiple shards.
-    print(f"[Amazon] Loading raw_meta_{category} via parquet streaming ...")
+    parquet_glob = (
+        f"hf://datasets/McAuley-Lab/Amazon-Reviews-2023/"
+        f"raw_meta_{category}/full-*.parquet"
+    )
+    print(f"[Amazon] Loading raw_meta_{category} streaming ...")
     try:
         ds = load_dataset(
             "parquet",
-            data_files={"full": parquet_shard_0},
+            data_files={"full": parquet_shard},
             split="full",
             streaming=True,
             token=HF_TOKEN or None,
         )
     except Exception:
-        # Fallback: glob pattern for multi-shard categories
-        parquet_glob = (
-            f"hf://datasets/McAuley-Lab/Amazon-Reviews-2023/"
-            f"raw_meta_{category}/full-*.parquet"
-        )
         ds = load_dataset(
             "parquet",
             data_files={"full": parquet_glob},
@@ -445,43 +688,325 @@ def stream_amazon(category: str, limit: int) -> Iterator[tuple[str, str, dict]]:
     for row in ds:
         if limit and count >= limit:
             break
-
-        title = str(row.get("title") or "").strip()
+        title = _str(row.get("title"), 300)
         if not title:
             continue
 
-        main_category = str(row.get("main_category") or "")
-        categories = _amz_list_str(row.get("categories"), max_items=4)
-        description = _amz_list_str(row.get("description"), max_items=2)
-        features = _amz_list_str(row.get("features"), max_items=3)
-        details_str = _amz_details_str(row.get("details"))
-        store = str(row.get("store") or "")
-        price = str(row.get("price") or "")
+        main_category = _str(row.get("main_category"), 100)
+        categories_list = row.get("categories") or []
+        categories = " | ".join(str(c) for c in categories_list[:5])
+        features = _list_str(row.get("features"), max_items=5)
+        store = _str(row.get("store"), 200)
+        details = _amz_details_dict(row.get("details"))
+        parent_asin = _str(row.get("parent_asin"), 20)
 
-        embed_text = " | ".join(p for p in [
-            title, main_category, store, categories, features[:200], details_str[:200]
-        ] if p)
+        embed_text = " | ".join(p for p in [title, main_category, store, features[:200]] if p)
 
-        parent_asin = str(row.get("parent_asin") or "")
+        # characteristics: details dict + features list
+        characteristics: dict[str, Any] = {}
+        if store:
+            characteristics["Бренд"] = [store]
+        if main_category:
+            characteristics["Категория"] = [main_category]
+        features_list = row.get("features") or []
+        if features_list:
+            characteristics["Особенности"] = [str(f)[:100] for f in features_list[:5]]
+        for k, v in details.items():
+            if v and str(v).strip():
+                characteristics[k] = [str(v)[:100]]
+
         point_id = _stable_uuid("amazon", parent_asin) if parent_asin else _hash_uuid(embed_text)
 
         payload = {
-            "source": "amazon_2023",
-            "category": main_category,
-            "title": title[:300],
-            "store": store[:200],
-            "price": price,
-            "categories": categories[:300],
-            "description": description[:400],
-            "features": features[:400],
-            "details": details_str[:500],
-            "parent_asin": parent_asin,
-            "average_rating": row.get("average_rating"),
-            "rating_number": row.get("rating_number"),
+            "name": title,
+            "categories": categories or main_category,
+            "characteristics": _encode_characteristics(characteristics),
+            "source": "amazon",
         }
 
         yield point_id, embed_text, payload
         count += 1
+
+
+# ── Amazon Berkeley Objects (ABO) adapter ────────────────────────────────────
+
+def _abo_multilang_value(field: Any, prefer_langs: tuple = ("en_US", "en_GB", "en")) -> str:
+    """Extract best value from list[{language_tag?, value}]."""
+    if not isinstance(field, list) or not field:
+        return _str(field)
+    # Try preferred languages first
+    for lang in prefer_langs:
+        for item in field:
+            if isinstance(item, dict) and item.get("language_tag", "").startswith(lang[:2]):
+                v = item.get("value", "")
+                if v:
+                    return str(v).strip()[:200]
+    # Fallback: first with a value
+    for item in field:
+        if isinstance(item, dict):
+            v = item.get("value", "")
+            if v:
+                return str(v).strip()[:200]
+    return ""
+
+
+def stream_abo(limit: int) -> Iterator[tuple[str, str, dict]]:
+    """Yield (point_id, embed_text, payload) from ABO S3 shards."""
+    count = 0
+    for shard_url in ABO_SHARDS:
+        if limit and count >= limit:
+            break
+        print(f"[ABO] Streaming shard: {shard_url} ...")
+        try:
+            for row in _stream_jsonl_gz(shard_url):
+                if limit and count >= limit:
+                    break
+                name = _abo_multilang_value(row.get("item_name"))
+                if not name:
+                    continue
+
+                brand = _abo_multilang_value(row.get("brand"))
+                color = _abo_multilang_value(row.get("color"))
+                style = _abo_multilang_value(row.get("style"))
+                product_type_list = row.get("product_type") or []
+                product_type = (product_type_list[0].get("value", "") if product_type_list else "")
+                bullet = _abo_multilang_value(row.get("bullet_point"))
+                item_id = _str(row.get("item_id"), 20)
+                node_list = row.get("node") or []
+                categories = " > ".join(
+                    str(n.get("node_name", "")) for n in node_list[:4] if isinstance(n, dict)
+                )
+
+                embed_text = " | ".join(p for p in [name, brand, product_type, color] if p)
+
+                characteristics: dict[str, Any] = {}
+                if brand:
+                    characteristics["Бренд"] = [brand]
+                if color:
+                    characteristics["Цвет"] = [color]
+                if style:
+                    characteristics["Стиль"] = [style]
+                if product_type:
+                    characteristics["Тип продукта"] = [product_type]
+                if bullet:
+                    characteristics["Описание"] = [bullet[:200]]
+
+                point_id = _stable_uuid("abo", item_id) if item_id else _hash_uuid(embed_text)
+
+                payload = {
+                    "name": name,
+                    "categories": categories,
+                    "characteristics": _encode_characteristics(characteristics),
+                    "source": "abo",
+                }
+
+                yield point_id, embed_text, payload
+                count += 1
+        except Exception as e:
+            print(f"[ABO] Shard {shard_url} failed: {e} — skipping.")
+            continue
+
+
+# ── IKEA adapter ──────────────────────────────────────────────────────────────
+
+def _ikea_list_field(field: Any, maxlen: int = 400) -> str:
+    """IKEA materials/care_instructions/category_tree are list[str]."""
+    if isinstance(field, list):
+        return " | ".join(str(x)[:100] for x in field if x)[:maxlen]
+    return _str(field, maxlen)
+
+
+def stream_ikea(limit: int) -> Iterator[tuple[str, str, dict]]:
+    """Yield (point_id, embed_text, payload) from IKEA HF dataset.
+
+    Confirmed fields (jeffreyszhou/ikea-us-products-2025):
+      title (str), materials (list[str]), care_instructions (list[str]),
+      category_tree (list[str]), style (str), price (str|float), product_id (str)
+    """
+    try:
+        from datasets import load_dataset  # type: ignore
+    except ImportError:
+        sys.exit("[Error] datasets not installed.")
+
+    print("[IKEA] Loading jeffreyszhou/ikea-us-products-2025 streaming ...")
+    ds = load_dataset(
+        "jeffreyszhou/ikea-us-products-2025",
+        split="train",
+        streaming=True,
+        token=HF_TOKEN or None,
+    )
+
+    count = 0
+    for row in ds:
+        if limit and count >= limit:
+            break
+        # Confirmed field: 'title' (not 'name')
+        name = _str(row.get("title"), 300)
+        if not name:
+            continue
+
+        # materials and care_instructions are list[str]; category_tree is list[str]
+        materials_list: list[str] = row.get("materials") or []
+        care_list: list[str] = row.get("care_instructions") or []
+        category_tree_list: list[str] = row.get("category_tree") or []
+
+        materials = _ikea_list_field(materials_list)
+        care = _ikea_list_field(care_list)
+        # category_tree[:-1] drops the leaf node (product name repeated there)
+        cat_path = category_tree_list[:-1] if len(category_tree_list) > 1 else category_tree_list
+        categories = " > ".join(cat_path)
+
+        style = _str(row.get("style"), 200)
+        price = _str(row.get("price"), 50)
+        product_id = _str(row.get("product_id"), 20)
+
+        embed_text = " | ".join(p for p in [name, categories[:200], materials[:100]] if p)
+
+        characteristics: dict[str, Any] = {}
+        if materials_list:
+            characteristics["Материал"] = [m for m in materials_list if m][:5]
+        if care_list:
+            characteristics["Уход"] = [c for c in care_list if c][:5]
+        if style:
+            characteristics["Стиль"] = [style]
+        if price:
+            characteristics["Цена"] = [price]
+
+        point_id = _stable_uuid("ikea", product_id) if product_id else _hash_uuid(embed_text)
+
+        payload = {
+            "name": name,
+            "categories": categories,
+            "characteristics": _encode_characteristics(characteristics),
+            "source": "ikea",
+        }
+
+        yield point_id, embed_text, payload
+        count += 1
+
+
+# ── Rebrickable adapter ───────────────────────────────────────────────────────
+
+def stream_rebrickable(limit: int) -> Iterator[tuple[str, str, dict]]:
+    """Yield (point_id, embed_text, payload) from Rebrickable sets.csv.gz."""
+    print(f"[Rebrickable] Downloading sets.csv.gz from {REBRICKABLE_URL} ...")
+    try:
+        req = urllib.request.Request(
+            REBRICKABLE_URL, headers={"User-Agent": "eg-ingest/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = gzip.decompress(resp.read())
+        reader = csv.DictReader(io.StringIO(data.decode("utf-8", errors="replace")))
+    except Exception as e:
+        print(f"[Rebrickable] Download failed: {e}")
+        return
+
+    count = 0
+    for row in reader:
+        if limit and count >= limit:
+            break
+        name = _str(row.get("name"), 300)
+        if not name:
+            continue
+
+        set_num = _str(row.get("set_num"), 30)
+        year = _str(row.get("year"), 10)
+        theme_id = _str(row.get("theme_id"), 20)
+        num_parts = _str(row.get("num_parts"), 20)
+
+        embed_text = f"LEGO {name} {year}"
+        categories = f"LEGO | Конструкторы | {year}"
+
+        characteristics: dict[str, Any] = {
+            "Год": [year],
+            "Деталей": [num_parts],
+            "Тема": [theme_id],
+            "Артикул": [set_num],
+        }
+
+        point_id = _stable_uuid("rebrickable", set_num) if set_num else _hash_uuid(embed_text)
+
+        payload = {
+            "name": name,
+            "categories": categories,
+            "characteristics": _encode_characteristics(characteristics),
+            "source": "rebrickable",
+        }
+
+        yield point_id, embed_text, payload
+        count += 1
+
+
+# ── GSMArena adapter ──────────────────────────────────────────────────────────
+
+def stream_gsmarena(limit: int) -> Iterator[tuple[str, str, dict]]:
+    """Yield from GSMArena Kaggle dataset — skips gracefully if creds absent."""
+    kaggle_json = Path.home() / ".kaggle" / "kaggle.json"
+    kaggle_user = os.environ.get("KAGGLE_USERNAME", "")
+    kaggle_key = os.environ.get("KAGGLE_KEY", "")
+    if not kaggle_json.exists() and not (kaggle_user and kaggle_key):
+        print(
+            "[GSMArena] SKIP: Kaggle credentials not found.\n"
+            "  Provide ~/.kaggle/kaggle.json or set KAGGLE_USERNAME + KAGGLE_KEY env vars.\n"
+            "  Dataset: https://www.kaggle.com/datasets/arwinneil/gsmarena-phone-dataset"
+        )
+        return
+    try:
+        import kaggle  # type: ignore
+    except ImportError:
+        print("[GSMArena] SKIP: 'kaggle' package not installed. Run: pip install kaggle")
+        return
+
+    try:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            kaggle.api.authenticate()
+            kaggle.api.dataset_download_files(
+                "arwinneil/gsmarena-phone-dataset", path=tmpdir, unzip=True
+            )
+            csv_files = list(Path(tmpdir).glob("*.csv"))
+            if not csv_files:
+                print("[GSMArena] No CSV files found after download.")
+                return
+            csv_path = csv_files[0]
+            print(f"[GSMArena] Reading {csv_path.name} ...")
+            with open(csv_path, encoding="utf-8", errors="replace") as f:
+                reader = csv.DictReader(f)
+                count = 0
+                for row in reader:
+                    if limit and count >= limit:
+                        break
+                    name = _str(row.get("Model") or row.get("name"), 300)
+                    if not name:
+                        continue
+                    brand = _str(row.get("Brand") or row.get("brand"), 100)
+                    oem = _str(row.get("OEM") or row.get("oem"), 100)
+
+                    embed_text = " | ".join(p for p in [name, brand] if p)
+                    categories = "Смартфоны | Мобильные телефоны"
+
+                    characteristics: dict[str, Any] = {}
+                    if brand:
+                        characteristics["Бренд"] = [brand]
+                    # Include all non-empty spec columns
+                    for k, v in row.items():
+                        if v and k not in ("Model", "Brand", "name", "brand") and _str(v, 1):
+                            characteristics[k] = [_str(v, 100)]
+
+                    model_id = _str(row.get("Model") or row.get("name"), 100)
+                    point_id = _stable_uuid("gsmarena", f"{brand}:{model_id}") if model_id else _hash_uuid(embed_text)
+
+                    payload = {
+                        "name": name,
+                        "categories": categories,
+                        "characteristics": _encode_characteristics(characteristics),
+                        "source": "gsmarena",
+                    }
+
+                    yield point_id, embed_text, payload
+                    count += 1
+    except Exception as e:
+        print(f"[GSMArena] Error: {e}")
 
 
 # ── Core ingest loop ──────────────────────────────────────────────────────────
@@ -494,8 +1019,8 @@ def run_ingest(
     encode_batch_size: int,
     upsert_batch_size: int,
     recreate: bool,
-    text_index_field: str,
     no_text_index: bool,
+    print_sample: int = 1,
 ) -> None:
     client = get_client(qdrant_url)
     ensure_collection(client, collection, recreate)
@@ -505,6 +1030,7 @@ def run_ingest(
     t0 = time.time()
     total_indexed = 0
     total_skipped = 0
+    printed = 0
 
     id_buf: list[str] = []
     text_buf: list[str] = []
@@ -527,13 +1053,28 @@ def run_ingest(
         payload_buf.clear()
 
     for point_id, embed_text, payload in source_stream:
-        # Check limit BEFORE accumulating (avoids over-shoot by encode_batch)
-        if limit and (total_indexed + len(text_buf) + total_skipped) >= limit:
+        if limit and (total_indexed + len(text_buf)) >= limit:
             break
 
         if not embed_text.strip():
             total_skipped += 1
             continue
+
+        # Print sample for quality inspection
+        if printed < print_sample:
+            print(f"\n[Sample point #{printed + 1}]")
+            print(f"  id         : {point_id}")
+            print(f"  embed_text : {embed_text[:120]}")
+            print(f"  name       : {payload.get('name', '')[:80]}")
+            print(f"  categories : {payload.get('categories', '')[:80]}")
+            chars_raw = payload.get("characteristics", "{}")
+            try:
+                chars = json.loads(chars_raw)
+            except Exception:
+                chars = chars_raw
+            print(f"  characteristics: {json.dumps(chars, ensure_ascii=False)[:300]}")
+            print(f"  source     : {payload.get('source', '')}")
+            printed += 1
 
         id_buf.append(point_id)
         text_buf.append(embed_text)
@@ -542,7 +1083,7 @@ def run_ingest(
         if len(text_buf) >= encode_batch_size:
             flush()
             rows_done = total_indexed + total_skipped
-            if rows_done % 500 == 0 and rows_done > 0:
+            if rows_done % 1000 == 0 and rows_done > 0:
                 elapsed = time.time() - t0
                 speed = total_indexed / elapsed if elapsed > 0 else 0
                 print(f"[Ingest] {total_indexed:,} indexed | {speed:.0f} rows/s | {elapsed:.0f}s")
@@ -556,11 +1097,11 @@ def run_ingest(
     print(f"  Skipped   : {total_skipped:,}")
     print(f"  Total pts : {info.points_count or 0:,}")
     print(f"  Time      : {elapsed:.1f}s")
-    if elapsed > 0:
+    if elapsed > 0 and total_indexed > 0:
         print(f"  Speed     : {total_indexed / elapsed:.0f} rows/s")
 
     if not no_text_index:
-        create_text_index(client, collection, text_index_field)
+        create_text_index(client, collection, "categories")
 
     print("\n[Ingest] === Validation: query-back ===")
     _validate(client, collection)
@@ -568,11 +1109,13 @@ def run_ingest(
 
 def _validate(client, collection: str) -> None:
     sample_queries = [
-        "chocolate spread hazelnut",
+        "chocolate hazelnut spread",
         "wireless earbuds bluetooth",
-        "leather conditioner",
+        "wooden chair furniture",
+        "LEGO brick set",
+        "cat food tuna",
     ]
-    for q in sample_queries[:2]:
+    for q in sample_queries[:3]:
         print(f"[Validate] Query: '{q}'")
         try:
             vec = embed_batch([q])[0]
@@ -584,9 +1127,9 @@ def _validate(client, collection: str) -> None:
             )
             for i, hit in enumerate(result.points):
                 p = hit.payload or {}
-                name = (p.get("product_name") or p.get("title") or "")[:70]
-                brand = (p.get("brands") or p.get("store") or "")[:30]
-                print(f"  [{i}] score={hit.score:.3f} | {name} | {brand}")
+                name = _str(p.get("name", ""), 70)
+                source = p.get("source", "")
+                print(f"  [{i}] score={hit.score:.3f} | {source} | {name}")
             print(f"  -> {len(result.points)} results")
         except Exception as e:
             print(f"  ERROR: {e}")
@@ -597,12 +1140,20 @@ def _validate(client, collection: str) -> None:
 def main() -> None:
     args = parse_args()
 
-    collection = args.collection or (
-        DEFAULT_COLLECTION_OFT if args.dataset == "off" else DEFAULT_COLLECTION_AMZ
-    )
-    limit = 0 if args.full else args.sample_size
+    # Delete-only mode
+    if args.delete_collection:
+        client = get_client(args.qdrant_url)
+        delete_collection(client, args.delete_collection)
+        return
 
-    print("[Ingest] === Dataset -> Qdrant Scaffold ===")
+    if not args.dataset:
+        print("[Error] --dataset is required (unless --delete-collection is used).")
+        sys.exit(1)
+
+    collection = args.collection
+    limit = 0 if args.full else args.sample
+
+    print("[Ingest] === Unified Dataset -> Qdrant ===")
     print(f"  dataset    : {args.dataset}")
     if args.dataset == "amazon":
         print(f"  category   : {args.amazon_category}")
@@ -610,12 +1161,24 @@ def main() -> None:
     print(f"  qdrant_url : {args.qdrant_url}")
     print(f"  limit      : {'unlimited (--full)' if args.full else limit}")
 
-    if args.dataset == "off":
-        source = stream_off(split=args.off_split, limit=limit)
-        text_field = "product_name"
-    else:  # amazon
-        source = stream_amazon(category=args.amazon_category, limit=limit)
-        text_field = "title"
+    # Validate-only mode: skip ingest, just query
+    if args.validate_only:
+        client = get_client(args.qdrant_url)
+        _validate(client, collection)
+        return
+
+    dataset_map = {
+        "off": lambda: stream_off(split="food", limit=limit),
+        "obf": lambda: stream_off(split="beauty", limit=limit),
+        "opff": lambda: stream_opff(limit=limit),
+        "amazon": lambda: stream_amazon(category=args.amazon_category, limit=limit),
+        "abo": lambda: stream_abo(limit=limit),
+        "ikea": lambda: stream_ikea(limit=limit),
+        "rebrickable": lambda: stream_rebrickable(limit=limit),
+        "gsmarena": lambda: stream_gsmarena(limit=limit),
+    }
+
+    source = dataset_map[args.dataset]()
 
     run_ingest(
         source_stream=source,
@@ -625,8 +1188,8 @@ def main() -> None:
         encode_batch_size=args.encode_batch,
         upsert_batch_size=args.batch,
         recreate=args.recreate,
-        text_index_field=text_field,
         no_text_index=args.no_text_index,
+        print_sample=args.print_sample,
     )
 
 
