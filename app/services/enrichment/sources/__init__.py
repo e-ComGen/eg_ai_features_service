@@ -18,6 +18,7 @@ from .barcode_source import BarcodeSource
 from .regard_source import RegardSource
 from .bestbuy_source import BestBuySource
 from .onliner_source import OnlinerSource
+from .books_source import BooksSource
 
 __all__ = [
     "DescriptionSource",
@@ -39,4 +40,5 @@ __all__ = [
     "RegardSource",
     "BestBuySource",
     "OnlinerSource",
+    "BooksSource",
 ]

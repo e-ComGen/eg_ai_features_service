@@ -40,6 +40,7 @@ from app.services.enrichment.sources import (
     RegardSource,
     BestBuySource,
     OnlinerSource,
+    BooksSource,
 )
 from app.services.enrichment.sources.ozon_card_source import (
     _extract_gender_signal,
@@ -2937,6 +2938,7 @@ class PipelineOrchestrator:
         regard_source: Optional[RegardSource] = None,
         bestbuy_source: Optional[BestBuySource] = None,
         onliner_source: Optional[OnlinerSource] = None,
+        books_source: Optional[BooksSource] = None,
         classifier: Optional[LlmClassifier] = None,
         cost_predictor: Optional[CostPredictor] = None,
         strategy: Optional[MarketplaceStrategy] = None,
@@ -3012,6 +3014,12 @@ class PipelineOrchestrator:
         # Russian values, no translation needed.
         # None → Onliner stage skipped.
         self._onliner: Optional[OnlinerSource] = onliner_source
+        # BooksSource: verbatim book metadata from Open Library + Google Books APIs.
+        # Fires Stage 0.56 — after IceCat (0.55), before Regard (0.57).
+        # ISBN-gated: fires ONLY when context.ean starts with 978/979 (book ISBN-13).
+        # Cost: 2–4 free API calls (Open Library, optionally Google Books). Zero Serper.
+        # None → Books stage skipped.
+        self._books: Optional[BooksSource] = books_source
         # ScrapflyOzonSource: last-resort Ozon card gap-filler via Scrapfly.
         # Fires ONLY when OzonCardSource (Scrappey) returned 0 results AND
         # SCRAPFLY_OZON_FALLBACK_ENABLED=true AND there are still-empty targets.
@@ -3064,6 +3072,11 @@ class PipelineOrchestrator:
         if self._onliner is not None and Source.WB_CARD not in self._judges:
             self._judges[Source.WB_CARD] = ConfidenceAwareJudgeWrapper(
                 self._onliner.get_judge()
+            )
+        # BooksSource also emits Source.WB_CARD — register fallback only if judge not set.
+        if self._books is not None and Source.WB_CARD not in self._judges:
+            self._judges[Source.WB_CARD] = ConfidenceAwareJudgeWrapper(
+                self._books.get_judge()
             )
         # Judge для YandexMarket (если source передан).
         # YandexMarketSource эмитит Source.OZON_CARD — переиспользуем тот же judge
@@ -3220,6 +3233,21 @@ class PipelineOrchestrator:
         if self._icecat is not None:
             new_avs = await self._run_icecat_stage(context, remaining, already_filled=filled_so_far)
             icecat_filled_count = len([v for v in new_avs if v.is_confident()])
+            all_values += new_avs
+            filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
+            remaining = self._remaining_targets(targets, all_values)
+            if not remaining:
+                all_values += await self._run_finishing(context, targets, all_values)
+                all_values += await self._generate_annotation(context, targets, all_values)
+                return await self._finalize_async(all_values, targets, context)
+
+        # Stage 0.56: BooksSource — verbatim book metadata from Open Library + Google Books.
+        # ISBN-gated: fires ONLY when context.ean is a book ISBN-13 (prefix 978/979).
+        # Cost: 2–4 free API calls; zero Serper. Category-specific, safe to skip for non-books.
+        if self._books is not None and remaining:
+            new_avs = await self._run_books_stage(
+                context, remaining, already_filled=filled_so_far,
+            )
             all_values += new_avs
             filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
             remaining = self._remaining_targets(targets, all_values)
@@ -4380,6 +4408,42 @@ class PipelineOrchestrator:
         # The URL is available in logs; wiring actual attribute extraction from the found URL
         # (fetch + parse + map) is straightforward once this stage is proven in live testing.
         return []
+
+    async def _run_books_stage(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: Optional[list[AttributeValue]] = None,
+    ) -> list[AttributeValue]:
+        """Run BooksSource (Stage 0.56) + WB_CARD judge. Errors don't interrupt pipeline.
+
+        ISBN-gated inside BooksSource.extract(): fires only when context.ean is a
+        book ISBN-13 (prefix 978/979). Non-book products return [] immediately.
+        """
+        if self._books is None:
+            return []
+        judge_wrapper = self._judges.get(Source.WB_CARD)
+        try:
+            extracted = await self._books.extract(
+                context, targets, already_filled=already_filled
+            )
+        except Exception as e:
+            logger.warning("[Pipeline] books source failed: %s", e, exc_info=True)
+            return []
+        if judge_wrapper is None:
+            return extracted
+        results: list[AttributeValue] = []
+        for value in extracted:
+            try:
+                judged = await judge_wrapper.maybe_validate(value, context)
+                if judged is not None:
+                    results.append(judged)
+            except Exception as e:
+                logger.warning(
+                    "[Pipeline] books judge failed for attr %s: %s",
+                    value.attribute_id, e,
+                )
+        return results
 
     async def _run_regard_stage(
         self,
