@@ -38,6 +38,8 @@ from app.services.enrichment.sources import (
     ScrapflyOzonSource,
     BarcodeSource,
     RegardSource,
+    BestBuySource,
+    OnlinerSource,
 )
 from app.services.enrichment.sources.ozon_card_source import (
     _extract_gender_signal,
@@ -2933,6 +2935,8 @@ class PipelineOrchestrator:
         scrapfly_ozon_source: Optional[ScrapflyOzonSource] = None,
         barcode_source: Optional[BarcodeSource] = None,
         regard_source: Optional[RegardSource] = None,
+        bestbuy_source: Optional[BestBuySource] = None,
+        onliner_source: Optional[OnlinerSource] = None,
         classifier: Optional[LlmClassifier] = None,
         cost_predictor: Optional[CostPredictor] = None,
         strategy: Optional[MarketplaceStrategy] = None,
@@ -2997,6 +3001,17 @@ class PipelineOrchestrator:
         # categories where IceCat is weak (CPU/RAM/storage/GPU specs).
         # None → regard stage skipped.
         self._regard: Optional[RegardSource] = regard_source
+        # BestBuySource: verbatim specs from Best Buy Developer API (free, official).
+        # Fires Stage 0.58 — after Regard, before CompetitorRAG.
+        # English values translated EN→RU before enum-match.
+        # Graceful no-op when BESTBUY_API_KEY absent.
+        # None → BestBuy stage skipped.
+        self._bestbuy: Optional[BestBuySource] = bestbuy_source
+        # OnlinerSource: verbatim specs from Onliner.by (public REST + JSON-LD).
+        # Fires Stage 0.59 — after BestBuy, before CompetitorRAG.
+        # Russian values, no translation needed.
+        # None → Onliner stage skipped.
+        self._onliner: Optional[OnlinerSource] = onliner_source
         # ScrapflyOzonSource: last-resort Ozon card gap-filler via Scrapfly.
         # Fires ONLY when OzonCardSource (Scrappey) returned 0 results AND
         # SCRAPFLY_OZON_FALLBACK_ENABLED=true AND there are still-empty targets.
@@ -3039,6 +3054,16 @@ class PipelineOrchestrator:
         if self._regard is not None and Source.WB_CARD not in self._judges:
             self._judges[Source.WB_CARD] = ConfidenceAwareJudgeWrapper(
                 self._regard.get_judge()
+            )
+        # BestBuySource / OnlinerSource also emit Source.WB_CARD — same judge applies.
+        # Register fallback only if WB_CARD judge still not set (all three share the judge).
+        if self._bestbuy is not None and Source.WB_CARD not in self._judges:
+            self._judges[Source.WB_CARD] = ConfidenceAwareJudgeWrapper(
+                self._bestbuy.get_judge()
+            )
+        if self._onliner is not None and Source.WB_CARD not in self._judges:
+            self._judges[Source.WB_CARD] = ConfidenceAwareJudgeWrapper(
+                self._onliner.get_judge()
             )
         # Judge для YandexMarket (если source передан).
         # YandexMarketSource эмитит Source.OZON_CARD — переиспользуем тот же judge
@@ -3209,6 +3234,37 @@ class PipelineOrchestrator:
         # Cost: 1 Serper + 1 plain httpx GET (~$0.001 + free).
         if self._regard is not None and remaining:
             new_avs = await self._run_regard_stage(
+                context, remaining, already_filled=filled_so_far,
+            )
+            all_values += new_avs
+            filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
+            remaining = self._remaining_targets(targets, all_values)
+            if not remaining:
+                all_values += await self._run_finishing(context, targets, all_values)
+                all_values += await self._generate_annotation(context, targets, all_values)
+                return await self._finalize_async(all_values, targets, context)
+
+        # Stage 0.58: BestBuySource — verbatim specs from Best Buy API (free, official).
+        # Fires after Regard: rich structured EN specs, EN→RU translated before enum-match.
+        # UPC lookup when EAN present; manufacturer+search otherwise.
+        # Cost: 1 Best Buy API call (free, rate-limited). No-op when BESTBUY_API_KEY absent.
+        if self._bestbuy is not None and remaining:
+            new_avs = await self._run_bestbuy_stage(
+                context, remaining, already_filled=filled_so_far,
+            )
+            all_values += new_avs
+            filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
+            remaining = self._remaining_targets(targets, all_values)
+            if not remaining:
+                all_values += await self._run_finishing(context, targets, all_values)
+                all_values += await self._generate_annotation(context, targets, all_values)
+                return await self._finalize_async(all_values, targets, context)
+
+        # Stage 0.59: OnlinerSource — verbatim RU specs from Onliner.by (public REST + JSON-LD).
+        # Fires after BestBuy: 80+ clean RU name/value pairs from additionalProperty.
+        # Cost: 1 search httpx GET + 1 page httpx GET (free, ~200ms).
+        if self._onliner is not None and remaining:
+            new_avs = await self._run_onliner_stage(
                 context, remaining, already_filled=filled_so_far,
             )
             all_values += new_avs
@@ -4353,6 +4409,70 @@ class PipelineOrchestrator:
             except Exception as e:
                 logger.warning(
                     "[Pipeline] regard judge failed for attr %s: %s",
+                    value.attribute_id, e,
+                )
+        return results
+
+    async def _run_bestbuy_stage(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: Optional[list[AttributeValue]] = None,
+    ) -> list[AttributeValue]:
+        """Run BestBuySource (Stage 0.58) + WB_CARD judge. Errors don't interrupt pipeline."""
+        if self._bestbuy is None:
+            return []
+        judge_wrapper = self._judges.get(Source.WB_CARD)
+        try:
+            extracted = await self._bestbuy.extract(
+                context, targets, already_filled=already_filled
+            )
+        except Exception as e:
+            logger.warning("[Pipeline] bestbuy source failed: %s", e, exc_info=True)
+            return []
+        if judge_wrapper is None:
+            return extracted
+        results: list[AttributeValue] = []
+        for value in extracted:
+            try:
+                judged = await judge_wrapper.maybe_validate(value, context)
+                if judged is not None:
+                    results.append(judged)
+            except Exception as e:
+                logger.warning(
+                    "[Pipeline] bestbuy judge failed for attr %s: %s",
+                    value.attribute_id, e,
+                )
+        return results
+
+    async def _run_onliner_stage(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: Optional[list[AttributeValue]] = None,
+    ) -> list[AttributeValue]:
+        """Run OnlinerSource (Stage 0.59) + WB_CARD judge. Errors don't interrupt pipeline."""
+        if self._onliner is None:
+            return []
+        judge_wrapper = self._judges.get(Source.WB_CARD)
+        try:
+            extracted = await self._onliner.extract(
+                context, targets, already_filled=already_filled
+            )
+        except Exception as e:
+            logger.warning("[Pipeline] onliner source failed: %s", e, exc_info=True)
+            return []
+        if judge_wrapper is None:
+            return extracted
+        results: list[AttributeValue] = []
+        for value in extracted:
+            try:
+                judged = await judge_wrapper.maybe_validate(value, context)
+                if judged is not None:
+                    results.append(judged)
+            except Exception as e:
+                logger.warning(
+                    "[Pipeline] onliner judge failed for attr %s: %s",
                     value.attribute_id, e,
                 )
         return results

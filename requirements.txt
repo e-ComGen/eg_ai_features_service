@@ -23,6 +23,8 @@ playwright>=1.40.0
 datasets
 # Process-tree cleanup for BrowserFetcher Chrome child processes
 psutil
+# Ingest scaffolds: FSA open-data (.7z extraction)
+py7zr>=0.20
 # Test dependencies
 pytest
 pytest-asyncio

@@ -16,6 +16,8 @@ from .scrapfly_ozon_source import ScrapflyOzonSource
 from .safe_enum_fill_source import SafeEnumFillSource
 from .barcode_source import BarcodeSource
 from .regard_source import RegardSource
+from .bestbuy_source import BestBuySource
+from .onliner_source import OnlinerSource
 
 __all__ = [
     "DescriptionSource",
@@ -35,4 +37,6 @@ __all__ = [
     "SafeEnumFillSource",
     "BarcodeSource",
     "RegardSource",
+    "BestBuySource",
+    "OnlinerSource",
 ]
