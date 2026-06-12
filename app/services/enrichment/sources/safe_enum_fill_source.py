@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 
 # Short-enum threshold: enums with more than this many options are not
 # suitable for the "LLM knows this closed domain" assumption.
-SAFE_ENUM_MAX_OPTIONS: int = int(os.environ.get("SAFE_ENUM_MAX_OPTIONS", "20"))
+SAFE_ENUM_MAX_OPTIONS: int = int(os.environ.get("SAFE_ENUM_MAX_OPTIONS", "35"))
 
 # Confidence assigned to fills that pass a gate.
 _FILL_CONFIDENCE = 0.82

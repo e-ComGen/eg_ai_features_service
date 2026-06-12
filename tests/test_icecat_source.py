@@ -20,6 +20,7 @@ from app.services.enrichment.sources.icecat_source import (
     IceCatSource,
     _extract_code_candidates,
     _build_code_candidates,
+    _bilingual_normalize,
     closed_brands,
     open_brands,
 )
@@ -620,3 +621,186 @@ async def test_mpn_lookup_serper_down_graceful_fallback():
 
     assert results == [], "Serper down → graceful [], без исключений"
     mock_serper.search.assert_called_once(), "Serper.search должен быть вызван (и поймать ошибку)"
+
+
+# ---------------------------------------------------------------------------
+# LEVER 1 tests: bilingual EN↔RU normalization
+# ---------------------------------------------------------------------------
+
+def test_bilingual_normalize_exact_en_key():
+    """'Power' → 'мощность' (точное EN ключевое слово)."""
+    assert _bilingual_normalize("Power") == "мощность"
+
+
+def test_bilingual_normalize_case_insensitive():
+    """'WEIGHT' → 'вес' (регистронезависимый lookup)."""
+    assert _bilingual_normalize("WEIGHT") == "вес"
+
+
+def test_bilingual_normalize_partial_phrase():
+    """'Total power output' содержит 'power output' → 'мощность'."""
+    result = _bilingual_normalize("Total power output")
+    assert result == "мощность", f"Expected 'мощность', got {result!r}"
+
+
+def test_bilingual_normalize_ru_passthrough():
+    """Русское имя проходит без изменений."""
+    assert _bilingual_normalize("Мощность") == "Мощность"
+
+
+def test_bilingual_normalize_unknown_en_passthrough():
+    """Неизвестное EN имя возвращается как есть."""
+    assert _bilingual_normalize("Foobar XYZ Spec") == "Foobar XYZ Spec"
+
+
+def test_bilingual_normalize_form_factor():
+    """'Form factor' → 'форм-фактор'."""
+    assert _bilingual_normalize("Form factor") == "форм-фактор"
+
+
+@pytest.mark.asyncio
+async def test_en_icecat_name_maps_to_ru_target():
+    """IceCat EN feature 'Power' matches RU target 'Мощность блока питания, Вт' via bilingual norm."""
+    features = [("Power", "850 W")]
+    source = _make_icecat_source_with_mock_fetch(_make_icecat_response(features))
+
+    targets = [
+        _make_target(301, "Мощность блока питания, Вт"),
+        _make_target(302, "Цвет"),
+    ]
+    ctx = _make_context()
+    results = await source.extract(ctx, targets)
+
+    assert any(av.attribute_id == 301 for av in results), (
+        "EN IceCat name 'Power' должен смапиться на RU target 'Мощность блока питания, Вт' "
+        "через bilingual normalization"
+    )
+
+
+@pytest.mark.asyncio
+async def test_en_weight_maps_to_ru_target():
+    """IceCat EN 'Weight' → RU target 'Вес, кг'."""
+    features = [("Weight", "1.2 kg")]
+    source = _make_icecat_source_with_mock_fetch(_make_icecat_response(features))
+
+    targets = [
+        _make_target(401, "Вес, кг"),
+        _make_target(402, "Цвет"),
+    ]
+    ctx = _make_context()
+    results = await source.extract(ctx, targets)
+
+    assert any(av.attribute_id == 401 for av in results), (
+        "EN IceCat name 'Weight' должен смапиться на RU target 'Вес, кг'"
+    )
+
+
+@pytest.mark.asyncio
+async def test_en_color_maps_to_ru_target():
+    """IceCat EN 'Color' → RU target 'Цвет'."""
+    features = [("Color", "Black")]
+    source = _make_icecat_source_with_mock_fetch(_make_icecat_response(features))
+
+    targets = [_make_target(501, "Цвет")]
+    ctx = _make_context()
+    results = await source.extract(ctx, targets)
+
+    assert any(av.attribute_id == 501 for av in results), (
+        "EN IceCat name 'Color' должен смапиться на RU target 'Цвет'"
+    )
+
+
+# ---------------------------------------------------------------------------
+# LEVER 2 tests: stated-negative "Нет" for boolean attributes
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_stated_negative_skipped_when_flag_off(monkeypatch):
+    """Verbatim 'No' IceCat value → skipped when ICECAT_STATED_NEGATIVE_ENABLED=0."""
+    import app.services.enrichment.sources.icecat_source as icecat_mod
+    monkeypatch.setattr(icecat_mod, "_ICECAT_STATED_NEGATIVE_ENABLED", False)
+
+    features = [("Modular", "No")]
+    source = _make_icecat_source_with_mock_fetch(_make_icecat_response(features))
+
+    targets = [_make_target(601, "Модульность", attr_type="bool")]
+    ctx = _make_context()
+    results = await source.extract(ctx, targets)
+
+    assert results == [], (
+        "Verbatim 'No' должен быть отброшен когда флаг ICECAT_STATED_NEGATIVE_ENABLED=OFF"
+    )
+
+
+@pytest.mark.asyncio
+async def test_stated_negative_fills_nyet_for_bool_when_flag_on(monkeypatch):
+    """Verbatim 'No' for bool target → fills 'Нет' when flag ON."""
+    import app.services.enrichment.sources.icecat_source as icecat_mod
+    monkeypatch.setattr(icecat_mod, "_ICECAT_STATED_NEGATIVE_ENABLED", True)
+
+    features = [("Modular", "No")]
+    source = _make_icecat_source_with_mock_fetch(_make_icecat_response(features))
+
+    targets = [_make_target(601, "Модульность", attr_type="bool")]
+    ctx = _make_context()
+    results = await source.extract(ctx, targets)
+
+    assert len(results) == 1, "Должен быть 1 AV для verbatim 'No' с флагом ON"
+    assert results[0].value == "Нет", f"Ожидаем 'Нет', получили {results[0].value!r}"
+    assert results[0].attribute_id == 601
+    assert "stated_negative" in results[0].evidence
+
+
+@pytest.mark.asyncio
+async def test_stated_negative_not_filled_for_non_bool_target(monkeypatch):
+    """Verbatim 'No' for non-bool (text) target → NOT filled, even when flag ON."""
+    import app.services.enrichment.sources.icecat_source as icecat_mod
+    monkeypatch.setattr(icecat_mod, "_ICECAT_STATED_NEGATIVE_ENABLED", True)
+
+    features = [("Color", "No")]  # "No" as color value — not a bool target
+    source = _make_icecat_source_with_mock_fetch(_make_icecat_response(features))
+
+    targets = [_make_target(701, "Цвет", attr_type="text")]
+    ctx = _make_context()
+    results = await source.extract(ctx, targets)
+
+    # "No" for a text attr should not produce a "Нет" fill (not a bool target)
+    assert results == [], (
+        "Verbatim 'No' для text-атрибута не должен давать 'Нет' fill"
+    )
+
+
+@pytest.mark.asyncio
+async def test_stated_negative_ru_nyet_for_bool_when_flag_on(monkeypatch):
+    """Verbatim 'Нет' (RU) for bool target → fills 'Нет' when flag ON."""
+    import app.services.enrichment.sources.icecat_source as icecat_mod
+    monkeypatch.setattr(icecat_mod, "_ICECAT_STATED_NEGATIVE_ENABLED", True)
+
+    features = [("Модульность", "Нет")]
+    source = _make_icecat_source_with_mock_fetch(_make_icecat_response(features))
+
+    targets = [_make_target(601, "Модульность", attr_type="bool")]
+    ctx = _make_context()
+    results = await source.extract(ctx, targets)
+
+    assert len(results) == 1
+    assert results[0].value == "Нет"
+
+
+@pytest.mark.asyncio
+async def test_positive_bool_value_not_treated_as_negative(monkeypatch):
+    """IceCat value 'Yes' for bool target → NOT treated as negative, fills normally."""
+    import app.services.enrichment.sources.icecat_source as icecat_mod
+    monkeypatch.setattr(icecat_mod, "_ICECAT_STATED_NEGATIVE_ENABLED", True)
+
+    features = [("Модульность", "Yes")]
+    source = _make_icecat_source_with_mock_fetch(_make_icecat_response(features))
+
+    targets = [_make_target(601, "Модульность", attr_type="bool")]
+    ctx = _make_context()
+    results = await source.extract(ctx, targets)
+
+    # "Yes" is NOT a verbatim negative → should be passed through as a regular fill
+    assert len(results) == 1, "Позитивное значение 'Yes' должно давать fill"
+    assert results[0].value == "Yes", f"Ожидаем 'Yes', получили {results[0].value!r}"
+    assert "stated_negative" not in results[0].evidence

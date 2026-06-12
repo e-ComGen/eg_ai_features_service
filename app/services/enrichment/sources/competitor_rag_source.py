@@ -27,6 +27,7 @@ except ImportError:
 import logging
 import math
 import os
+import re
 import socket
 from collections import Counter
 from typing import Optional, TYPE_CHECKING
@@ -106,6 +107,72 @@ def _get_embedding(text: str) -> list[float]:
 
 # Кэш загруженной модели (singleton per process)
 _model_cache = None
+
+# Regex: detects raw colorway/SKU codes like "ftwwht/cblack/solred" or "ABCD-123/XY".
+# A slash-separated token where every segment is purely ASCII-alphanumeric (no Cyrillic).
+_RAW_CODE_RE = re.compile(r"^[A-Za-z0-9]+(?:[/\-][A-Za-z0-9]+)+$")
+
+# Regex: detects strings with NO Cyrillic characters at all.
+_NO_CYRILLIC_RE = re.compile(r"^[^Ѐ-ӿ]+$")
+
+# Regex: "measurement-like" non-Cyrillic values that are safe to keep:
+# a leading number followed by optional whitespace and a short unit (≤5 alpha chars).
+# Examples: "750W", "2.4GHz", "16GB", "5.1", "60Hz".
+# These are universal notation and should NOT be dropped as "foreign strings".
+_MEASUREMENT_LIKE_RE = re.compile(r"^\d[\d.,]*\s*[A-Za-z]{0,5}$")
+
+# Collapse multiple whitespace / trim.
+_WS_RE = re.compile(r"\s+")
+
+
+def _normalize_free_text_rag(value: str) -> Optional[str]:
+    """General normalizer for free-text RAG values (e.g. Состав).
+
+    Rules (all general — no per-category logic):
+      1. Trim and collapse whitespace.
+      2. Drop raw slash/dash colorway/SKU codes (e.g. "ftwwht/cblack/solred").
+      3. Drop non-Cyrillic strings that are NOT measurement-like — these are
+         foreign-language values (e.g. "Red", "100% Polyester", "UK 6") with no
+         clean RU form. Measurement-like values (e.g. "750W", "2.4GHz") are kept
+         because they are universal notation that does not need translation.
+
+    Returns the cleaned value, or None if the value should be dropped entirely.
+    """
+    cleaned = _WS_RE.sub(" ", value.strip())
+    if not cleaned:
+        return None
+    # Drop raw slash/dash code tokens (e.g. "ftwwht/cblack/solred")
+    if _RAW_CODE_RE.match(cleaned):
+        return None
+    # Drop non-Cyrillic strings unless they look like a numeric measurement.
+    # "Red" → drop. "100% Polyester" → drop. "UK 6" → drop.
+    # "750W" → keep (measurement). "2.4GHz" → keep.
+    if _NO_CYRILLIC_RE.match(cleaned) and not _MEASUREMENT_LIKE_RE.match(cleaned):
+        return None
+    return cleaned
+
+
+def _match_enum_value(raw_value: str, allowed_values: list[str]) -> Optional[str]:
+    """Match a RAG raw value against the attribute's allowed enum options.
+
+    Uses the project's MatcherService (fuzzy + vector, same as resolve_value_id).
+    Returns the matched allowed option string, or None if no confident match found.
+    Falls back gracefully if MatcherService is unavailable (sentence-transformers absent).
+    """
+    try:
+        from app.services.enrichment.strategies.dictionaries.ozon_loader import get_matcher
+        matcher = get_matcher()
+        if matcher is None:
+            # No fuzzy matcher available — fall back to case-insensitive exact match only
+            raw_lower = raw_value.lower().strip()
+            for opt in allowed_values:
+                if opt.lower().strip() == raw_lower:
+                    return opt
+            return None
+        return matcher.find_best_match(raw_value, allowed_values)
+    except Exception as exc:
+        logger.debug("[CompetitorRag] enum matcher failed for %r: %s", raw_value, exc)
+        return None
 
 # ── Process-wide Qdrant embedded singleton ────────────────────────────────────
 # Embedded local mode loads ALL vectors into numpy RAM (~3.7 GB for ozon_rag).
@@ -579,6 +646,12 @@ class CompetitorRagSource(AttributeSource):
         Консенсус = ≥ ceil(len(filtered)/2) кандидатов с одинаковым значением.
         Confidence = 0.7 + 0.05 * agree_count (capped at 0.95).
         Повышенная уверенность относительно legacy-версии: кандидаты уже проверены LLM.
+
+        Enum gating: for ENUM attributes every consensus value MUST match an allowed option
+        via the project's fuzzy/vector matcher.  Raw competitor strings that don't map to a
+        known option are DROPPED — empty is better than a dirty format value.
+        Free-text gating: general normalizer drops foreign/Latin-only strings and raw
+        SKU-style codes.  No translation or guessing is performed.
         """
         results: list[AttributeValue] = []
         n = len(neighbors)
@@ -600,13 +673,22 @@ class CompetitorRagSource(AttributeSource):
             if best_count < min_agree:
                 continue  # консенсуса нет
 
+            # ── Enum / free-text format gating ───────────────────────────────
+            clean_value = self._gate_rag_value(best_value, target)
+            if clean_value is None:
+                logger.debug(
+                    "[CompetitorRag] DROP enum/format gate: attr=%r raw=%r",
+                    target.name, best_value,
+                )
+                continue
+
             # Уверенность выше, т.к. кандидаты отфильтрованы LLM
             confidence = min(0.7 + 0.05 * best_count, 0.95)
             evidence = f"seen in {best_count}/{n} similar Ozon cards (LLM-filtered)"
 
             results.append(AttributeValue(
                 attribute_id=target.id,
-                value=best_value,
+                value=clean_value,
                 confidence=confidence,
                 source=Source.COMPETITOR_RAG,
                 evidence=evidence,
@@ -626,6 +708,7 @@ class CompetitorRagSource(AttributeSource):
 
         Минимум min_consensus соседей с одинаковым значением.
         Confidence: 0.6 + 0.4 * (best_count / len(neighbors)).
+        Same enum/free-text gating as _aggregate_consensus applies here.
         """
         results: list[AttributeValue] = []
 
@@ -644,12 +727,21 @@ class CompetitorRagSource(AttributeSource):
             if best_count < min_consensus:
                 continue
 
+            # ── Enum / free-text format gating ───────────────────────────────
+            clean_value = self._gate_rag_value(best_value, target)
+            if clean_value is None:
+                logger.debug(
+                    "[CompetitorRag] DROP enum/format gate (legacy): attr=%r raw=%r",
+                    target.name, best_value,
+                )
+                continue
+
             confidence = 0.6 + 0.4 * (best_count / len(neighbors))
             evidence = f"seen in {best_count}/{len(neighbors)} similar Ozon cards"
 
             results.append(AttributeValue(
                 attribute_id=target.id,
-                value=best_value,
+                value=clean_value,
                 confidence=confidence,
                 source=Source.COMPETITOR_RAG,
                 evidence=evidence,
@@ -658,6 +750,35 @@ class CompetitorRagSource(AttributeSource):
             ))
 
         return results
+
+    @staticmethod
+    def _gate_rag_value(raw_value: str, target: TargetAttribute) -> Optional[str]:
+        """Apply format/enum gate to a RAG consensus value before accepting it.
+
+        For ENUM attributes (target.type == "enum" AND target.allowed_values non-empty):
+          Pass the raw value through the fuzzy enum-option matcher.
+          If no confident match to an allowed option → return None (DROP).
+          This prevents raw competitor strings (colorway codes, English values, size codes)
+          from leaking into filled attributes.
+
+        For other attribute types (free-text, numeric, bool):
+          Apply the general free-text normalizer: trim, drop raw SKU codes, drop
+          Latin/foreign-only strings (no Cyrillic).  Return None if value looks dirty.
+
+        Returns the clean/matched value to use, or None to drop the fill entirely.
+        Never translates or guesses — if no clean RU form exists, drops.
+        """
+        is_enum = (
+            target.type == "enum"
+            and target.allowed_values is not None
+            and len(target.allowed_values) > 0
+        )
+        if is_enum:
+            matched = _match_enum_value(raw_value, target.allowed_values)
+            return matched  # None = no confident match → drop
+
+        # Free-text / numeric / bool: general normalizer
+        return _normalize_free_text_rag(raw_value)
 
     @staticmethod
     def _coerce_characteristics(raw) -> dict:

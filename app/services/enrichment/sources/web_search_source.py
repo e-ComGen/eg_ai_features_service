@@ -166,6 +166,28 @@ class WebSearchSource(AttributeSource):
         if not summary:
             return []
 
+        # Step 2.5: OEM spec-pair harvest — verbatim spec extraction from raw page text.
+        # Fires ONLY when OEM_SPEC_HARVEST_ENABLED=1 (default OFF). No LLM call needed.
+        # Reads the raw page text (trafilatura output before LLM summarisation) that
+        # WebSearchProducer stored in _last_page_text during produce_summary.
+        # Falls back silently to [] when the flag is off or no page text was cached.
+        oem_spec_avs: list[AttributeValue] = []
+        try:
+            from app.services.enrichment.sources.oem_spec_harvest import (
+                harvest_spec_pairs,
+                OEM_SPEC_HARVEST_ENABLED,
+            )
+            if OEM_SPEC_HARVEST_ENABLED:
+                raw_page = getattr(self._search, "_last_page_text", None)
+                if raw_page:
+                    oem_spec_avs = await harvest_spec_pairs(
+                        raw_page, effective_targets, already_filled or [], context
+                    )
+        except Exception as exc:
+            logger.warning(
+                "WebSearchSource: oem_spec_harvest failed (non-fatal): %s", exc
+            )
+
         # Step 3: extraction from summary с type-aware подсказками
         # Батчинг: разбиваем targets на чанки по CHUNK_SIZE, context не дублируем
         CHUNK_SIZE = 30
@@ -244,9 +266,11 @@ class WebSearchSource(AttributeSource):
             for a in all_extracted
         ]
 
-        # Merge: composition_avs first (deterministic, no LLM), then LLM results.
-        # LLM results that overlap 4604/4496 are kept as well (merger will pick best).
-        return composition_avs + llm_avs
+        # Merge: composition_avs first (deterministic), then oem_spec_avs (verbatim,
+        # source=DESCRIPTION, higher priority in merge), then LLM results.
+        # Ordering matters: deterministic fills come first so the merger can protect
+        # them from lower-confidence LLM overwrites via _merge_winner / card-protection.
+        return composition_avs + oem_spec_avs + llm_avs
 
     # ------------------------------------------------------------------
     # BrowserFetcher lifecycle helpers

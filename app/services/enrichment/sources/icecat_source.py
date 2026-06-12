@@ -53,6 +53,182 @@ logger = logging.getLogger(__name__)
 # Confidence для всех IceCat-значений (brand-verified данные высокого качества)
 _ICECAT_CONFIDENCE = 0.92
 
+# ---------------------------------------------------------------------------
+# LEVER 1: General bilingual EN→RU attribute-name normalization
+#
+# Purpose: IceCat Open returns attribute names in English for many brands while
+# our target attributes are in Russian. A fuzzy match on dissimilar-language
+# strings produces low scores and drops real data. This compact, GENERAL
+# EN→RU concept map (not per-category) converts common tech-spec attribute
+# names to Russian so the existing rapidfuzz matcher can operate on same-
+# language strings. No per-category or per-product hardcode.
+#
+# Maintenance rule: entries must be GENERAL concepts that appear across product
+# categories (power, weight, color, dimensions, …). Per-category terms belong
+# in the marketplace dictionary, not here.
+# ---------------------------------------------------------------------------
+
+_EN_RU_ATTR_NAME_MAP: dict[str, str] = {
+    # Power / energy
+    "power": "мощность",
+    "power output": "мощность",
+    "rated power": "мощность",
+    "wattage": "мощность",
+    "power consumption": "потребляемая мощность",
+    "standby power": "мощность в режиме ожидания",
+    "energy efficiency": "энергоэффективность",
+    "energy class": "класс энергопотребления",
+    "energy rating": "класс энергопотребления",
+    # Dimensions / weight
+    "weight": "вес",
+    "product weight": "вес",
+    "net weight": "вес нетто",
+    "width": "ширина",
+    "height": "высота",
+    "depth": "глубина",
+    "length": "длина",
+    "diameter": "диаметр",
+    "thickness": "толщина",
+    # Color / appearance
+    "color": "цвет",
+    "colour": "цвет",
+    "product colour": "цвет",
+    "product color": "цвет",
+    # Connectivity / interfaces
+    "interface": "интерфейс",
+    "connector": "разъём",
+    "connector type": "тип разъёма",
+    "port": "порт",
+    "cable length": "длина кабеля",
+    "cable type": "тип кабеля",
+    # Display
+    "display diagonal": "диагональ экрана",
+    "screen size": "диагональ экрана",
+    "resolution": "разрешение",
+    "refresh rate": "частота обновления",
+    "response time": "время отклика",
+    "brightness": "яркость",
+    "contrast ratio": "контрастность",
+    # Memory / storage
+    "memory": "память",
+    "storage": "объём памяти",
+    "capacity": "ёмкость",
+    "storage capacity": "объём памяти",
+    "ram": "оперативная память",
+    "internal memory": "внутренняя память",
+    # Processor
+    "processor": "процессор",
+    "processor speed": "частота процессора",
+    "number of cores": "количество ядер",
+    "clock speed": "тактовая частота",
+    # Battery
+    "battery capacity": "ёмкость аккумулятора",
+    "battery life": "время работы аккумулятора",
+    "battery voltage": "напряжение аккумулятора",
+    "battery type": "тип аккумулятора",
+    # General specs
+    "form factor": "форм-фактор",
+    "material": "материал",
+    "operating temperature": "рабочая температура",
+    "operating humidity": "рабочая влажность",
+    "noise level": "уровень шума",
+    "frequency": "частота",
+    "voltage": "напряжение",
+    "current": "ток",
+    "efficiency": "кпд",
+    "efficiency rating": "сертификат эффективности",
+    "certification": "сертификат",
+    "compatibility": "совместимость",
+    "warranty": "гарантия",
+    "country of origin": "страна производства",
+    "brand": "бренд",
+    "manufacturer": "производитель",
+    "model": "модель",
+    "product line": "линейка продуктов",
+    "type": "тип",
+    "fan speed": "скорость вентилятора",
+    "fan size": "размер вентилятора",
+    "number of fans": "количество вентиляторов",
+    "modular": "модульность",
+    "protection": "защита",
+    "input voltage": "входное напряжение",
+    "output voltage": "выходное напряжение",
+    "input frequency": "входная частота",
+    "output power": "выходная мощность",
+    "peak power": "пиковая мощность",
+    "dimensions": "габариты",
+    "packaging dimensions": "размер упаковки",
+}
+
+# Pre-build lowercase version for O(1) exact lookup
+_EN_RU_LOWER: dict[str, str] = {k.lower(): v for k, v in _EN_RU_ATTR_NAME_MAP.items()}
+
+
+def _bilingual_normalize(name: str) -> str:
+    """Return a Russian equivalent of an English attribute name, or the original.
+
+    Algorithm (general, no per-category hardcode):
+      1. Exact lowercase lookup in the EN→RU map.
+      2. Partial-phrase lookup: check if any map key is a substring of the name
+         (for names like "Total power output" → "power output" → "мощность").
+      3. If no match: return the original name unchanged (Russian names pass through).
+
+    This is used as a query-time normalization before rapidfuzz matching so that
+    EN IceCat names can fuzzy-match against RU target names.
+    """
+    stripped = name.strip()
+    lower = stripped.lower()
+
+    # Step 1: exact match
+    if lower in _EN_RU_LOWER:
+        return _EN_RU_LOWER[lower]
+
+    # Step 2: longest matching phrase contained in the name
+    best_key: Optional[str] = None
+    best_len = 0
+    for key, ru_val in _EN_RU_LOWER.items():
+        if key in lower and len(key) > best_len:
+            best_key = key
+            best_len = len(key)
+    if best_key is not None:
+        return _EN_RU_LOWER[best_key]
+
+    return stripped
+
+
+# ---------------------------------------------------------------------------
+# LEVER 2: Stated-negative ("Нет") detection for boolean attributes
+#
+# FEATURE FLAG: ICECAT_STATED_NEGATIVE_ENABLED (default "0" = OFF)
+# When ON: if an IceCat feature has an EXPLICIT verbatim negative value for a
+# boolean/yes-no target, we fill "Нет" (false). We NEVER infer absence from
+# missing data — only verbatim stated-negative triggers a fill.
+#
+# Conservative detection: only a small set of unambiguous explicit-negative
+# literals counts. Any value not in this set → treated as positive or unknown.
+# ---------------------------------------------------------------------------
+
+_ICECAT_STATED_NEGATIVE_ENABLED: bool = (
+    os.environ.get("ICECAT_STATED_NEGATIVE_ENABLED", "0").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
+# Verbatim negative literals returned by IceCat for absent features.
+# ONLY these exact strings (case-insensitive, stripped) trigger a "Нет" fill.
+# "n/a" and "-" are already filtered in _parse_response (ambiguous: not explicit negatives).
+_ICECAT_VERBATIM_NEGATIVES: frozenset[str] = frozenset({
+    "no",
+    "none",
+    "нет",
+    "false",
+    "not available",
+    "not supported",
+    "не поддерживается",
+    "не предусмотрен",
+    "не предусмотрено",
+    "без",
+})
+
 # Максимальное число candidates кодов которые пробуем (увеличено для multi-strategy)
 _MAX_CANDIDATES = 8
 
@@ -680,8 +856,19 @@ class IceCatSource(AttributeSource):
         """Смапить IceCat features на TargetAttribute через fuzzy/semantic matching.
 
         Для каждой IceCat (name, value) ищем ближайший target по имени.
-        Используем rapidfuzz + cosine similarity (через MatcherService если доступен).
-        Если совпадение найдено — эмитируем AttributeValue.
+
+        EN↔RU bilingual normalization (LEVER 1):
+          Перед fuzzy-матчингом IceCat-имя прогоняется через _bilingual_normalize().
+          Если IceCat вернул EN-имя (напр. "Power"), функция транслирует его в RU
+          ("мощность") через компактный general EN→RU словарь (не per-category).
+          Затем фаззи-матч работает на одноязычных строках, находя совпадения
+          которые ранее терялись из-за языковой разницы.
+
+        Stated-negative ("Нет") для bool-атрибутов (LEVER 2):
+          Включается только при ICECAT_STATED_NEGATIVE_ENABLED=1 (по умолчанию OFF).
+          Если IceCat явно указывает отсутствие признака (verbatim "No"/"Нет"/...),
+          заполняем "Нет" для boolean-цели. НИКОГДА не выводим "Нет" из отсутствия
+          данных — только из явного verbatim-отрицания.
 
         Один target может получить только одно значение (первое совпадение с наивысшим score).
         """
@@ -705,31 +892,107 @@ class IceCatSource(AttributeSource):
             if not icecat_name or not value:
                 continue
 
+            # LEVER 2: stated-negative guard for bool targets (flag-gated OFF by default)
+            value_lower_stripped = value.strip().lower()
+            is_stated_negative = value_lower_stripped in _ICECAT_VERBATIM_NEGATIVES
+            if is_stated_negative and not _ICECAT_STATED_NEGATIVE_ENABLED:
+                # Explicit negatives are dropped when the feature flag is OFF.
+                # We don't want to incorrectly skip non-negative values that
+                # happen to partially match, so only skip verbatim negatives here.
+                logger.debug(
+                    "[IceCat] stated-negative skipped (flag OFF): attr=%r value=%r",
+                    icecat_name, value,
+                )
+                continue
+
+            # LEVER 1: bilingual normalization — translate EN attr name to RU
+            # before fuzzy matching so EN IceCat attrs match RU targets.
+            normalized_name = _bilingual_normalize(icecat_name)
+            if normalized_name != icecat_name:
+                logger.debug(
+                    "[IceCat] bilingual normalize: %r → %r",
+                    icecat_name, normalized_name,
+                )
+
             matched_target: Optional[TargetAttribute] = None
 
             if _has_rapidfuzz:
-                # rapidfuzz: WRatio хорошо работает с русскими строками разной длины
+                # First attempt: match with the (possibly translated) normalized name.
                 match = fuzz_process.extractOne(
-                    icecat_name,
+                    normalized_name,
                     target_names,
                     scorer=fuzz.WRatio,
                     score_cutoff=65,
                 )
+                # For short translated queries (≤8 chars) WRatio under-scores when
+                # the translated word is a substring of a longer target name.
+                # Use partial_ratio as a secondary scorer to catch these cases
+                # (e.g. "вес" → "Вес, кг" scores 67 with partial_ratio vs ~60 WRatio).
+                if match is None and len(normalized_name) <= 8:
+                    match = fuzz_process.extractOne(
+                        normalized_name,
+                        target_names,
+                        scorer=fuzz.partial_ratio,
+                        score_cutoff=65,
+                    )
+                # Third attempt: if normalized name did not improve score, also try
+                # the original IceCat name (guards against over-aggressive translation).
+                if match is None and normalized_name != icecat_name:
+                    match = fuzz_process.extractOne(
+                        icecat_name,
+                        target_names,
+                        scorer=fuzz.WRatio,
+                        score_cutoff=65,
+                    )
                 if match:
                     matched_name = match[0]
                     matched_target = target_by_name.get(matched_name)
             else:
-                # Fallback: простой lowercase substring match
-                icecat_lower = icecat_name.lower()
-                for t in targets:
-                    if t.name.lower() == icecat_lower or t.name.lower() in icecat_lower or icecat_lower in t.name.lower():
-                        matched_target = t
+                # Fallback: простой lowercase substring match (try translated first)
+                for query in (normalized_name, icecat_name):
+                    q_lower = query.lower()
+                    for t in targets:
+                        if (
+                            t.name.lower() == q_lower
+                            or t.name.lower() in q_lower
+                            or q_lower in t.name.lower()
+                        ):
+                            matched_target = t
+                            break
+                    if matched_target is not None:
                         break
 
             if matched_target is None:
                 continue
             if matched_target.id in used_target_ids:
                 continue  # уже заполнили этот target
+
+            # LEVER 2: stated-negative fill for boolean targets
+            # Only when flag is ON AND value is a verbatim explicit negative.
+            if is_stated_negative:
+                # Only fill "Нет" for bool-type targets.
+                if matched_target.type not in ("bool", "boolean"):
+                    logger.debug(
+                        "[IceCat] stated-negative skipped (target not bool): "
+                        "attr=%r type=%r value=%r",
+                        matched_target.name, matched_target.type, value,
+                    )
+                    continue
+                logger.info(
+                    "[IceCat] stated-negative fill: attr=%r value=%r → Нет",
+                    matched_target.name, value,
+                )
+                used_target_ids.add(matched_target.id)
+                results.append(AttributeValue(
+                    attribute_id=matched_target.id,
+                    value="Нет",
+                    confidence=_ICECAT_CONFIDENCE,
+                    source=Source.ICECAT,
+                    evidence=f"icecat:stated_negative:{icecat_name}={value}",
+                    semantic_type=matched_target.semantic_type,
+                    is_collection=matched_target.is_collection,
+                ))
+                continue
 
             used_target_ids.add(matched_target.id)
             # Normalize numeric values: strip units, convert if needed

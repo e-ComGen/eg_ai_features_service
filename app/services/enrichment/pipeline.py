@@ -36,6 +36,8 @@ from app.services.enrichment.sources import (
     TnvedSource,
     YandexMarketSource,
     ScrapflyOzonSource,
+    BarcodeSource,
+    TitleCrossFillSource,
 )
 from app.services.enrichment.sources.ozon_card_source import (
     _extract_gender_signal,
@@ -2026,6 +2028,8 @@ class PipelineOrchestrator:
         ugc_source: Optional[UgcSource] = None,
         tnved_source: Optional[TnvedSource] = None,
         scrapfly_ozon_source: Optional[ScrapflyOzonSource] = None,
+        barcode_source: Optional[BarcodeSource] = None,
+        title_cross_fill_source: Optional[TitleCrossFillSource] = None,
         classifier: Optional[LlmClassifier] = None,
         cost_predictor: Optional[CostPredictor] = None,
         strategy: Optional[MarketplaceStrategy] = None,
@@ -2082,6 +2086,14 @@ class PipelineOrchestrator:
         # Создаётся ОДИН раз → кэш переживает все товары батча.
         # None → по умолчанию создаём инстанс (всегда нужен для Ozon).
         self._tnved: TnvedSource = tnved_source or TnvedSource()
+        # BarcodeSource: verbatim EAN/barcode extractor — zero LLM, zero cost.
+        # Always created (cheap singleton, no external deps).
+        self._barcode: BarcodeSource = barcode_source or BarcodeSource()
+        # TitleCrossFillSource: verbatim enum/numeric extraction from product title.
+        # Zero cost (no LLM, no network). Always created.
+        self._title_cross_fill: TitleCrossFillSource = (
+            title_cross_fill_source or TitleCrossFillSource()
+        )
         # ScrapflyOzonSource: last-resort Ozon card gap-filler via Scrapfly.
         # Fires ONLY when OzonCardSource (Scrappey) returned 0 results AND
         # SCRAPFLY_OZON_FALLBACK_ENABLED=true AND there are still-empty targets.
@@ -2177,6 +2189,35 @@ class PipelineOrchestrator:
             all_values += await self._run_finishing(context, targets, all_values)
             all_values += await self._generate_annotation(context, targets, all_values)
             return await self._finalize_async(all_values, targets, context)
+
+        # Stage 0.46: BarcodeSource — verbatim EAN/barcode from description text.
+        # Zero cost (no LLM, no network). Runs after Stage 0 so description text
+        # is already in context; fills barcode-type attributes from verbatim digits.
+        if remaining:
+            new_avs = await self._run_barcode_stage(context, remaining, already_filled=filled_so_far)
+            all_values += new_avs
+            filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
+            remaining = self._remaining_targets(targets, all_values)
+            if not remaining:
+                all_values += await self._run_finishing(context, targets, all_values)
+                all_values += await self._generate_annotation(context, targets, all_values)
+                return await self._finalize_async(all_values, targets, context)
+
+        # Stage 0.47: TitleCrossFillSource — verbatim enum/numeric extraction from title.
+        # Zero cost (no LLM, no network). Fires after BarcodeSource so barcode attrs
+        # are already excluded; runs before WbCardSource so it can pre-fill attrs
+        # that card-sources would otherwise consume a full network round-trip for.
+        if remaining:
+            new_avs = await self._run_title_cross_fill_stage(
+                context, remaining, already_filled=filled_so_far,
+            )
+            all_values += new_avs
+            filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
+            remaining = self._remaining_targets(targets, all_values)
+            if not remaining:
+                all_values += await self._run_finishing(context, targets, all_values)
+                all_values += await self._generate_annotation(context, targets, all_values)
+                return await self._finalize_async(all_values, targets, context)
 
         # Stage 0.45: WbCardSource — копия характеристик с похожего WB-товара
         # через бесплатный basket-API (БЕЗ Scrappey credits). Запускаем ПЕРВЫМ
@@ -2473,9 +2514,21 @@ class PipelineOrchestrator:
         # Off by default; enabled via LLM_KNOWLEDGE_ADVERSARIAL_ENABLED env flag
         # (name kept for back-compat; now gates both llm_knowledge and web_search).
         if os.environ.get("LLM_KNOWLEDGE_ADVERSARIAL_ENABLED", "0") == "1":
-            all_values = await self._run_llm_knowledge_adversarial_pass(
-                all_values, targets, context, filled_so_far,
+            # Force-websearch targets are explicitly trusted: exempt their WEB_SEARCH fills
+            # from the adversarial gate.  Dropping them + re-firing in finishing would be a
+            # real Serper double-charge and contradicts the intent of the force list.
+            _force_avs = [
+                v for v in all_values
+                if v.attribute_id in force_attr_ids and v.source == Source.WEB_SEARCH
+            ]
+            _non_force_avs = [
+                v for v in all_values
+                if not (v.attribute_id in force_attr_ids and v.source == Source.WEB_SEARCH)
+            ]
+            gated = await self._run_llm_knowledge_adversarial_pass(
+                _non_force_avs, targets, context, filled_so_far,
             )
+            all_values = gated + _force_avs
 
         # Stage 5: Finishing pass — focused re-extraction for empty required attributes
         all_values += await self._run_finishing(context, targets, all_values)
@@ -2927,6 +2980,61 @@ class PipelineOrchestrator:
                 )
         return results
 
+    async def _run_barcode_stage(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: Optional[list[AttributeValue]] = None,
+        source_text: Optional[str] = None,
+    ) -> list[AttributeValue]:
+        """Stage 0.46: BarcodeSource — verbatim EAN/barcode extractor.
+
+        Zero cost (no LLM, no network).  Deterministic checksum validation.
+        Errors do not interrupt the pipeline.
+        """
+        try:
+            extracted = await self._barcode.extract(
+                context, targets, already_filled=already_filled,
+                source_text=source_text,
+            )
+        except Exception as e:
+            logger.warning("[Pipeline] barcode_source failed: %s", e, exc_info=True)
+            return []
+        # BarcodeJudge is deterministic — always validate
+        results: list[AttributeValue] = []
+        for value in extracted:
+            try:
+                valid = await self._barcode.get_judge().validate(value, context)
+                if valid:
+                    results.append(value)
+            except Exception as e:
+                logger.warning(
+                    "[Pipeline] barcode judge failed for attr %s: %s",
+                    value.attribute_id, e,
+                )
+        return results
+
+    async def _run_title_cross_fill_stage(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: Optional[list[AttributeValue]] = None,
+    ) -> list[AttributeValue]:
+        """Stage 0.47: TitleCrossFillSource — verbatim enum/numeric from title.
+
+        Zero cost (no LLM, no network).  Deterministic: enum ambiguity guard
+        + unit-aware numeric extraction.  Errors do not interrupt the pipeline.
+        """
+        try:
+            extracted = await self._title_cross_fill.extract(
+                context, targets, already_filled=already_filled,
+            )
+        except Exception as e:
+            logger.warning("[Pipeline] title_cross_fill stage failed: %s", e, exc_info=True)
+            return []
+        # Judge is a deterministic passthrough — always accept
+        return extracted
+
     async def _run_tnved_stage(
         self,
         context: ExtractionContext,
@@ -3039,7 +3147,11 @@ class PipelineOrchestrator:
         )
 
         # Sources that require the gate.
-        _ADVERSARIAL_SOURCES = {Source.LLM_KNOWLEDGE, Source.WEB_SEARCH}
+        # COMPETITOR_RAG is consensus from similar products (NOT ground-truth per-product data).
+        # It must go through Track A for objective-spec attrs — "most speakers are stereo" would
+        # otherwise corroborate a wrong Звуковая схема=2.0 without any ground-truth evidence.
+        # For non-spec attrs it goes through Track B LLM Gate B like other guess-prone sources.
+        _ADVERSARIAL_SOURCES = {Source.LLM_KNOWLEDGE, Source.WEB_SEARCH, Source.COMPETITOR_RAG}
 
         target_by_id: dict[int, TargetAttribute] = {t.id: t for t in targets}
 
