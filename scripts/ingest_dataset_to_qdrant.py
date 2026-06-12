@@ -257,6 +257,11 @@ def parse_args() -> argparse.Namespace:
         help="Full ingest (no row limit). Overnight job — see module docstring for scale.",
     )
     p.add_argument(
+        "--limit", type=int, default=0, metavar="N",
+        help="Hard cap on rows ingested even in --full mode (0 = no cap). "
+             "Useful for Phase-1 proof runs: e.g. --full --limit 400000.",
+    )
+    p.add_argument(
         "--batch", type=int, default=256,
         help="Qdrant upsert batch size. Default: 256",
     )
@@ -1152,6 +1157,9 @@ def main() -> None:
 
     collection = args.collection
     limit = 0 if args.full else args.sample
+    # --limit overrides even --full; 0 means no cap
+    if args.full and args.limit:
+        limit = args.limit
 
     print("[Ingest] === Unified Dataset -> Qdrant ===")
     print(f"  dataset    : {args.dataset}")
@@ -1159,7 +1167,8 @@ def main() -> None:
         print(f"  category   : {args.amazon_category}")
     print(f"  collection : {collection}")
     print(f"  qdrant_url : {args.qdrant_url}")
-    print(f"  limit      : {'unlimited (--full)' if args.full else limit}")
+    limit_label = "unlimited (--full)" if args.full and not args.limit else str(limit)
+    print(f"  limit      : {limit_label}")
 
     # Validate-only mode: skip ingest, just query
     if args.validate_only:
