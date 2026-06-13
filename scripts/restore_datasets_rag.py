@@ -134,27 +134,41 @@ def list_hf_parquet_files(repo_id: str) -> list[str]:
 
 
 def download_parquet_file(repo_id: str, remote_path: str, local_path: Path) -> None:
-    """Download a single file from HF dataset repo."""
+    """Download a single file from HF dataset repo, with retries on network errors."""
     import urllib.request
+    import time as _t
     url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{remote_path}"
     headers = {}
     if HF_TOKEN:
         headers["Authorization"] = f"Bearer {HF_TOKEN}"
-    req = urllib.request.Request(url, headers=headers)
-    print(f"[restore] GET {url}")
-    with urllib.request.urlopen(req, timeout=300) as r:
-        total = 0
-        with open(local_path, "wb") as f:
-            while True:
-                chunk = r.read(4 * 1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                total += len(chunk)
-                mb = total / (1024 * 1024)
-                print(f"  {mb:.1f} MB", end="\r", flush=True)
-    size_mb = local_path.stat().st_size / (1024 * 1024)
-    print(f"\n  saved {local_path.name} ({size_mb:.1f} MB)")
+    last_err = None
+    for attempt in range(1, 7):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            print(f"[restore] GET {url} (attempt {attempt})")
+            with urllib.request.urlopen(req, timeout=300) as r:
+                total = 0
+                with open(local_path, "wb") as f:
+                    while True:
+                        chunk = r.read(4 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        total += len(chunk)
+                        print(f"  {total / (1024 * 1024):.1f} MB", end="\r", flush=True)
+            size_mb = local_path.stat().st_size / (1024 * 1024)
+            print(f"\n  saved {local_path.name} ({size_mb:.1f} MB)")
+            return
+        except Exception as e:  # noqa: BLE001 — retry any network/IO error
+            last_err = e
+            print(f"\n  [retry] download failed (attempt {attempt}/6): {e}")
+            try:
+                if local_path.exists():
+                    local_path.unlink()  # drop truncated partial before retry
+            except Exception:
+                pass
+            _t.sleep(min(30, 5 * attempt))
+    raise RuntimeError(f"download failed after 6 retries: {remote_path}: {last_err}")
 
 
 # ── Qdrant helpers ─────────────────────────────────────────────────────────────
