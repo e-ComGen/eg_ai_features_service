@@ -6,7 +6,7 @@
 #
 # Required env: HF_TOKEN, HF_REPO_ID
 # NO Qdrant is installed or started on the pod. Qdrant upsert happens locally.
-set -euo pipefail
+set -uo pipefail
 exec > >(tee -a /workspace/datasets_pod.log) 2>&1
 
 LOG=/workspace/datasets_pod.log
@@ -113,28 +113,32 @@ HF_TOKEN="${HF_TOKEN}" python3 /workspace/ingest_dataset_to_qdrant.py \
     --full \
     --limit 400000 \
     --encode-batch "${ENCODE_BATCH}" \
-    --out-parquet "${OUT}"
+    --out-parquet "${OUT}" \
+    || echo "[pod] WARN: off ingest failed, continuing"
 
 echo "[pod] === Phase-1: OBF (beauty) full → parquet ==="
 HF_TOKEN="${HF_TOKEN}" python3 /workspace/ingest_dataset_to_qdrant.py \
     --dataset obf \
     --full \
     --encode-batch "${ENCODE_BATCH}" \
-    --out-parquet "${OUT}"
+    --out-parquet "${OUT}" \
+    || echo "[pod] WARN: obf ingest failed, continuing"
 
 echo "[pod] === Phase-1: OPFF (pet food) full → parquet ==="
 HF_TOKEN="${HF_TOKEN}" python3 /workspace/ingest_dataset_to_qdrant.py \
     --dataset opff \
     --full \
     --encode-batch "${ENCODE_BATCH}" \
-    --out-parquet "${OUT}"
+    --out-parquet "${OUT}" \
+    || echo "[pod] WARN: opff ingest failed, continuing"
 
 echo "[pod] === Phase-1: IKEA full → parquet ==="
 HF_TOKEN="${HF_TOKEN}" python3 /workspace/ingest_dataset_to_qdrant.py \
     --dataset ikea \
     --full \
     --encode-batch "${ENCODE_BATCH}" \
-    --out-parquet "${OUT}"
+    --out-parquet "${OUT}" \
+    || echo "[pod] WARN: ikea ingest failed, continuing"
 
 # ── Summary of produced parquet files ────────────────────────────────────────
 echo "[pod] === parquet output summary ==="
@@ -149,21 +153,30 @@ print(total)
 " 2>/dev/null || echo "unknown")
 echo "[pod] total rows across all parquet shards: ${TOTAL_ROWS}"
 
-# ── Upload parquet/ shards to HF ──────────────────────────────────────────────
-echo "[pod] === upload parquet shards to HF ==="
+# ── Upload parquet/ shards + write DONE or FAILED marker ──────────────────────
+echo "[pod] === upload parquet shards to HF (or write FAILED marker) ==="
 python3 - <<PYEOF
-import os, pathlib
+import os, pathlib, datetime, sys
 from huggingface_hub import HfApi
 
 api = HfApi(token=os.environ["HF_TOKEN"])
 repo_id = os.environ["HF_REPO_ID"]
 out_dir = pathlib.Path("/workspace/out")
 files = sorted(out_dir.glob("file_*.parquet"))
+ts = datetime.datetime.utcnow().isoformat()
 
 if not files:
-    import sys
-    print("[pod] ERROR: no parquet files to upload", file=sys.stderr)
-    sys.exit(1)
+    print("[pod] ERROR: no parquet files produced by any dataset — writing FAILED_DATASETS marker.")
+    marker = f"FAILED at {ts}\nno parquet shards found in /workspace/out\n"
+    api.upload_file(
+        path_or_fileobj=marker.encode(),
+        path_in_repo="FAILED_DATASETS",
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message="FAILED marker — no parquet output",
+    )
+    print(f"[pod] FAILED_DATASETS uploaded at {ts}")
+    sys.exit(0)   # not a fatal error for the outer script; log is still uploaded
 
 print(f"[pod] uploading {len(files)} parquet file(s) to {repo_id} ...")
 for f in files:
@@ -178,6 +191,18 @@ for f in files:
         commit_message=f"parquet shard {f.name}",
     )
 print(f"[pod] all {len(files)} shards uploaded")
+
+# Write DONE_DATASETS marker
+total_rows = "${TOTAL_ROWS}"
+marker = f"DONE at {ts}\ntotal_rows={total_rows}\nshards={len(files)}\n"
+api.upload_file(
+    path_or_fileobj=marker.encode(),
+    path_in_repo="DONE_DATASETS",
+    repo_id=repo_id,
+    repo_type="dataset",
+    commit_message="DONE marker",
+)
+print(f"[pod] DONE_DATASETS uploaded at {ts}")
 PYEOF
 
 # ── Upload running log ─────────────────────────────────────────────────────────
@@ -193,24 +218,6 @@ HfApi(token=os.environ["HF_TOKEN"]).upload_file(
     commit_message="pod log (progress)",
 )
 print("[pod] log uploaded")
-PYEOF
-
-# ── DONE marker ───────────────────────────────────────────────────────────────
-echo "[pod] === upload DONE_DATASETS marker ==="
-python3 - <<PYEOF
-import os, datetime
-from huggingface_hub import HfApi
-api = HfApi(token=os.environ["HF_TOKEN"])
-ts = datetime.datetime.utcnow().isoformat()
-marker = f"DONE at {ts}\ntotal_rows={TOTAL_ROWS}\n"
-api.upload_file(
-    path_or_fileobj=marker.encode(),
-    path_in_repo="DONE_DATASETS",
-    repo_id=os.environ["HF_REPO_ID"],
-    repo_type="dataset",
-    commit_message="DONE marker",
-)
-print(f"[pod] DONE_DATASETS uploaded at {ts}")
 PYEOF
 
 echo "[pod] === ALL DONE at $(date) ==="

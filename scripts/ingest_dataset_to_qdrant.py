@@ -512,65 +512,264 @@ def _off_nutriments(nutriments: Any, max_keys: int = 8) -> dict:
     return out
 
 
-def stream_off(split: str, limit: int) -> Iterator[tuple[str, str, dict]]:
-    """Yield (point_id, embed_text, payload) for OFF/OBF rows."""
-    try:
-        from datasets import load_dataset  # type: ignore
-    except ImportError:
-        sys.exit("[Error] datasets not installed.")
+_OFF_NEEDED_COLUMNS = [
+    "product_name", "brands", "categories", "ingredients_text",
+    "quantity", "packaging", "nutriments", "code",
+]
 
-    source_id = "off" if split == "food" else "obf"
-    print(f"[{source_id.upper()}] Loading openfoodfacts/product-database split={split} streaming ...")
-    ds = load_dataset(
-        "openfoodfacts/product-database",
-        split=split,
-        streaming=True,
-        token=HF_TOKEN or None,
+
+def _list_off_parquet_shards(split: str) -> list[str]:
+    """Return sorted HF parquet shard URLs for the given openfoodfacts split.
+
+    Primary: HF datasets-server parquet API — queries config=default, filters by split.
+    Fallback 1: list_repo_files on refs/convert/parquet branch.
+    Fallback 2: list_repo_files on main (repo-level .parquet files like food.parquet).
+    """
+    import urllib.request as _req
+    import json as _json
+
+    # Primary: datasets-server API (no auth required for public repos).
+    # Config is 'default'; filter by split name.
+    api_url = (
+        "https://datasets-server.huggingface.co/parquet"
+        "?dataset=openfoodfacts%2Fproduct-database"
+    )
+    try:
+        with _req.urlopen(api_url, timeout=30) as resp:
+            data = _json.loads(resp.read())
+        urls = [
+            p["url"] for p in data.get("parquet_files", [])
+            if p.get("url") and p.get("split") == split
+        ]
+        if urls:
+            print(f"[OFF/OBF] Found {len(urls)} shard URL(s) via datasets-server API for split={split}.")
+            return sorted(urls)
+        print(f"[OFF/OBF] datasets-server returned 0 shards for split={split}, trying fallbacks.")
+    except Exception as e:
+        print(f"[OFF/OBF] datasets-server API failed ({e}), falling back to list_repo_files.")
+
+    # Fallback 1: converted parquet branch (refs/convert/parquet), path default/{split}/*.parquet
+    try:
+        from huggingface_hub import list_repo_files  # type: ignore
+        prefix = f"default/{split}/"
+        paths = [
+            (
+                f"https://huggingface.co/datasets/openfoodfacts/product-database"
+                f"/resolve/refs%2Fconvert%2Fparquet/{p}"
+            )
+            for p in list_repo_files(
+                "openfoodfacts/product-database",
+                repo_type="dataset",
+                revision="refs/convert/parquet",
+                token=HF_TOKEN or None,
+            )
+            if p.startswith(prefix) and p.endswith(".parquet")
+        ]
+        if paths:
+            print(f"[OFF/OBF] Found {len(paths)} shard(s) via refs/convert/parquet for split={split}.")
+            return sorted(paths)
+    except Exception as e:
+        print(f"[OFF/OBF] refs/convert/parquet fallback failed: {e}")
+
+    # Fallback 2: root-level repo file e.g. food.parquet / beauty.parquet
+    try:
+        from huggingface_hub import list_repo_files  # type: ignore
+        all_files = list(list_repo_files(
+            "openfoodfacts/product-database",
+            repo_type="dataset",
+            token=HF_TOKEN or None,
+        ))
+        # food split → food.parquet (or food-*.parquet shards)
+        matching = [
+            f for f in all_files
+            if f.endswith(".parquet") and f.startswith(split)
+        ]
+        if matching:
+            base = (
+                "https://huggingface.co/datasets/openfoodfacts/product-database/resolve/main/"
+            )
+            urls = [f"{base}{f}" for f in sorted(matching)]
+            print(f"[OFF/OBF] Found {len(urls)} root-level shard(s) for split={split}.")
+            return urls
+    except Exception as e:
+        print(f"[OFF/OBF] root-level list_repo_files fallback failed: {e}")
+
+    raise RuntimeError(
+        f"Could not enumerate parquet shards for openfoodfacts/product-database split={split}. "
+        "Check network connectivity and HF_TOKEN."
     )
 
+
+def _open_off_parquet_file(shard_path: str) -> "pyarrow.parquet.ParquetFile":  # type: ignore[name-defined]
+    """Open a ParquetFile handle for the given shard path.
+
+    For HTTPS URLs the file is downloaded to a NamedTemporaryFile so that
+    pyarrow can seek within it (required for row-group iteration).
+    The caller is responsible for closing the temp file if one was created.
+    Returns (pq_file, tmp_file_or_None).
+    """
+    import pyarrow.parquet as pq  # type: ignore
+
+    if shard_path.startswith("hf://"):
+        from huggingface_hub import HfFileSystem  # type: ignore
+        hf_fs = HfFileSystem(token=HF_TOKEN or None)
+        bare = shard_path[len("hf://"):]
+        # HfFileSystem returns a seekable file object — pass directly
+        fobj = hf_fs.open(bare, "rb")
+        return pq.ParquetFile(fobj), fobj
+    elif shard_path.startswith("https://"):
+        import tempfile
+        import urllib.request as _req
+        req = _req.Request(shard_path, headers={"User-Agent": "eg-ingest/1.0"})
+        if HF_TOKEN:
+            req.add_header("Authorization", f"Bearer {HF_TOKEN}")
+        tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False)
+        try:
+            with _req.urlopen(req, timeout=600) as resp:
+                while True:
+                    chunk = resp.read(1 << 20)  # 1 MB chunks
+                    if not chunk:
+                        break
+                    tmp.write(chunk)
+            tmp.flush()
+            tmp.seek(0)
+            return pq.ParquetFile(tmp.name), tmp
+        except Exception:
+            tmp.close()
+            import os as _os
+            _os.unlink(tmp.name)
+            raise
+    else:
+        return pq.ParquetFile(shard_path), None
+
+
+def _iter_off_shard_rows(
+    shard_path: str,
+    source_tag: str,
+) -> Iterator[tuple[str, str, dict]]:
+    """Yield mapped (point_id, embed_text, payload) rows from one OFF/OBF parquet shard.
+
+    Uses row-group iteration so only ~50k rows are in memory at once even for the
+    3.9M-row food.parquet. Missing columns in any row group are filled with None.
+    """
+    import pyarrow as pa  # type: ignore
+
+    pq_file, handle = _open_off_parquet_file(shard_path)
+    try:
+        meta = pq_file.metadata
+        n_groups = meta.num_row_groups
+        n_rows_total = meta.num_rows
+        print(f"  [{source_tag}] {n_rows_total:,} rows, {n_groups} row group(s)")
+
+        for rg_idx in range(n_groups):
+            # Read one row group at a time — tolerant of per-group schema drift
+            try:
+                batch: pa.Table = pq_file.read_row_group(rg_idx)
+            except Exception as e:
+                print(f"  [{source_tag}] WARNING: row group {rg_idx} read failed "
+                      f"({type(e).__name__}: {e}) — skipping.")
+                continue
+
+            existing = set(batch.schema.names)
+            # Build per-row-group column arrays, filling missing with None-typed nulls
+            col_arrays = {}
+            for col in _OFF_NEEDED_COLUMNS:
+                if col in existing:
+                    col_arrays[col] = batch.column(col)
+                else:
+                    col_arrays[col] = pa.nulls(len(batch), type=pa.null())
+
+            for i in range(len(batch)):
+                row = {col: col_arrays[col][i].as_py() for col in _OFF_NEEDED_COLUMNS}
+
+                name = _off_product_name(row)
+                if not name:
+                    continue
+
+                brands = _str(row.get("brands"), 200)
+                categories = _str(row.get("categories"), 400)
+                ingredients = _off_ingredients(row)
+                quantity = _str(row.get("quantity"), 100)
+                packaging = _str(row.get("packaging"), 200)
+                nutriments_dict = _off_nutriments(row.get("nutriments"))
+                code = _str(row.get("code"), 50)
+
+                embed_text = " | ".join(p for p in [
+                    name, brands, categories[:200], ingredients[:200]
+                ] if p)
+
+                characteristics: dict = {}
+                if ingredients:
+                    characteristics["Состав"] = [ingredients]
+                if brands:
+                    characteristics["Бренд"] = [brands]
+                if quantity:
+                    characteristics["Количество"] = [quantity]
+                if packaging:
+                    characteristics["Упаковка"] = [packaging]
+                for k, v in nutriments_dict.items():
+                    characteristics[k] = [v]
+
+                point_id = _stable_uuid(source_tag, code) if code else _hash_uuid(embed_text)
+
+                payload = {
+                    "name": name,
+                    "categories": categories,
+                    "characteristics": _encode_characteristics(characteristics),
+                    "source": source_tag,
+                }
+
+                yield point_id, embed_text, payload
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        # Clean up temp file for HTTPS downloads
+        if shard_path.startswith("https://") and handle is not None:
+            import os as _os
+            try:
+                _os.unlink(handle.name)
+            except Exception:
+                pass
+
+
+def stream_off(split: str, limit: int) -> Iterator[tuple[str, str, dict]]:
+    """Yield (point_id, embed_text, payload) for OFF/OBF rows.
+
+    Uses pyarrow ParquetFile row-group iteration (not datasets streaming) so that
+    schema drift across row groups and shards no longer crashes the run.
+    Each row group is read independently; missing columns are filled with None.
+    """
+    try:
+        import pyarrow  # noqa: F401 — ensure pyarrow is present early
+    except ImportError:
+        sys.exit("[Error] pyarrow not installed — required for OFF/OBF shard loading.")
+
+    source_id = "off" if split == "food" else "obf"
+    print(f"[{source_id.upper()}] Enumerating parquet shards for split={split} ...")
+
+    try:
+        shard_paths = _list_off_parquet_shards(split)
+    except Exception as e:
+        sys.exit(f"[{source_id.upper()}] Fatal: could not enumerate shards: {e}")
+
     count = 0
-    for row in ds:
+    for shard_idx, shard_path in enumerate(shard_paths):
         if limit and count >= limit:
             break
-        name = _off_product_name(row)
-        if not name:
-            continue
-
-        brands = _str(row.get("brands"), 200)
-        categories = _str(row.get("categories"), 400)
-        ingredients = _off_ingredients(row)
-        quantity = _str(row.get("quantity"), 100)
-        packaging = _str(row.get("packaging"), 200)
-        nutriments_dict = _off_nutriments(row.get("nutriments"))
-        code = _str(row.get("code"), 50)
-
-        embed_text = " | ".join(p for p in [
-            name, brands, categories[:200], ingredients[:200]
-        ] if p)
-
-        characteristics = {}
-        if ingredients:
-            characteristics["Состав"] = [ingredients]
-        if brands:
-            characteristics["Бренд"] = [brands]
-        if quantity:
-            characteristics["Количество"] = [quantity]
-        if packaging:
-            characteristics["Упаковка"] = [packaging]
-        for k, v in nutriments_dict.items():
-            characteristics[k] = [v]
-
-        point_id = _stable_uuid(source_id, code) if code else _hash_uuid(embed_text)
-
-        payload = {
-            "name": name,
-            "categories": categories,
-            "characteristics": _encode_characteristics(characteristics),
-            "source": source_id,
-        }
-
-        yield point_id, embed_text, payload
-        count += 1
+        print(f"[{source_id.upper()}] Shard {shard_idx + 1}/{len(shard_paths)}: "
+              f"{shard_path.split('/')[-1]} ...")
+        try:
+            for point_id, embed_text, payload in _iter_off_shard_rows(shard_path, source_id):
+                if limit and count >= limit:
+                    break
+                yield point_id, embed_text, payload
+                count += 1
+        except Exception as e:
+            print(f"[{source_id.upper()}] WARNING: shard {shard_path.split('/')[-1]} failed "
+                  f"({type(e).__name__}: {e}) — skipping.")
 
 
 # ── Open Pet Food Facts adapter ───────────────────────────────────────────────
