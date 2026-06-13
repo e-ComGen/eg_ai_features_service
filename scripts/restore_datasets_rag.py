@@ -133,42 +133,54 @@ def list_hf_parquet_files(repo_id: str) -> list[str]:
     return []
 
 
+def _valid_parquet(path: Path) -> bool:
+    """Cheap integrity check: a real parquet ends with the 'PAR1' magic footer."""
+    try:
+        if path.stat().st_size < 8:
+            return False
+        with open(path, "rb") as fh:
+            fh.seek(-4, 2)
+            return fh.read(4) == b"PAR1"
+    except Exception:
+        return False
+
+
 def download_parquet_file(repo_id: str, remote_path: str, local_path: Path) -> None:
-    """Download a single file from HF dataset repo, with retries on network errors."""
-    import urllib.request
+    """Download via huggingface_hub (validates size/etag + retries) + a PAR1 footer
+    check, retried. Avoids silently-truncated files that a plain urllib stream allowed."""
+    import shutil
     import time as _t
-    url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{remote_path}"
-    headers = {}
-    if HF_TOKEN:
-        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+    from huggingface_hub import hf_hub_download
+
     last_err = None
-    for attempt in range(1, 7):
+    for attempt in range(1, 6):
         try:
-            req = urllib.request.Request(url, headers=headers)
-            print(f"[restore] GET {url} (attempt {attempt})")
-            with urllib.request.urlopen(req, timeout=300) as r:
-                total = 0
-                with open(local_path, "wb") as f:
-                    while True:
-                        chunk = r.read(4 * 1024 * 1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        total += len(chunk)
-                        print(f"  {total / (1024 * 1024):.1f} MB", end="\r", flush=True)
+            print(f"[restore] download {remote_path} (attempt {attempt})", flush=True)
+            got = hf_hub_download(
+                repo_id=repo_id,
+                filename=remote_path,
+                repo_type="dataset",
+                token=(HF_TOKEN or None),
+                local_dir=str(local_path.parent),
+            )
+            got_p = Path(got)
+            if got_p.resolve() != local_path.resolve():
+                shutil.move(str(got_p), str(local_path))
+            if not _valid_parquet(local_path):
+                raise ValueError("downloaded file failed PAR1 footer check (truncated/corrupt)")
             size_mb = local_path.stat().st_size / (1024 * 1024)
-            print(f"\n  saved {local_path.name} ({size_mb:.1f} MB)")
+            print(f"  saved {local_path.name} ({size_mb:.1f} MB)")
             return
-        except Exception as e:  # noqa: BLE001 — retry any network/IO error
+        except Exception as e:  # noqa: BLE001 — retry any network/IO/validation error
             last_err = e
-            print(f"\n  [retry] download failed (attempt {attempt}/6): {e}")
+            print(f"  [retry] download failed (attempt {attempt}/5): {e}", flush=True)
             try:
                 if local_path.exists():
-                    local_path.unlink()  # drop truncated partial before retry
+                    local_path.unlink()
             except Exception:
                 pass
             _t.sleep(min(30, 5 * attempt))
-    raise RuntimeError(f"download failed after 6 retries: {remote_path}: {last_err}")
+    raise RuntimeError(f"download failed after 5 retries: {remote_path}: {last_err}")
 
 
 # ── Qdrant helpers ─────────────────────────────────────────────────────────────
