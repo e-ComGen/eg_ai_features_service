@@ -156,18 +156,20 @@ def download_parquet_file(repo_id: str, remote_path: str, local_path: Path) -> N
     for attempt in range(1, 6):
         try:
             print(f"[restore] download {remote_path} (attempt {attempt})", flush=True)
+            # Download into the HF cache (validated by size/etag); force_download on
+            # retry bypasses any bad cached blob. Then copy (overwrite) to local_path.
             got = hf_hub_download(
                 repo_id=repo_id,
                 filename=remote_path,
                 repo_type="dataset",
                 token=(HF_TOKEN or None),
-                local_dir=str(local_path.parent),
+                force_download=(attempt > 1),
             )
-            got_p = Path(got)
-            if got_p.resolve() != local_path.resolve():
-                shutil.move(str(got_p), str(local_path))
+            if not _valid_parquet(Path(got)):
+                raise ValueError("cached file failed PAR1 footer check (truncated/corrupt)")
+            shutil.copyfile(got, local_path)  # always overwrites local_path
             if not _valid_parquet(local_path):
-                raise ValueError("downloaded file failed PAR1 footer check (truncated/corrupt)")
+                raise ValueError("copied file failed PAR1 footer check")
             size_mb = local_path.stat().st_size / (1024 * 1024)
             print(f"  saved {local_path.name} ({size_mb:.1f} MB)")
             return
