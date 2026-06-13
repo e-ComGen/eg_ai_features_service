@@ -1,20 +1,28 @@
 """Restore datasets_rag collection from HF parquet shards to local Qdrant.
 
 NEW APPROACH (no snapshot, no qdrant-on-pod):
-  1. Download parquet/*.parquet from HF dataset repo.
+  1. Download parquet_all/*.parquet from HF dataset repo.
+     Files use unique names: <dataset>_file_NNNN.parquet
+     (e.g. off_file_0000.parquet, abo_file_0000.parquet) so all 9 datasets
+     coexist without name collisions — this was the root cause of the Phase-1/2
+     overwrite bug where all datasets shared the same output dir.
   2. (Re)create local Qdrant collection `datasets_rag` (localhost:6333)
      with 384-d Cosine, on_disk vectors + HNSW + payload (low-RAM safeguard).
   3. Upsert all points in batches, reading vector+payload from parquet.
   4. Verify: print point count + run a sample vector query.
 
 Idempotent: safe to re-run; existing points are overwritten by upsert-by-id.
-Use --recreate to drop the collection before upsert (full rebuild).
+Use --recreate to drop the collection before upsert (clean complete rebuild).
 
 Usage (from WSL or Windows terminal):
     python scripts/restore_datasets_rag.py [--hf-repo USER/REPO] [--recreate] [--verify-only]
 
+    # Full clean rebuild from all 9 datasets (recommended after runpod_spawn_datasets_all.py):
+    python scripts/restore_datasets_rag.py --recreate
+
 Reads HF_TOKEN + HF_REPO_ID from .env or environment.
-Reads hf_repo_id from scripts/.runpod_datasets_state.json if --hf-repo not given.
+Reads hf_repo_id from scripts/.runpod_datasets_all_state.json (or legacy
+.runpod_datasets_state.json) if --hf-repo not given.
 """
 from __future__ import annotations
 
@@ -37,7 +45,9 @@ QDRANT_URL: str = os.environ.get("QDRANT_URL", "http://localhost:6333")
 COLLECTION = "datasets_rag"
 VECTOR_DIM = 384
 UPSERT_BATCH = 1000
-STATE_FILE = PROJECT_ROOT / "scripts" / ".runpod_datasets_state.json"
+# Prefer the new all-datasets state file; fall back to legacy phase-1 state.
+STATE_FILE = PROJECT_ROOT / "scripts" / ".runpod_datasets_all_state.json"
+STATE_FILE_LEGACY = PROJECT_ROOT / "scripts" / ".runpod_datasets_state.json"
 
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
@@ -74,12 +84,13 @@ def resolve_hf_repo(args: argparse.Namespace) -> str:
     env_val = os.environ.get("HF_REPO_ID", "")
     if env_val:
         return env_val
-    if STATE_FILE.exists():
-        d = json.loads(STATE_FILE.read_text())
-        repo = d.get("hf_repo_id", "")
-        if repo:
-            print(f"[restore] hf_repo_id from state: {repo}")
-            return repo
+    for sf in (STATE_FILE, STATE_FILE_LEGACY):
+        if sf.exists():
+            d = json.loads(sf.read_text())
+            repo = d.get("hf_repo_id", "")
+            if repo:
+                print(f"[restore] hf_repo_id from state ({sf.name}): {repo}")
+                return repo
     sys.exit(
         "[restore] ERROR: cannot determine HF repo id.\n"
         "  Pass --hf-repo USER/REPO, or set HF_REPO_ID env, "
@@ -88,15 +99,38 @@ def resolve_hf_repo(args: argparse.Namespace) -> str:
 
 
 def list_hf_parquet_files(repo_id: str) -> list[str]:
-    """Return list of filenames under parquet/ in the HF dataset."""
+    """Return list of filenames under parquet_all/ in the HF dataset.
+
+    parquet_all/ contains uniquely-named shards produced by
+    runpod_pod_runner_datasets_all.sh, e.g.:
+      off_file_0000.parquet, obf_file_0000.parquet, abo_file_0000.parquet …
+    Unlike the old parquet/ folder (phase-1/2 runs), names never collide here.
+    Falls back to legacy parquet/ prefix if parquet_all/ is empty (old runs).
+    """
     try:
         from huggingface_hub import HfApi  # type: ignore
     except ImportError:
         sys.exit("[restore] huggingface_hub not installed: pip install huggingface_hub")
     api = HfApi(token=HF_TOKEN or None)
-    files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
-    parquet_files = [f for f in files if f.startswith("parquet/") and f.endswith(".parquet")]
-    return sorted(parquet_files)
+    files = list(api.list_repo_files(repo_id=repo_id, repo_type="dataset"))
+
+    # Primary: parquet_all/ (new all-in-one runner)
+    parquet_all = sorted(f for f in files if f.startswith("parquet_all/") and f.endswith(".parquet"))
+    if parquet_all:
+        print(f"[restore] Using parquet_all/ ({len(parquet_all)} shards, unique per-dataset names).")
+        return parquet_all
+
+    # Legacy fallback: parquet/ (phase-1 / phase-2 old runs)
+    legacy = sorted(f for f in files if f.startswith("parquet/") and f.endswith(".parquet"))
+    if legacy:
+        print(
+            f"[restore] WARNING: parquet_all/ empty — falling back to legacy parquet/ "
+            f"({len(legacy)} shards). These may be incomplete due to the overwrite bug. "
+            "Run runpod_spawn_datasets_all.py for a complete rebuild."
+        )
+        return legacy
+
+    return []
 
 
 def download_parquet_file(repo_id: str, remote_path: str, local_path: Path) -> None:
@@ -355,8 +389,10 @@ def main() -> None:
     remote_files = list_hf_parquet_files(hf_repo_id)
     if not remote_files:
         sys.exit(
-            f"[restore] ERROR: no parquet files found under parquet/ in {hf_repo_id}.\n"
-            "  The pod job may not have finished yet — check DONE_DATASETS marker on HF."
+            f"[restore] ERROR: no parquet files found under parquet_all/ (or legacy parquet/) "
+            f"in {hf_repo_id}.\n"
+            "  The pod job may not have finished yet — check DONE_ALL (or DONE_DATASETS) "
+            "marker on HF."
         )
     print(f"[restore] Found {len(remote_files)} parquet file(s):")
     for rf in remote_files:
