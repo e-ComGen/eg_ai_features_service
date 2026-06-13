@@ -265,8 +265,9 @@ echo "[pod-all] total rows: ${TOTAL_ROWS}"
 # ── Upload all shards to HF parquet_all/ with unique names ────────────────────
 # Name format: <subdir>_<filename>  e.g. off_file_0000.parquet, abo_file_0000.parquet
 echo "[pod-all] === upload all shards to HF parquet_all/ ==="
-python3 - <<PYEOF
+python3 - <<'PYEOF'
 import os, pathlib, datetime, sys
+import pyarrow.parquet as pq
 from huggingface_hub import HfApi
 
 api = HfApi(token=os.environ["HF_TOKEN"])
@@ -298,10 +299,17 @@ if not all_shards:
     sys.exit(0)
 
 print(f"[pod-all] uploading {len(all_shards)} parquet shard(s) to {repo_id}/parquet_all/ ...")
+total_rows = 0
 for shard_path, unique_name in all_shards:
     dest = f"parquet_all/{unique_name}"
     size_mb = shard_path.stat().st_size / (1024 * 1024)
-    print(f"  {shard_path.relative_to(out_root)}  ({size_mb:.1f} MB) -> {dest}")
+    try:
+        meta = pq.read_metadata(str(shard_path))
+        rows = meta.num_rows
+        total_rows += rows
+    except Exception:
+        rows = "?"
+    print(f"  {shard_path.relative_to(out_root)}  ({size_mb:.1f} MB, {rows} rows) -> {dest}")
     api.upload_file(
         path_or_fileobj=str(shard_path),
         path_in_repo=dest,
@@ -311,8 +319,7 @@ for shard_path, unique_name in all_shards:
     )
 print(f"[pod-all] all {len(all_shards)} shards uploaded to parquet_all/")
 
-# Write DONE_ALL marker
-total_rows = "${TOTAL_ROWS}"
+# Write DONE_ALL marker — Python computes summary, no shell interpolation
 subdirs_done = sorted(set(s[1].split("_file_")[0] for s in all_shards))
 marker = (
     f"DONE at {ts}\n"
