@@ -56,6 +56,12 @@ OPENAI_FALLBACK_MODEL_VISION: str = os.getenv("OPENAI_FALLBACK_MODEL_VISION", "g
 # Используется ТОЛЬКО когда response_model.__has_enum_constraints__ == True.
 # $0.40 input / $1.60 output per 1M tokens — дороже DeepSeek, но без retries.
 OPENAI_STRUCTURED_MODEL: str = os.getenv("OPENAI_STRUCTURED_MODEL", "gpt-4.1-mini")
+# Toggle for routing enum-heavy extraction through OpenAI strict mode.
+# When false, get_openai_strict_manager() returns None and enum extraction falls
+# back to the main provider (DeepSeek). Set false while the OpenAI quota is dead
+# (a present-but-429 key otherwise routes strict calls into a dead provider with
+# no fallback → sources return []). Restore to true when OpenAI quota returns.
+USE_OPENAI_STRICT: bool = os.getenv("USE_OPENAI_STRICT", "true").lower() in ("1", "true", "yes")
 
 # Vague / placeholder feature names that must NEVER trigger an LLM call.
 # These are operator-defined placeholders (e.g. "NewFeature" from CS-Cart's
@@ -87,6 +93,24 @@ VAGUE_FEATURE_PATTERNS = [
 USE_NEW_PIPELINE: bool = os.getenv("USE_NEW_PIPELINE", "false").lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
+# Feature flag: bypass the prompt-tree (TreeRouter) verification — EXPLICIT,
+# decoupled from USE_NEW_PIPELINE so "do we route through the owner's prompt-
+# tree" is its own reversible switch.
+# ---------------------------------------------------------------------------
+# True  (current default, owner decision 2026-06-16) = BYPASS the prompt-tree.
+#   The cost-aware source-merge pipeline fills attributes and the deterministic
+#   UNIVERSAL_VERIFY gate (+ LLM judge once re-enabled) acts as an after-the-
+#   fact guard. This is a STOPGAP — it CURES hallucinations after generation
+#   (unit-sanity / country-rule / evidence-self-admission = band-aids).
+# False (the PROPER future investment) = route values through the prompt-tree's
+#   crafted per-leaf prompts so hallucinations are PREVENTED at generation and
+#   never arise. NOT yet wired into the source-merge pipeline; flipping False
+#   today is a no-op fallback to bypass + a logged TODO until that lands.
+# Kept ON now: defer the tree investment, keep the stopgap, but the bypass is
+# now an explicit conscious toggle instead of zashitое behaviour.
+BYPASS_PROMPT_TREE: bool = os.getenv("BYPASS_PROMPT_TREE", "true").lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
 # Scrapfly — last-resort Ozon card gap-filler
 # ---------------------------------------------------------------------------
 # API key: read SCRAPFLY_API_KEY (canonical) or the legacy SCRAPFLY_KEY env var.
@@ -97,6 +121,17 @@ SCRAPFLY_API_KEY: str = os.getenv("SCRAPFLY_API_KEY", "") or os.getenv("SCRAPFLY
 # Enable via env: SCRAPFLY_OZON_FALLBACK_ENABLED=true (or "1" / "yes").
 SCRAPFLY_OZON_FALLBACK_ENABLED: bool = os.getenv(
     "SCRAPFLY_OZON_FALLBACK_ENABLED", "false"
+).lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
+# Lamoda Scrapfly — last-resort clothing attribute gap-filler
+# ---------------------------------------------------------------------------
+# Fetches attributes from Lamoda product cards via Scrapfly (residential proxy,
+# DataDome bypass). Pre-gated by LLM "is this clothing?" classifier — non-clothing
+# products pay zero Scrapfly credits. Cost: 30 credits/product + 1 Serper call.
+# Default OFF — set LAMODA_SCRAPFLY_ENABLED=true to enable.
+LAMODA_SCRAPFLY_ENABLED: bool = os.getenv(
+    "LAMODA_SCRAPFLY_ENABLED", "false"
 ).lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
@@ -112,6 +147,36 @@ SCRAPFLY_OZON_FALLBACK_ENABLED: bool = os.getenv(
 SAFE_LLM_ENUM_FILL_ENABLED: bool = os.getenv(
     "SAFE_LLM_ENUM_FILL_ENABLED", "false"
 ).lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
+# TnvedSource authoritative fix — drop LLM/web garbage codes before merge
+# ---------------------------------------------------------------------------
+# When True (default), values for ТН ВЭД attributes from LLM_KNOWLEDGE or
+# WEB_SEARCH are dropped before _finalize unless they came from TnvedSource
+# (identified by evidence prefix "tnved_resolver:").  TnvedSource itself uses
+# LLM_KNOWLEDGE but produces a validated 10-digit code via per-category prompt
+# — its fills are deliberately preserved.  Set TNVED_SOURCE_FIX_ENABLED=false
+# to revert to the old behaviour (web_search wins with garbage codes).
+TNVED_SOURCE_FIX_ENABLED: bool = os.getenv(
+    "TNVED_SOURCE_FIX_ENABLED", "true"
+).lower() not in ("0", "false", "no")
+
+# ---------------------------------------------------------------------------
+# Unit normalization for card-sourced values — deterministic, data-driven
+# ---------------------------------------------------------------------------
+# WB/Ozon card extraction maps a spec line to an attribute by fuzzy NAME match
+# without checking unit compatibility, so a value with its own unit ("5.4 см")
+# can land in a field that declares a different one ("Ширина, мм"). When True
+# (default), WbCardSource losslessly converts such EXPLICIT-explicit, same-
+# dimension mismatches (5.4 см → 54) BEFORE value_id resolution. The conversion
+# table is data — app/services/enrichment/strategies/dictionaries/data/
+# unit_conversions.json — and only fires on an unambiguous scalar with explicit
+# units on both sides (bare numbers, ranges, lists, cross-dimension are left
+# untouched). Arithmetic only, no LLM. Set UNIT_NORMALIZE_ENABLED=false to
+# revert to raw card values.
+UNIT_NORMALIZE_ENABLED: bool = os.getenv(
+    "UNIT_NORMALIZE_ENABLED", "true"
+).lower() not in ("0", "false", "no")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set in environment (.env)")

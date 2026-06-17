@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from collections import OrderedDict
 from typing import Any, Optional, Union
@@ -79,8 +80,12 @@ from app.services.enrichment.strategies.dictionaries.ozon_loader import (
 from app.services.enrichment.strategies.dictionaries.eg_wb_ozon_field_map import (
     eg_get_field_map,
 )
+from app.services.enrichment.strategies.dictionaries.unit_normalizer import (
+    normalize_value as _normalize_unit_value,
+)
 from app.services.enrichment.size_normalizer import extract_wb_sizes
 from app.services.providers.factory import get_web_search_client
+from app.services.enrichment.sources.donor_gate import DonorMatchGate
 
 logger = logging.getLogger(__name__)
 
@@ -301,7 +306,22 @@ def _eg_is_permanent_4xx(exc: BaseException) -> bool:
 # Сколько card.json реально скачать прежде чем выбирать лучший. Многие nm_id
 # архивные/несуществующие → 404 по всем basket. Перебираем кандидатов по порядку,
 # но останавливаемся, набрав _MAX_FETCHED_CARDS успешно скачанных карточек.
-_MAX_FETCHED_CARDS = 8
+_MAX_FETCHED_CARDS = int(os.getenv("WB_CARD_MAX_FETCHED", "8"))
+
+# Inject WB card photos into context.image_urls for downstream VisionSource.
+# Default on (preserves eval behaviour). Set WB_CARD_INJECT_IMAGES=false to
+# suppress the Vision trigger (its per-product LLM call is the main latency hit)
+# in latency-bounded deployments like the importer worker.
+_INJECT_IMAGES = os.getenv("WB_CARD_INJECT_IMAGES", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# Lossless unit normalization of card scalar values before value_id resolution.
+# Fixes the fuzzy-name-match-without-unit-check class ("5.4 см" → field "…, мм").
+# Set UNIT_NORMALIZE_ENABLED=false to emit raw card values. See unit_normalizer.
+_UNIT_NORMALIZE_ENABLED = os.getenv(
+    "UNIT_NORMALIZE_ENABLED", "true"
+).strip().lower() not in ("0", "false", "no")
 
 # Карточка считается «богатой» если у неё ≥ _RICH_OPTIONS_THRESHOLD полезных
 # options. При сопоставимом матч-скоре богатую предпочитаем бедной.
@@ -321,6 +341,15 @@ _CONF_GENDER_DOWNWEIGHT = 0.40
 
 _EXACT_THRESHOLD = 78.0
 _BRAND_LINE_THRESHOLD = 60.0
+
+# Standalone short integer tokens acting as a model index ("Series 9",
+# "Mi Band 8", "Nordman 8") — captured even as a single digit, which
+# _extract_model_tokens (needs an embedded digit + len ≥ 3) misses. Excludes
+# numbers glued to '.', ',', '/' or other digits so sizes ("205/55", "1.62")
+# and codes don't leak in. Used to spot a wrong donor that base fuzzy alone
+# pushed to an "exact" score without sharing the model index (Mi Band 8 → a
+# Mi Band 7 card at 78.2).
+_STD_MODEL_NUM_RE = re.compile(r"(?<![\d.,/])\b\d{1,3}\b(?![\d.,/])")
 
 # Semantic attr-name fallback (step 5 of _map_characteristics).
 # Cosine similarity threshold for WB char name ↔ Ozon target attr name.
@@ -689,6 +718,8 @@ class WbCardSource(AttributeSource):
         self._judge = WbCardJudge()
         # LRU cache: (brand_lower, model_lower) → list[AttributeValue]
         self._cache: "OrderedDict[tuple[str, str], list[AttributeValue]]" = OrderedDict()
+        # LLM-гейт «тот же товар» для brand_line-доноров (score 60-78)
+        self._donor_gate = DonorMatchGate()
 
     @property
     def source_type(self) -> Source:
@@ -818,17 +849,46 @@ class WbCardSource(AttributeSource):
                                 "title='%s' nm=%s",
                                 mode, score, title[:80], nm_id,
                             )
-                            chars = self._extract_options(card)
-                            if chars:
-                                new_image_urls = self._extract_image_urls(card, nm_id)
-                                if new_image_urls:
-                                    existing = set(context.image_urls or [])
-                                    added = [u for u in new_image_urls if u not in existing]
-                                    if added:
-                                        context.image_urls = list(context.image_urls or []) + added
-                                return self._map_characteristics(
-                                    chars, targets, context, mode, title, score, card,
+                            # LLM donor-gate: brand_line + exact-с-расхождением
+                            # модель-индекса (donor беднее/другой модели). Чистый
+                            # exact (общий модель-индекс) → доверяем без LLM.
+                            if self._should_run_donor_gate(mode, full_name, title):
+                                same = await self._donor_gate.is_same_product(
+                                    full_name, title
                                 )
+                                if not same:
+                                    logger.info(
+                                        "[WbCard] DonorGate DIFFERENT (article-path) "
+                                        "target='%s' donor='%s' — skip",
+                                        full_name[:60], title[:60],
+                                    )
+                                    # fall through to title-based path below
+                                else:
+                                    chars = self._extract_options(card)
+                                    if chars:
+                                        if _INJECT_IMAGES:
+                                            new_image_urls = self._extract_image_urls(card, nm_id)
+                                            if new_image_urls:
+                                                existing = set(context.image_urls or [])
+                                                added = [u for u in new_image_urls if u not in existing]
+                                                if added:
+                                                    context.image_urls = list(context.image_urls or []) + added
+                                        return self._map_characteristics(
+                                            chars, targets, context, mode, title, score, card,
+                                        )
+                            else:
+                                chars = self._extract_options(card)
+                                if chars:
+                                    if _INJECT_IMAGES:
+                                        new_image_urls = self._extract_image_urls(card, nm_id)
+                                        if new_image_urls:
+                                            existing = set(context.image_urls or [])
+                                            added = [u for u in new_image_urls if u not in existing]
+                                            if added:
+                                                context.image_urls = list(context.image_urls or []) + added
+                                    return self._map_characteristics(
+                                        chars, targets, context, mode, title, score, card,
+                                    )
                         else:
                             logger.info(
                                 "[WbCard] article-path: best score=%.1f < %.0f — "
@@ -926,22 +986,37 @@ class WbCardSource(AttributeSource):
                 mode, score, title[:80], nm_id,
             )
 
+            # ---- LLM DONOR GATE (brand_line + exact-с-расхождением модели) ----
+            # brand_line (60-78): «того же бренда/типа» — Osprey Daylite проходит
+            # за Osprey Farpoint, LLM проверяет тот ли это товар. exact (≥78) с
+            # СОВПАДЕНИЕМ модель-индекса доверяем fuzzy без LLM; exact с
+            # РАСХОЖДЕНИЕМ (Mi Band 8 → карточка Mi Band 7 @78.2) тоже зовёт гейт.
+            if self._should_run_donor_gate(mode, full_name, title):
+                same = await self._donor_gate.is_same_product(full_name, title)
+                if not same:
+                    logger.info(
+                        "[WbCard] DonorGate DIFFERENT target='%s' donor='%s' — возвращаем []",
+                        full_name[:60], title[:60],
+                    )
+                    return []
+
             chars = self._extract_options(card)
             if not chars:
                 logger.info("[WbCard] no options/characteristics в card.json nm=%s", nm_id)
                 return []
 
             # ---- IMAGES (для downstream VisionSource) ----
-            new_image_urls = self._extract_image_urls(card, nm_id)
-            if new_image_urls:
-                existing = set(context.image_urls or [])
-                added = [u for u in new_image_urls if u not in existing]
-                if added:
-                    context.image_urls = list(context.image_urls or []) + added
-                    logger.info(
-                        "[WbCard] +%d image URLs для VisionSource (nm=%s)",
-                        len(added), nm_id,
-                    )
+            if _INJECT_IMAGES:
+                new_image_urls = self._extract_image_urls(card, nm_id)
+                if new_image_urls:
+                    existing = set(context.image_urls or [])
+                    added = [u for u in new_image_urls if u not in existing]
+                    if added:
+                        context.image_urls = list(context.image_urls or []) + added
+                        logger.info(
+                            "[WbCard] +%d image URLs для VisionSource (nm=%s)",
+                            len(added), nm_id,
+                        )
 
             # ---- MAP & EMIT ----
             return self._map_characteristics(
@@ -1472,6 +1547,43 @@ class WbCardSource(AttributeSource):
             return "brand_line"
         return "skip"
 
+    @staticmethod
+    def _model_index_mismatch(target_name: str, donor_title: str) -> bool:
+        """True when the target carries a model-defining token the donor lacks.
+
+        Signature = alphanumeric-with-digit articles (RB2140, A500S, WH-1000XM5)
+        ∪ standalone short numbers (Series 9, Mi Band 8). Pure type/description
+        words are excluded so "очки"/"часы" don't false-trigger. Asymmetric
+        (target − donor): a donor that is a richer SUPERSET of the same product
+        (all target model tokens present) → empty difference → trusted. Catches
+        a wrong donor that base fuzzy alone scored ≥ exact threshold without a
+        shared model index (Mi Band 8 → Mi Band 7 card at 78.2).
+        """
+        def sig(s: str) -> set:
+            return _extract_model_tokens(s) | set(
+                _STD_MODEL_NUM_RE.findall(s.lower())
+            )
+
+        q, t = sig(target_name), sig(donor_title)
+        return bool(q) and bool(t) and bool(q - t)
+
+    def _should_run_donor_gate(
+        self, mode: str, target_name: str, donor_title: str
+    ) -> bool:
+        """Whether to call the LLM donor gate for this card match.
+
+        Fires on brand_line (same brand, possibly different model) AND on an
+        'exact' match whose model index mismatches — closing the gap where a
+        wrong donor (Mi Band 7 for Mi Band 8) scored 78.2 and bypassed the
+        gate. A clean exact match (shared model index) is trusted without an
+        LLM call, as before.
+        """
+        if mode == "brand_line":
+            return True
+        if mode == "exact" and self._model_index_mismatch(target_name, donor_title):
+            return True
+        return False
+
     # ------------------------------------------------------------------
     # Mapping: char name → target attribute_id → value_id (Ozon dict)
     # ------------------------------------------------------------------
@@ -1683,11 +1795,25 @@ class WbCardSource(AttributeSource):
                         logger.debug("[WbCard] resolve_value_id (list) failed: %s", exc)
             else:
                 value_out = char_val
+                # Unit normalization: convert an explicit-explicit, same-dimension
+                # unit mismatch ("5.4 см" in a "…, мм" field) into the field's unit
+                # BEFORE value_id resolution, so the resolved id matches the number.
+                # Fires only on an unambiguous scalar; bare numbers/ranges/lists pass
+                # through untouched (see unit_normalizer.normalize_value).
+                if _UNIT_NORMALIZE_ENABLED:
+                    _norm = _normalize_unit_value(target.name, char_val)
+                    if _norm.changed:
+                        logger.info(
+                            "[WbCard] unit-normalize '%s': %s", target.name, _norm.note,
+                        )
+                        value_out = _norm.value
                 value_ids = None
                 value_id = None
                 if cat_id and type_id:
                     try:
-                        value_id = resolve_value_id(cat_id, type_id, target.id, char_val)
+                        value_id = resolve_value_id(
+                            cat_id, type_id, target.id, value_out,
+                        )
                     except Exception as exc:
                         logger.debug("[WbCard] resolve_value_id failed: %s", exc)
 

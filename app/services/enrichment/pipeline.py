@@ -6,6 +6,7 @@ cost gating (CostPredictor перед expensive web search).
 
 Spec: docs/architecture/pipeline.md, section "PipelineOrchestrator".
 """
+import asyncio
 import logging
 import os
 import re
@@ -41,6 +42,7 @@ from app.services.enrichment.sources import (
     BestBuySource,
     OnlinerSource,
     BooksSource,
+    LamodaScrapflySource,
 )
 from app.services.enrichment.sources.ozon_card_source import (
     _extract_gender_signal,
@@ -69,9 +71,15 @@ from app.services.enrichment.sources.icecat_numeric_normalizer import (
 from app.services.enrichment.intelligence import LlmClassifier, CostPredictor
 from app.services.providers.factory import get_main_manager
 from app.services.enrichment.confidence_aware_judge import ConfidenceAwareJudgeWrapper
+from app.strategies.validators.numeric_validator import NumericValidator
+from app.judge.judge import HallucinationJudge
+from app.judge.judge_profile import JudgeProfile
+from app.services.enrichment.prompt_router import classify_target, extract_unit
 from app.services.enrichment.strategies.base import MarketplaceStrategy
 from app.services.enrichment.strategies.default_strategy import DefaultStrategy
 from app.services.enrichment.finishing import FinishingExtractor
+from app.services.enrichment.marketplaces.registry import MarketplaceRouter
+from app.services.enrichment.judges.wb_card_judge import WbCardJudge
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +91,7 @@ YANDEX_MARKET_ENABLED: bool = os.environ.get("YANDEX_MARKET_ENABLED", "0") == "1
 # Card-protection в финальном _merge: карточные источники (копия из live-карточки
 # того же товара) не должны перетираться инференсом (LLM-знания / web-поиск), если
 # их confidence лишь незначительно ниже. Band = допустимый зазор.
-_CARD_SOURCES = {Source.WB_CARD, Source.OZON_CARD}
+_CARD_SOURCES = {Source.WB_CARD, Source.OZON_CARD, Source.LAMODA}
 _INFERENCE_SOURCES = {Source.LLM_KNOWLEDGE, Source.WEB_SEARCH}
 _CARD_PROTECTION_BAND = 0.10
 
@@ -215,6 +223,7 @@ _OBJECTIVE_SPEC_NAME_FRAGMENTS: tuple[str, ...] = (
 _AUTHORITATIVE_SOURCES: frozenset[Source] = frozenset({
     Source.WB_CARD,
     Source.OZON_CARD,
+    Source.LAMODA,
     Source.ICECAT,
     Source.PDF_DATASHEET,
     Source.DESCRIPTION,
@@ -1770,6 +1779,91 @@ def _apply_title_from_input(
 
 
 # ---------------------------------------------------------------------------
+# Model-from-title: verbatim filler for free-text MODEL / title-template-model
+# fields ("Модель", "Название модели для шаблона наименования"). These are
+# explicitly DISQUALIFIED from _apply_title_from_input (they are not the full
+# title), yet the model designation IS verbatim-present in the product name.
+# Free-text only (never forces an enum), still-empty only → zero mud risk.
+# ---------------------------------------------------------------------------
+_MODEL_FROM_TITLE_EVIDENCE = "model_from_title"
+_MODEL_FROM_TITLE_CONF = 0.9
+
+
+def _is_model_title_target(name: str) -> bool:
+    """True for a free-text model-designation / model-name-for-title field.
+
+    Matches 'Модель', 'Модель наушников', 'Название модели для шаблона …'.
+    Rejects color/material compounds ('Модель цвета', 'Название модели цвета').
+    """
+    low = name.lower().strip()
+    if any(dq in low for dq in ("цвет", "материал", "размер")):
+        return False
+    if "название модели" in low:
+        return True
+    return low == "модель" or low.startswith("модель ")
+
+
+def _strip_leading_brand(product_name: str, brand: str) -> str:
+    """Drop a leading brand token from the name ('Apple AirPods Pro 2' → 'AirPods Pro 2').
+
+    Only strips when the name starts with the brand; returns the original name
+    when stripping would leave it empty or the brand is absent. Stays verbatim
+    (a substring of the real product name) — no fabrication.
+    """
+    name = (product_name or "").strip()
+    b = (brand or "").strip()
+    if b and name.lower().startswith(b.lower()):
+        rest = name[len(b):].strip(" -—|")
+        return rest or name
+    return name
+
+
+def _apply_model_from_title(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+    context: ExtractionContext,
+) -> list[AttributeValue]:
+    """POST-merge verbatim filler for still-empty free-text MODEL fields.
+
+    'Название модели для шаблона …' ← full product_name (it IS the title model).
+    'Модель …' ← product_name with the leading brand stripped (cleaner designation).
+    Skips enum targets (has allowed_values) and already-filled targets.
+    Source=DESCRIPTION, conf=0.9 — verbatim, no inference.
+    """
+    product_name = (context.product_name or "").strip()
+    if not product_name:
+        return merged
+
+    filled_attr_ids: set[int] = {v.attribute_id for v in merged}
+    out = list(merged)
+    for t in targets:
+        if t.id in filled_attr_ids:
+            continue
+        if t.allowed_values:  # never force a value into a constrained enum
+            continue
+        if not _is_model_title_target(t.name):
+            continue
+        low = t.name.lower()
+        value = product_name if "название модели" in low else _strip_leading_brand(
+            product_name, context.brand or ""
+        )
+        if not value:
+            continue
+        logger.info(
+            "[Pipeline] model-from-title: attr=%s '%s' ← '%s'",
+            t.id, t.name, value[:80],
+        )
+        out.append(AttributeValue(
+            attribute_id=t.id,
+            value=value,
+            confidence=_MODEL_FROM_TITLE_CONF,
+            source=Source.DESCRIPTION,
+            evidence=_MODEL_FROM_TITLE_EVIDENCE,
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Spec-from-title: deterministic filler for OPTIONAL enum attrs whose allowed
 # value is literally present (whole token sequence) in the product title.
 # Mirrors _apply_brand_from_name / _apply_type_from_category in spirit.
@@ -2939,6 +3033,7 @@ class PipelineOrchestrator:
         bestbuy_source: Optional[BestBuySource] = None,
         onliner_source: Optional[OnlinerSource] = None,
         books_source: Optional[BooksSource] = None,
+        lamoda_scrapfly_source: Optional[LamodaScrapflySource] = None,
         classifier: Optional[LlmClassifier] = None,
         cost_predictor: Optional[CostPredictor] = None,
         strategy: Optional[MarketplaceStrategy] = None,
@@ -3028,6 +3123,13 @@ class PipelineOrchestrator:
             scrapfly_ozon_source if scrapfly_ozon_source is not None
             else ScrapflyOzonSource()
         )
+        # LamodaScrapflySource: last-resort clothing attribute gap-filler via Scrapfly.
+        # Gated by LLM "is clothing?" classifier + LAMODA_SCRAPFLY_ENABLED=true.
+        # Default: auto-create with env-based config (dormant when flag is off).
+        self._lamoda_scrapfly: Optional[LamodaScrapflySource] = (
+            lamoda_scrapfly_source if lamoda_scrapfly_source is not None
+            else LamodaScrapflySource()
+        )
         self._judges: dict[Source, ConfidenceAwareJudgeWrapper] = {
             src: ConfidenceAwareJudgeWrapper(s.get_judge())
             for src, s in self._sources.items()
@@ -3102,6 +3204,25 @@ class PipelineOrchestrator:
             self._judges[Source.OZON_CARD] = ConfidenceAwareJudgeWrapper(
                 self._scrapfly_ozon.get_judge()
             )
+        # LamodaScrapflySource emits Source.LAMODA — register its judge.
+        if self._lamoda_scrapfly is not None:
+            self._judges[Source.LAMODA] = ConfidenceAwareJudgeWrapper(
+                self._lamoda_scrapfly.get_judge()
+            )
+        # Judge для Source.YANDEX_MARKET (из MarketplaceRouter).
+        # Яндекс.Маркет — card-like источник (pre-moderated listing), поэтому
+        # переиспользуем WbCardJudge — тот же, что и для Lamoda/WB карточек.
+        if Source.YANDEX_MARKET not in self._judges:
+            self._judges[Source.YANDEX_MARKET] = ConfidenceAwareJudgeWrapper(
+                WbCardJudge()
+            )
+        # Judge для WEB_MARKETPLACE (GenericMarketplace pool).
+        # Grounding already guards mud; WbCardJudge reused for consistency.
+        self._judges[Source.WEB_MARKETPLACE] = ConfidenceAwareJudgeWrapper(
+            WbCardJudge()
+        )
+        # MarketplaceRouter — полиморфный пул маркетплейсов (Stage 4.65).
+        self._marketplace_router = MarketplaceRouter()
         self._classifier = classifier or LlmClassifier()
         self._cost_predictor = cost_predictor or CostPredictor()
         self._finisher = FinishingExtractor(sources=list(self._sources.values()))
@@ -3474,6 +3595,22 @@ class PipelineOrchestrator:
                 all_values += new_avs
                 filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
 
+        # Stage 4.65: MarketplaceRouter — полиморфный пул маркетплейсов.
+        # Яндекс.Маркет (always-on) + Lamoda/специалисты по типу товара.
+        # Гейт: LAMODA_SCRAPFLY_ENABLED=true (тот же флаг, что ранее у LamodaScrapflySource).
+        # Default: OFF.
+        from app import config as _cfg_mp  # local import — избегаем циклической зависимости
+        if _cfg_mp.LAMODA_SCRAPFLY_ENABLED:
+            remaining_for_mp = self._remaining_targets(targets, all_values)
+            if remaining_for_mp:
+                new_avs = await self._run_marketplace_router_stage(
+                    context,
+                    remaining_for_mp,
+                    already_filled=filled_so_far,
+                )
+                all_values += new_avs
+                filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
+
         # Stage 4.7: TnvedSource — per-category резолвер ТН ВЭД ЕАЭС.
         # Запускается после всех товарных sources: кэш по category_id уже тёплый
         # если несколько товаров одной категории обрабатываются параллельно.
@@ -3514,14 +3651,19 @@ class PipelineOrchestrator:
                 v for v in all_values
                 if v.attribute_id in force_attr_ids and v.source == Source.WEB_SEARCH
             ]
-            _non_force_avs = [
+            # TnvedSource fills are deterministically validated (10-digit code, per-category
+            # LLM prompt) — exempt from adversarial gate which cannot verify customs codes
+            # from product title alone (same reason as UniversalGate's _is_tnved_attr skip).
+            _tnved_avs = [
                 v for v in all_values
-                if not (v.attribute_id in force_attr_ids and v.source == Source.WEB_SEARCH)
+                if (v.evidence or "").startswith("tnved_resolver:")
             ]
+            _exempt_ids = {id(v) for v in _force_avs} | {id(v) for v in _tnved_avs}
+            _non_force_avs = [v for v in all_values if id(v) not in _exempt_ids]
             gated = await self._run_llm_knowledge_adversarial_pass(
                 _non_force_avs, targets, context, filled_so_far,
             )
-            all_values = gated + _force_avs
+            all_values = gated + _force_avs + _tnved_avs
 
         # Stage 5: Finishing pass — focused re-extraction for empty required attributes
         all_values += await self._run_finishing(context, targets, all_values)
@@ -3674,6 +3816,38 @@ class PipelineOrchestrator:
                     continue
             filtered_values.append(v)
 
+        # TNVED_SOURCE_FIX_ENABLED: drop LLM_KNOWLEDGE/WEB_SEARCH values for ТН ВЭД
+        # attributes UNLESS they came from TnvedSource (sentinel prefix "tnved_resolver:"
+        # in evidence field).  web_search routinely returns absurd customs codes (e.g.
+        # «цилиндры для контактных линз» on a car stereo) and generic LLM_KNOWLEDGE
+        # fares no better.  TnvedSource uses a focused per-category prompt with 10-digit
+        # validation and double-checked locking — it is the only trusted ТН ВЭД source.
+        # Option (а) chosen over (б) new Source enum: evidence-prefix costs zero refactor,
+        # keeps SOURCE_PRIORITY/judges intact, and is reversible via the flag alone.
+        from app import config as _cfg_tnved
+        if _cfg_tnved.TNVED_SOURCE_FIX_ENABLED:
+            _TNVED_NAME_MARKERS = ("тн вэд", "тнвэд", "еаэс")
+            _TNVED_GARBAGE_SOURCES = {Source.LLM_KNOWLEDGE, Source.WEB_SEARCH}
+            _TNVED_RESOLVER_PREFIX = "tnved_resolver:"
+            tnved_fixed: list[AttributeValue] = []
+            for v in filtered_values:
+                tgt = targets_by_id.get(v.attribute_id)
+                if tgt is not None:
+                    tname_l = (tgt.name or "").lower()
+                    is_tnved_attr = any(m in tname_l for m in _TNVED_NAME_MARKERS)
+                    if is_tnved_attr and v.source in _TNVED_GARBAGE_SOURCES:
+                        # Keep only TnvedSource fills (identified by evidence sentinel)
+                        ev = (v.evidence or "")
+                        if not ev.startswith(_TNVED_RESOLVER_PREFIX):
+                            logger.info(
+                                "[TnvedFix] DROP attr=%s value=%r source=%s "
+                                "— not from TnvedSource (evidence=%r)",
+                                v.attribute_id, v.value, v.source.value, ev[:60],
+                            )
+                            continue
+                tnved_fixed.append(v)
+            filtered_values = tnved_fixed
+
         finalized = self._finalize(filtered_values, targets, context)
         resolved = await self._strategy.llm_resolve_tail(finalized, targets, context)
 
@@ -3736,6 +3910,11 @@ class PipelineOrchestrator:
         # Verbatim fill from context.product_name. Never overwrites. Source=DESCRIPTION.
         resolved = _apply_title_from_input(resolved, targets, context)
 
+        # Lever 1b: free-text MODEL / title-template-model fields ← product name
+        # (verbatim; «Модель» strips leading brand). Closes Модель/Название модели
+        # which _apply_title_from_input deliberately skips.
+        resolved = _apply_model_from_title(resolved, targets, context)
+
         # Lever 2: General verbatim numeric-spec extractor.
         # Covers "Срок службы, лет" (special regex) + all other numeric attrs whose
         # name encodes a known unit AND whose keyword phrase appears near the number.
@@ -3763,9 +3942,555 @@ class PipelineOrchestrator:
         # 2. Дроп REQUIRED enum-значений без value_id — мусор в обязательном поле
         #    хуже пустоты: Ozon отвергает карточку, а не просто помечает поле пустым.
         #    Correctly-resolved required values (value_id is set) НЕ затрагиваются.
+        # Stage 4.95 — required-enum mud-gate. Plugs the hole left by the Stage-4.9
+        # inference gate (which covers only llm_knowledge / web_search / competitor_rag):
+        # a REQUIRED enum filled by DescriptionSource or Vision with a value that is NOT
+        # verbatim-present in the product's own text is an LLM inference, not data. Such
+        # values are adversarially verified (fail-closed) and retracted when baseless —
+        # e.g. Пол=«Женский» hallucinated for headphones. Structural attrs (Тип/Бренд) and
+        # authoritative card sources are exempt; verbatim-grounded values pass untouched.
+        resolved = await self._run_required_enum_mud_gate(resolved, targets, context)
+
+        # Universal verification gate (UNIVERSAL_VERIFY_ENABLED=1): applies
+        # evidence-self-admission, fast numeric reject, unit-sanity, and selective
+        # LLM hallucination judge to ALL sources after merge.
+        resolved = await self._run_universal_verification_gate(resolved, targets, context)
+
         resolved = _drop_unresolved_optional_enums(resolved, targets)
         resolved = _drop_unresolved_required_enums(resolved, targets)
         return resolved
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Universal verification gate (Stage 4.92)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # Non-authoritative sources that must pass LLM hallucination judge
+    # when the value is NOT verbatim in grounding text.
+    _UNVERIFIED_SOURCES: frozenset[Source] = frozenset({
+        Source.VISION,
+        Source.LLM_KNOWLEDGE,
+        Source.WEB_SEARCH,
+        Source.COMPETITOR_RAG,
+        Source.SAFE_ENUM_FILL,
+    })
+
+    # Evidence self-admission patterns — drop without LLM cost.
+    # Expanded to catch vision-style hedges like «No information about pedal type in vision»,
+    # and LLM self-hedges like «closest in list», «skipping», «not confident», «inferred».
+    _EVIDENCE_NO_INFO_RE = re.compile(
+        r"no information|not specified|not visible|cannot\s+(?:be\s+)?determin|"
+        r"uncertain|unknown|not mentioned|no\s+\S+\s+(?:information|data)|"
+        r"не указан|нет данных|не найдено|не\s+вид(?:но|ен)|невозможно\s+определить|"
+        r"information not found|"
+        # LLM self-admission of guessing / approximation
+        r"skipping|skip\b|closest\s+in\s+(?:the\s+)?list|not\s+in\s+(?:the\s+)?list|"
+        r"no\s+\w+\s+match|not\s+confident|guess(?:ed|ing)?|inferred|"
+        r"не\s+уверен|ближайш|нет\s+в\s+списке|предположительно",
+        re.IGNORECASE,
+    )
+
+    # Attribute name patterns that indicate country-of-origin fields.
+    # Filling country from inference sources is unreliable → DROP.
+    _COUNTRY_ATTR_RE = re.compile(
+        r"страна|country|изготовител|производител|origin",
+        re.IGNORECASE,
+    )
+
+    # Unit groups: values whose string contains a unit from group A are invalid
+    # for fields whose expected unit is in group B, and vice versa.
+    # Format: list of frozensets (each set = one "incompatible-with-others" unit class).
+    _UNIT_CONFLICT_GROUPS: tuple[frozenset[str], ...] = (
+        frozenset({"г", "кг", "мг", "lb", "oz", "фунт"}),     # weight
+        frozenset({"шт", "штук", "pcs", "piece"}),               # count
+        frozenset({"мл", "л", "ml", "l"}),                        # volume
+        # Linear units added back: unit_sanity fires ONLY when the TARGET field
+        # itself expects a weight/count/volume unit. If the field is "Вес, г" and
+        # the value is "50 см" — that is always wrong, any source.
+        frozenset({"см", "мм", "м", "km", "дюйм", "in", "ft", "mm", "cm"}),  # linear
+    )
+
+    # Boolean string values — in a numeric/dimensions field these are always wrong.
+    _BOOLEAN_VALS: frozenset[str] = frozenset(
+        {"да", "нет", "true", "false", "yes", "no"}
+    )
+
+    # Count-field names that classify_target() may not catch (type='text', no unit suffix)
+    # but which only accept integer counts — not boolean strings.
+    _COUNT_FIELD_RE = re.compile(
+        r"\b(?:число|количество|кол-во|кол\.?\s*во|count|number\s+of|qty)\b",
+        re.IGNORECASE,
+    )
+
+    # Sub-name / descriptive fields where a value equal to the WHOLE product
+    # title is a lazy placeholder echo, never a real attribute value. The main
+    # name/merge fields (Название, Наименование, Название модели…, Объединить…,
+    # Озон.Видео: название) legitimately hold the title and are deliberately NOT
+    # listed here — blanket-dropping value==title would cut real coverage.
+    _TITLE_ECHO_FIELD_RE = re.compile(
+        r"аннотаци|название\s+вкуса|название\s+цвета|название\s+аромат|"
+        r"название\s+запах|модель\s+тс\b",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _norm_for_title_echo(s: str) -> str:
+        """Normalize for title-echo comparison: lowercase, punctuation→space,
+        collapse whitespace. Cyrillic-safe (\\w matches Unicode letters)."""
+        return re.sub(r"\s+", " ", re.sub(r"[^\w]+", " ", str(s).lower())).strip()
+
+    async def _run_universal_verification_gate(
+        self,
+        resolved: list[AttributeValue],
+        targets: list[TargetAttribute],
+        context: ExtractionContext,
+    ) -> list[AttributeValue]:
+        """Universal anti-hallucination gate (Stage 4.92).
+
+        Applies 4 checks to every resolved AttributeValue after merge:
+
+        Step 1 — Evidence self-admission (free): if v.evidence matches the
+          "no information / not specified" regex → DROP. The source itself
+          admitted it had nothing.
+
+        Step 2 — Fast numeric reject (free): if the target is numeric/dimensions
+          AND the value string contains a digit AND that digit is NOT present in
+          grounding_text (name + description) → DROP. Catches wb_card returning
+          «50 cm» weight, IceCat stale specs, etc.
+
+        Step 3 — Unit sanity (free): if target expected unit is in a weight/count/
+          volume group, and the value string contains a unit from a DIFFERENT group →
+          DROP. Catches «50 см» in a weight field (г/кг expected).
+
+        Step 4 — Hallucination judge (LLM, batched): only for non-authoritative
+          sources (VISION, LLM_KNOWLEDGE, WEB_SEARCH, COMPETITOR_RAG, SAFE_ENUM_FILL)
+          whose value is NOT verbatim-present in grounding_text → LLM adversarial
+          check. Authoritative sources (WB_CARD, ICECAT, OZON_CARD, PDF_DATASHEET,
+          DESCRIPTION, LAMODA) trust-skip the LLM judge but still pass steps 1–3.
+
+        Gated behind UNIVERSAL_VERIFY_ENABLED env flag (default OFF to avoid
+        latency regression on existing deployments).
+
+        Anti-regression guarantee: authoritative sources NEVER enter Step 4.
+        Steps 1–3 are deterministic and only fire on clear evidence of error.
+        """
+        if os.getenv("UNIVERSAL_VERIFY_ENABLED", "0").strip().lower() not in (
+            "1", "true", "yes", "on",
+        ):
+            return resolved
+
+        targets_by_id: dict[int, TargetAttribute] = {t.id: t for t in targets}
+
+        # Grounding text = name + description (product-level, always available).
+        grounding_base = " ".join(
+            s for s in (context.product_name, context.product_description) if s
+        )
+
+        out: list[AttributeValue] = []
+        # Accumulate candidates for LLM judge batching.
+        # key: index in `out` where we will append (or drop) the value.
+        llm_candidates: list[tuple[int, AttributeValue, TargetAttribute, str]] = []
+
+        for v in resolved:
+            t = targets_by_id.get(v.attribute_id)
+            if t is None:
+                out.append(v)
+                continue
+
+            val_str = str(v.value).strip() if not isinstance(v.value, list) else ""
+            evidence_str = (v.evidence or "").strip()
+
+            # Per-value grounding text: name + description + THIS value's own evidence.
+            # For web_search/icecat/wb_card the evidence field contains the fetched
+            # snippet — the number must be present in THAT text, not only in the title.
+            grounding_text_v = " ".join(s for s in (evidence_str, grounding_base) if s)
+
+            # ── Step 1: Evidence self-admission ──────────────────────────────
+            if evidence_str and self._EVIDENCE_NO_INFO_RE.search(evidence_str):
+                logger.info(
+                    "[UniversalGate] DROP attr=%s value=%r source=%s "
+                    "step=evidence_self_admission evidence=%r",
+                    v.attribute_id, v.value, v.source.value, evidence_str[:80],
+                )
+                continue
+
+            # ── Step 1b: Country-of-origin from COMPETITOR_RAG → DROP ──
+            # COMPETITOR_RAG converges on wrong RU origin (Champion→Россия,
+            # Ahmad Tea→Россия) because competing listings copy each other.
+            # LLM_KNOWLEDGE is NOT blocked here — Германия/Индонезия from world
+            # knowledge is often correct; it will be audited by the judge if enabled.
+            if (
+                self._COUNTRY_ATTR_RE.search(t.name or "")
+                and v.source is Source.COMPETITOR_RAG
+            ):
+                logger.info(
+                    "[UniversalGate] DROP attr=%s value=%r source=%s "
+                    "step=country_competitor_rag",
+                    v.attribute_id, v.value, v.source.value,
+                )
+                continue
+
+            # ── Step 1c: Boolean value in numeric/dimensions field → DROP ──
+            # Catches IceCat emitting «Да»/«Нет»/«True»/«False»/«Yes»/«No» into
+            # fields like «Время зарядки, ч» or «Число портов HDMI».
+            # Fires for any source, any scalar value.
+            if val_str and val_str.strip().lower() in self._BOOLEAN_VALS:
+                _kind_for_bool = classify_target(t)
+                _has_unit = bool((extract_unit(t.name) or "").strip())
+                _is_count_field = bool(self._COUNT_FIELD_RE.search(t.name or ""))
+                if _kind_for_bool in ("numeric", "dimensions") or _has_unit or _is_count_field:
+                    logger.info(
+                        "[UniversalGate] DROP attr=%s value=%r source=%s "
+                        "step=boolean_in_numeric field=%r",
+                        v.attribute_id, v.value, v.source.value, t.name,
+                    )
+                    continue
+
+            # ── Step 1d: Title echo in a sub-name / descriptive field → DROP ──
+            # A descriptive or qualified-name field (Аннотация, Название вкуса/
+            # цвета/аромата, Модель ТС) whose value is just the WHOLE product
+            # title is a lazy placeholder fill, never a real value. Exact
+            # normalized match only; the main name/merge fields are NOT in the
+            # denylist, so legitimate title fills are untouched.
+            if val_str and self._TITLE_ECHO_FIELD_RE.search(t.name or ""):
+                prod_title = (context.product_name or "").strip()
+                if prod_title and self._norm_for_title_echo(val_str) == \
+                        self._norm_for_title_echo(prod_title):
+                    logger.info(
+                        "[UniversalGate] DROP attr=%s value=%r source=%s "
+                        "step=title_echo field=%r",
+                        v.attribute_id, v.value, v.source.value, t.name,
+                    )
+                    continue
+
+            # ── Steps 2 & 3 only for scalar values ───────────────────────────
+            if val_str and not isinstance(v.value, list):
+                kind = classify_target(t)
+                is_numeric_kind = kind in ("numeric", "dimensions")
+
+                # Step 2: Fast numeric reject
+                # Apply ONLY to text-extracting sources (DESCRIPTION, WEB_SEARCH) whose
+                # numbers must literally appear in the fetched text.
+                # EXEMPT: authoritative sources (wb_card, icecat, ozon_card, etc.) — their
+                # specs are NOT in the short seller text by design.
+                # EXEMPT: LLM_KNOWLEDGE — its numbers are world-knowledge about the named
+                # model; correctness is judged by polarity-correct judge in Step 4, not
+                # by text-presence.
+                _FAST_NUMERIC_SOURCES = {Source.DESCRIPTION, Source.WEB_SEARCH}
+                if is_numeric_kind and v.source in _FAST_NUMERIC_SOURCES:
+                    # Check if value string contains any digit
+                    has_digit = any(c.isdigit() for c in val_str)
+                    if has_digit and grounding_text_v:
+                        if not NumericValidator.is_value_in_text(val_str, grounding_text_v):
+                            logger.info(
+                                "[UniversalGate] DROP attr=%s value=%r source=%s "
+                                "step=fast_numeric_reject — число не в grounding_text",
+                                v.attribute_id, v.value, v.source.value,
+                            )
+                            continue
+
+                # Step 3: Unit sanity
+                expected_unit = (extract_unit(t.name) or "").strip().lower()
+                if expected_unit and val_str:
+                    val_lower = val_str.lower()
+                    # Find which group the expected unit belongs to
+                    expected_group: Optional[frozenset[str]] = None
+                    for grp in self._UNIT_CONFLICT_GROUPS:
+                        if expected_unit in grp:
+                            expected_group = grp
+                            break
+                    if expected_group is not None:
+                        # Check if value contains a unit from a DIFFERENT group
+                        for grp in self._UNIT_CONFLICT_GROUPS:
+                            if grp is expected_group:
+                                continue
+                            for unit_tok in grp:
+                                # Whole-word match to avoid «мл» matching «мл» within «мл/с»
+                                if re.search(
+                                    r"(?<![а-яёa-z])" + re.escape(unit_tok) + r"(?![а-яёa-z])",
+                                    val_lower,
+                                    re.IGNORECASE,
+                                ):
+                                    logger.info(
+                                        "[UniversalGate] DROP attr=%s value=%r source=%s "
+                                        "step=unit_sanity — unit '%s' conflicts with "
+                                        "expected '%s' (field=%r)",
+                                        v.attribute_id, v.value, v.source.value,
+                                        unit_tok, expected_unit, t.name,
+                                    )
+                                    # Mark as dropped by NOT appending — break inner loops
+                                    val_str = ""  # sentinel: signals unit-sanity DROP
+                                    break
+                            if not val_str:
+                                break
+                    if not val_str:
+                        continue  # unit-sanity dropped
+
+            # ── Step 4: Hallucination judge (LLM, selective) ─────────────────
+            # Only non-authoritative sources that are NOT verbatim in grounding text.
+            # EXEMPT: ТН ВЭД / ТНВЭД / ЕАЭС attributes — customs codes derived
+            # deterministically from category and confirmed by existing TnvedSource /
+            # inference-gate; LLM judge cannot verify them from title alone.
+            _tname_l = (t.name or "").lower()
+            _is_tnved_attr = (
+                "тн вэд" in _tname_l or "тнвэд" in _tname_l or "еаэс" in _tname_l
+            )
+            if _is_tnved_attr:
+                out.append(v)
+                continue
+
+            if v.source in self._UNVERIFIED_SOURCES and val_str:
+                # Use per-value grounding (name + description + evidence snippet).
+                grounding_text = grounding_text_v
+
+                # ── Leaf-aware pre-check (free, deterministic) ────────────────
+                # Map attribute to its strategy leaf and ask the leaf's own
+                # evaluate_need_for_judgment before hitting the LLM.
+                from app.services.enrichment.leaf_mapper import map_to_leaf, leaf_threshold
+                leaf_cls = map_to_leaf(t)
+                pre_verdict = leaf_cls.evaluate_need_for_judgment(
+                    val_str, grounding_text or "", list(t.allowed_values or [])
+                )
+                logger.debug(
+                    "[UniversalGate] attr=%s leaf=%s pre_verdict=%s source=%s",
+                    v.attribute_id, leaf_cls.name, pre_verdict, v.source.value,
+                )
+                if pre_verdict == "REJECT":
+                    logger.info(
+                        "[UniversalGate] DROP attr=%s value=%r source=%s "
+                        "step=leaf_pre_reject leaf=%s",
+                        v.attribute_id, v.value, v.source.value, leaf_cls.name,
+                    )
+                    continue
+                if pre_verdict == "ACCEPT":
+                    # Leaf says value is clean — skip LLM judge.
+                    out.append(v)
+                    continue
+
+                # Verbatim check: if value already present in grounding text → trust, skip LLM.
+                from app.services.enrichment.sources.safe_enum_fill_source import _verbatim_check
+                if grounding_text and _verbatim_check(val_str, grounding_text):
+                    out.append(v)
+                    continue
+                # Queue for batched LLM judge (carry leaf_cls for per-leaf profile)
+                slot = len(out)
+                out.append(v)  # placeholder — may be removed after judge
+                llm_candidates.append((slot, v, t, grounding_text, leaf_cls))
+                continue
+
+            out.append(v)
+
+        # ── Batch LLM judge for non-authoritative non-verbatim values ─────────
+        # llm_candidates items: (slot, v, t, grounding_text, leaf_cls)
+        # Guard: UNIVERSAL_VERIFY_JUDGE_ENABLED (default OFF).
+        # When OFF, candidates queued for judge are kept as-is (already in `out`).
+        _judge_enabled = os.getenv(
+            "UNIVERSAL_VERIFY_JUDGE_ENABLED", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+        if llm_candidates and not _judge_enabled:
+            logger.info(
+                "[UniversalGate] judge SKIPPED (UNIVERSAL_VERIFY_JUDGE_ENABLED=0): "
+                "%d candidates kept as-is",
+                len(llm_candidates),
+            )
+            return out
+
+        if llm_candidates and _judge_enabled:
+            from app.services.enrichment.leaf_mapper import leaf_threshold
+            llm_mgr = get_main_manager()
+            judge = HallucinationJudge(llm_mgr)
+
+            # Run all judge calls concurrently (one per candidate).
+            async def _judge_one(
+                slot: int,
+                v: AttributeValue,
+                t: TargetAttribute,
+                grounding: str,
+                leaf_cls: type,
+            ) -> tuple[int, bool]:
+                try:
+                    # Build per-leaf judge profile (inherits leaf's custom rules).
+                    profile = leaf_cls.get_judge_profile()
+                    profile.goal = (
+                        "Determine whether the extracted value is FACTUALLY WRONG or "
+                        "implausible for THIS specific product model. A value that is "
+                        "correct/plausible for the named product must be KEPT even if "
+                        "not literally restated in the source text — world-knowledge "
+                        "about a named model is acceptable. Flag as unsupported ONLY "
+                        "when the value CONTRADICTS the source text/evidence, or is a "
+                        "clearly wrong spec for this exact model."
+                    )
+                    # Universal gate baseline rules appended after leaf-specific ones.
+                    profile.custom_rules.extend([
+                        "Retract (is_supported_by_text=False) ONLY if the value "
+                        "contradicts the product name/description/evidence OR is a "
+                        "known-wrong spec for this exact model (e.g. wrong storage "
+                        "size, wrong connectivity standard, wrong country of origin). "
+                        "Do NOT retract correct technical facts about the named product "
+                        "merely because they are absent from the short seller text.",
+                        "Boolean fills ('Да'/'Нет') from SAFE_ENUM_FILL: retract only "
+                        "if the feature is explicitly contradicted by the text or is "
+                        "clearly inapplicable to this product type — do NOT retract "
+                        "merely because the feature keyword is absent from the text.",
+                    ])
+                    verdict, _tokens = await judge.execute_audit(
+                        text=grounding or context.product_name or "",
+                        feature_name=t.name,
+                        extracted_value=v.value,
+                        profile=profile,
+                    )
+                    # Apply leaf-specific threshold via process_judgment.
+                    judge_result = leaf_cls.process_judgment(verdict, _tokens)
+                    keep = judge_result.is_success
+                    threshold = leaf_threshold(leaf_cls)
+                    if not keep:
+                        logger.info(
+                            "[UniversalGate] DROP attr=%s value=%r source=%s "
+                            "step=hallucination_judge leaf=%s threshold=%s — "
+                            "is_supported=%s violates=%s conf=%s analysis=%r",
+                            v.attribute_id, v.value, v.source.value,
+                            leaf_cls.name, threshold,
+                            verdict.is_supported_by_text, verdict.violates_rules,
+                            verdict.error_confidence, verdict.analysis[:100],
+                        )
+                    else:
+                        logger.debug(
+                            "[UniversalGate] KEEP attr=%s value=%r source=%s "
+                            "leaf=%s threshold=%s conf=%s",
+                            v.attribute_id, v.value, v.source.value,
+                            leaf_cls.name, threshold, verdict.error_confidence,
+                        )
+                    return slot, keep
+                except Exception as exc:
+                    logger.warning(
+                        "[UniversalGate] judge failed for attr=%s source=%s: %s — keeping",
+                        v.attribute_id, v.source.value, exc,
+                    )
+                    return slot, True  # fail-open on judge error (keep)
+
+            judgements: list[tuple[int, bool]] = await asyncio.gather(
+                *[_judge_one(slot, v, t, gt, lc) for slot, v, t, gt, lc in llm_candidates]
+            )
+
+            # Build set of slots to drop
+            drop_slots: set[int] = {slot for slot, keep in judgements if not keep}
+            if drop_slots:
+                out = [v for i, v in enumerate(out) if i not in drop_slots]
+
+        return out
+
+    async def _run_required_enum_mud_gate(
+        self,
+        resolved: list[AttributeValue],
+        targets: list[TargetAttribute],
+        context: ExtractionContext,
+    ) -> list[AttributeValue]:
+        """Adversarial mud-gate for REQUIRED enum fills from inference sources.
+
+        Complements the Stage-4.9 inference gate (llm_knowledge / web_search /
+        competitor_rag) by covering Source.DESCRIPTION and Source.VISION — the
+        non-authoritative sources whose required-enum fills otherwise reach the
+        output ungated (the DescriptionSource Пол=«Женский»-for-headphones leak).
+
+        For each REQUIRED enum value from a gated source that is NOT verbatim-present
+        in the product's own text (name + description = Gate A), run the shared
+        adversarial verifier (Gate B). Retract every value the verifier does not
+        CONFIRM (fail-closed: empty > wrong). Structural attrs (Тип 8229, Бренд
+        31/85) and authoritative card sources are never touched.
+
+        Gated behind REQUIRED_ENUM_MUD_GATE_ENABLED (default on).
+        """
+        if os.getenv("REQUIRED_ENUM_MUD_GATE_ENABLED", "true").strip().lower() not in (
+            "1", "true", "yes", "on",
+        ):
+            return resolved
+
+        from app.services.enrichment.sources.safe_enum_fill_source import (
+            run_adversarial_verify,
+            _verbatim_check,
+        )
+
+        # Structural required enums are derived (Тип from cat_key) or identity (Бренд),
+        # never world-knowledge guesses — they have their own dedicated guards.
+        # +22232 ТН ВЭД: customs codes follow deterministically from product
+        # category (not a world-knowledge guess), so vision/LLM deriving one is
+        # legitimate — never mud-gate it. Live-confirmed: the gate was retracting
+        # a CORRECT ТН ВЭД from vision → required 85% instead of 95%.
+        _EXEMPT_ATTR_IDS = {8229, 31, 85, 22232}
+        # Non-authoritative sources NOT already covered by the Stage-4.9 inference gate.
+        _GATED_SOURCES = {Source.DESCRIPTION, Source.VISION}
+
+        targets_by_id = {t.id: t for t in targets}
+        source_text = " ".join(
+            s for s in (context.product_name, context.product_description) if s
+        )
+
+        proposals: list[tuple[int, str, str]] = []
+        candidate_ids: set[int] = set()
+        for v in resolved:
+            t = targets_by_id.get(v.attribute_id)
+            if t is None or not t.is_required or not t.allowed_values:
+                continue
+            _name_l = (t.name or "").lower()
+            if (v.attribute_id in _EXEMPT_ATTR_IDS
+                    or "тн вэд" in _name_l or "тнвэд" in _name_l or "еаэс" in _name_l):
+                continue
+            if v.source not in _GATED_SOURCES:
+                continue
+            if isinstance(v.value, list):
+                continue  # scalar required enums only
+            val_str = str(v.value).strip()
+            if not val_str:
+                continue
+            # Gate A: value literally present in the product's own text → grounded, keep.
+            if source_text and _verbatim_check(val_str, source_text):
+                continue
+            proposals.append((v.attribute_id, t.name, val_str))
+            candidate_ids.add(v.attribute_id)
+
+        if not proposals:
+            return resolved
+
+        logger.info(
+            "[Pipeline] required-enum mud-gate: product=%s verifying %d ungrounded "
+            "required-enum fill(s) from %s",
+            context.product_id, len(proposals),
+            ", ".join(sorted({
+                v.source.value for v in resolved
+                if v.attribute_id in candidate_ids and v.source in _GATED_SOURCES
+            })),
+        )
+
+        try:
+            confirmed_ids = await run_adversarial_verify(
+                context, proposals, resolved_attrs=resolved,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Pipeline] required-enum mud-gate failed (fail-closed, retract all): %s",
+                exc,
+            )
+            confirmed_ids = set()
+
+        drop_ids = candidate_ids - confirmed_ids
+        if not drop_ids:
+            return resolved
+
+        out: list[AttributeValue] = []
+        for v in resolved:
+            if (
+                v.attribute_id in drop_ids
+                and v.source in _GATED_SOURCES
+                and not isinstance(v.value, list)
+            ):
+                logger.info(
+                    "[Pipeline] required-enum mud-gate DROP: attr=%s value=%r source=%s "
+                    "— adversarial retracted (empty>wrong)",
+                    v.attribute_id, v.value, v.source.value,
+                )
+                continue
+            out.append(v)
+        return out
 
     def _finalize(
         self,
@@ -3995,6 +4720,94 @@ class PipelineOrchestrator:
             except Exception as e:
                 logger.warning(
                     "[Pipeline] scrapfly_ozon judge failed for attr %s: %s",
+                    value.attribute_id, e,
+                )
+        return results
+
+    async def _run_marketplace_router_stage(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: Optional[list[AttributeValue]] = None,
+    ) -> list[AttributeValue]:
+        """Run MarketplaceRouter — полиморфный пул маркетплейсов (Stage 4.65).
+
+        Каждое значение судится по своему source через self._judges.
+        Ошибки не прерывают пайплайн (возвращают []).
+        """
+        if not targets:
+            return []
+        filled_ids: set[int] = {v.attribute_id for v in (already_filled or [])}
+        try:
+            raw = await self._marketplace_router.fill_gaps(
+                context, targets, already_filled_ids=filled_ids
+            )
+        except Exception as exc:
+            logger.warning(
+                "[Pipeline] marketplace_router failed: %s", exc, exc_info=True
+            )
+            return []
+        if not raw:
+            return []
+        results: list[AttributeValue] = []
+        for value in raw:
+            judge_wrapper = self._judges.get(value.source)
+            if judge_wrapper is None:
+                # Нет зарегистрированного судьи — пропускаем as-is
+                results.append(value)
+                continue
+            try:
+                judged = await judge_wrapper.maybe_validate(value, context)
+                if judged is not None:
+                    results.append(judged)
+            except Exception as exc:
+                logger.warning(
+                    "[Pipeline] marketplace_router judge failed for attr %s (source=%s): %s",
+                    value.attribute_id, value.source, exc,
+                )
+        return results
+
+    async def _run_lamoda_scrapfly_stage(
+        self,
+        context: ExtractionContext,
+        targets: list[TargetAttribute],
+        already_filled: Optional[list[AttributeValue]] = None,
+    ) -> list[AttributeValue]:
+        """Run LamodaScrapflySource — last-resort clothing attribute gap-fill via Lamoda+Scrapfly.
+
+        Errors never interrupt the pipeline (return []).
+        LLM gate inside source: non-clothing products return [] immediately (0 credits).
+        LAMODA_SCRAPFLY_ENABLED env flag → off by default.
+        """
+        if self._lamoda_scrapfly is None:
+            return []
+        if not targets:
+            return []
+        if not self._lamoda_scrapfly.is_applicable(context, targets[0]):
+            return []
+        judge_wrapper = self._judges.get(Source.LAMODA)
+        try:
+            extracted = await self._lamoda_scrapfly.extract(
+                context,
+                targets,
+                already_filled=already_filled,
+            )
+        except Exception as e:
+            logger.warning("[Pipeline] lamoda_scrapfly source failed: %s", e, exc_info=True)
+            return []
+        if not extracted:
+            return []
+        if judge_wrapper is None:
+            return extracted
+        results: list[AttributeValue] = []
+        for value in extracted:
+            try:
+                judged = await judge_wrapper.maybe_validate(value, context)
+                if judged is not None:
+                    results.append(judged)
+            except Exception as e:
+                logger.warning(
+                    "[Pipeline] lamoda_scrapfly judge failed for attr %s: %s",
                     value.attribute_id, e,
                 )
         return results

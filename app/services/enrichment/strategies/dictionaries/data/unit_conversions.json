@@ -1,0 +1,38 @@
+{
+  "_comment": "Declarative unit-conversion table for wb_card value normalization. The engine (unit_normalizer.py) is generic; ALL units/factors live here. Only EXACT-ratio physical dimensions are listed — no approximate conversions (e.g. months->days) to keep every conversion lossless and unambiguous. To extend: add a dimension or a token with its factor-to-base; no code change needed. factor = how many base units in one of this unit.",
+  "dimensions": {
+    "length": {
+      "base": "mm",
+      "units": {
+        "мм": 1,
+        "см": 10,
+        "м": 1000,
+        "дюйм": 25.4
+      }
+    },
+    "mass": {
+      "base": "g",
+      "units": {
+        "мкг": 0.000001,
+        "мг": 0.001,
+        "г": 1,
+        "кг": 1000,
+        "т": 1000000
+      }
+    },
+    "volume": {
+      "base": "ml",
+      "units": {
+        "мл": 1,
+        "л": 1000
+      }
+    },
+    "power": {
+      "base": "w",
+      "units": {
+        "вт": 1,
+        "квт": 1000
+      }
+    }
+  }
+}
