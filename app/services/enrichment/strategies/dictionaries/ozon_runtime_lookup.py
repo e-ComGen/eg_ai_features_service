@@ -138,3 +138,85 @@ async def search_value(
 
     _lookup_cache[cache_key] = result
     return result
+
+
+VALUES_ENDPOINT = "/v1/description-category/attribute/values"
+
+# (cat_id, type_id, attr_id) -> list[{"id": int, "value": str}]
+_values_cache: dict[tuple[int, int, int], list[dict]] = {}
+
+
+def clear_values_cache() -> None:
+    """Clear the in-process category-values cache. Useful in tests."""
+    _values_cache.clear()
+
+
+async def list_values(
+    cat_id: int,
+    type_id: int,
+    attribute_id: int,
+    *,
+    client_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    page_limit: int = 100,
+    max_values: int = 300,
+) -> list[dict]:
+    """List the authoritative per-category dictionary values for an attribute.
+
+    Paginates POST ``/v1/description-category/attribute/values`` (``last_value_id``
+    cursor) and returns up to ``max_values`` entries as ``{"id": int, "value":
+    str}``. Used for ТН ВЭД / Тип, whose LOCALLY-cached values are stale/generic
+    while the live API holds the real category-specific list. Returns ``[]`` on
+    missing creds, a non-dict-backed (404) attribute, or any error. Cached per
+    (cat, type, attr) for the process lifetime.
+    """
+    cache_key = (cat_id, type_id, attribute_id)
+    if cache_key in _values_cache:
+        return _values_cache[cache_key]
+
+    resolved_client_id = client_id or os.getenv("OZON_CLIENT_ID", "")
+    resolved_api_key = api_key or os.getenv("OZON_API_KEY", "")
+    if not resolved_client_id or not resolved_api_key:
+        _values_cache[cache_key] = []
+        return []
+
+    headers = {
+        "Client-Id": resolved_client_id,
+        "Api-Key": resolved_api_key,
+        "Content-Type": "application/json",
+    }
+    out: list[dict] = []
+    last_value_id = 0
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            while len(out) < max_values:
+                payload = {
+                    "description_category_id": cat_id,
+                    "type_id": type_id,
+                    "attribute_id": attribute_id,
+                    "language": "DEFAULT",
+                    "limit": page_limit,
+                    "last_value_id": last_value_id,
+                }
+                r = await client.post(OZON_BASE_URL + VALUES_ENDPOINT, headers=headers, json=payload)
+                if r.status_code != 200:
+                    if r.status_code != 404:
+                        log.warning(
+                            "ozon list_values: HTTP %d attr_id=%d: %s",
+                            r.status_code, attribute_id, r.text[:200],
+                        )
+                    break
+                body = r.json()
+                items = body.get("result") or []
+                if not items:
+                    break
+                for it in items:
+                    out.append({"id": it["id"], "value": it["value"]})
+                    last_value_id = it["id"]
+                if not body.get("has_next"):
+                    break
+    except httpx.HTTPError as exc:
+        log.warning("ozon list_values: network error attr_id=%d: %s", attribute_id, exc)
+
+    _values_cache[cache_key] = out
+    return out

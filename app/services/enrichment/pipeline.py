@@ -2785,6 +2785,13 @@ def _is_placeholder_value(raw: object) -> bool:
     return str(raw).strip().lower() in _PLACEHOLDER_VALUES
 
 
+# ТН ВЭД (EAEU customs code) attribute-name markers. The customs-code field is
+# free-text (any valid 10-digit code) even though Ozon ships a small sample
+# allowed_values list — so it must be exempted from the enum drop-guards, which
+# otherwise silently dropped every TnvedSource-validated code (value_id=None).
+_TNVED_ATTR_NAME_MARKERS = ("тн вэд", "тнвэд", "еаэс")
+
+
 def _drop_unresolved_optional_enums(
     merged: list[AttributeValue],
     targets: list[TargetAttribute],
@@ -2860,6 +2867,16 @@ def _drop_unresolved_enums(
         # Вне scope → пропускаем как есть: нет таргета, не enum, или
         # is_required не совпадает с режимом вызова.
         if target is None or not target.allowed_values:
+            out.append(v)
+            continue
+        # ТН ВЭД exemption: the customs-code attr (22232) carries a sample
+        # allowed_values list (~50 codes) but is effectively FREE-TEXT — any
+        # valid 10-digit ЕАЭС code is acceptable, not only those samples. A
+        # TnvedSource-validated code legitimately resolves to value_id=None, so
+        # the enum drop-guard must NOT treat it as "unresolved garbage" (that
+        # silently killed ТН ВЭД on ~all products). Garbage ТН ВЭД from other
+        # sources is already removed earlier by the TNVED_SOURCE_FIX filter.
+        if any(m in (target.name or "").lower() for m in _TNVED_ATTR_NAME_MARKERS):
             out.append(v)
             continue
         if required_only and not target.is_required:
@@ -3956,6 +3973,11 @@ class PipelineOrchestrator:
         # LLM hallucination judge to ALL sources after merge.
         resolved = await self._run_universal_verification_gate(resolved, targets, context)
 
+        # Authoritative ТН ВЭД / Тип resolution via the live Ozon API — runs
+        # AFTER the gates and JUST BEFORE the drop-guards so the real value_ids
+        # it assigns prevent the enum drop-guards from discarding these fields.
+        resolved = await self._apply_ozon_api_resolve(resolved, targets, context)
+
         resolved = _drop_unresolved_optional_enums(resolved, targets)
         resolved = _drop_unresolved_required_enums(resolved, targets)
         return resolved
@@ -4871,6 +4893,147 @@ class PipelineOrchestrator:
                     value.attribute_id, e,
                 )
         return results
+
+    async def _ozon_api_llm_pick(
+        self,
+        context: ExtractionContext,
+        target: TargetAttribute,
+        candidates: list[dict],
+    ) -> Optional[dict]:
+        """LLM picks the single best authoritative value from the live Ozon list.
+
+        candidates: [{"id": int, "value": str}] from the Ozon API. Returns the
+        chosen {"id","value"} or None (nothing fits / LLM error). The choice is
+        CONSTRAINED to the real category list, so the result always carries a
+        valid value_id — unlike a free LLM guess.
+        """
+        cands = candidates[:150]
+        if not cands:
+            return None
+        listing = "\n".join(f"{i}. {c['value']}" for i, c in enumerate(cands))
+        cat_hint = " / ".join(context.category_path) if context.category_path else ""
+
+        class _PickResponse(BaseModel):
+            index: int = Field(..., description="индекс выбранного значения из списка; -1 если ничего не подходит")
+
+        user_text = (
+            f'Товар: "{context.product_name}".\n'
+            f'Поле для заполнения: "{target.name}".\n'
+            + (f'Категория: {cat_hint}.\n' if cat_hint else "")
+            + "Выбери из списка ОДНО значение, наиболее точно подходящее этому товару.\n"
+            "Верни ТОЛЬКО индекс (число). Если ни одно не подходит — верни -1.\n\n"
+            f"Список:\n{listing}"
+        )
+        try:
+            from app.services.providers.factory import get_main_manager
+            llm = get_main_manager()
+            parsed, _ = await asyncio.wait_for(
+                llm.structured_request(
+                    system_prompt=(
+                        "Ты эксперт по классификации товаров для маркетплейса Ozon. "
+                        "Выбираешь ровно одно значение из предложенного списка по индексу."
+                    ),
+                    user_text=user_text,
+                    response_model=_PickResponse,
+                ),
+                timeout=20,
+            )
+        except Exception as exc:
+            logger.warning("[OzonApiResolve] LLM pick failed for attr %s: %s", target.id, exc)
+            return None
+        if parsed is None:
+            return None
+        idx = parsed.index
+        if 0 <= idx < len(cands):
+            return cands[idx]
+        return None
+
+    async def _apply_ozon_api_resolve(
+        self,
+        resolved: list[AttributeValue],
+        targets: list[TargetAttribute],
+        context: ExtractionContext,
+    ) -> list[AttributeValue]:
+        """Authoritative ТН ВЭД / Тип resolution via the live Ozon Seller API.
+
+        The local dictionary cache is stale for these dict-backed fields (ТН ВЭД
+        ships a generic 66-code sample; «Тип» ships 4 unrelated values — the same
+        on every category), so values never resolve to a real value_id and the
+        ТН ВЭД code is otherwise an LLM guess that Ozon's category list rejects.
+        For each ТН ВЭД / Тип target still lacking a value_id:
+          1. search_value(proposed value | category leaf) — cheap exact/partial.
+          2. else LLM-pick from the authoritative live category list.
+        Sets value + value_id in place (or appends when the field was empty).
+        Creds-gated internally; no-op without OZON_CLIENT_ID/OZON_API_KEY.
+        """
+        from app import config as _cfg
+        if not _cfg.OZON_API_RESOLVE_ENABLED:
+            return resolved
+        cat_id = context.category_id
+        type_id = context.ozon_type_id
+        if cat_id is None or type_id is None:
+            return resolved
+        from app.services.enrichment.strategies.dictionaries.ozon_runtime_lookup import (
+            search_value, list_values,
+        )
+
+        leaf = (context.category_path[-1] if context.category_path else "") or ""
+        by_attr: dict[int, AttributeValue] = {}
+        for v in resolved:
+            by_attr.setdefault(v.attribute_id, v)
+
+        for t in targets:
+            name_l = (t.name or "").lower()
+            is_tnved = any(m in name_l for m in _TNVED_ATTR_NAME_MARKERS)
+            is_typ = name_l.strip() == "тип"
+            if not (is_tnved or is_typ):
+                continue
+            cur = by_attr.get(t.id)
+            if cur is not None and cur.value_id is not None:
+                continue  # already resolved to an authoritative value_id
+
+            # 1) cheap search by proposed value (or, for empty Тип, category leaf)
+            hit = None
+            query = None
+            if cur is not None and not isinstance(cur.value, list) and str(cur.value).strip():
+                query = str(cur.value).strip()
+            elif is_typ and leaf:
+                query = leaf
+            if query:
+                hit = await search_value(cat_id, type_id, t.id, query)
+
+            # 2) constrained LLM pick from the authoritative live list
+            if hit is None:
+                cands = await list_values(cat_id, type_id, t.id)
+                if cands:
+                    hit = await self._ozon_api_llm_pick(context, t, cands)
+
+            if hit is None:
+                continue
+
+            if cur is not None:
+                logger.info(
+                    "[OzonApiResolve] attr=%s '%s': %r → %r (value_id=%s)",
+                    t.id, t.name, str(cur.value)[:40], hit["value"][:40], hit["id"],
+                )
+                cur.value = hit["value"]
+                cur.value_id = hit["id"]
+                cur.source = Source.OZON_CARD
+                cur.evidence = "ozon_api: authoritative category value"
+            else:
+                logger.info(
+                    "[OzonApiResolve] attr=%s '%s': EMPTY → %r (value_id=%s)",
+                    t.id, t.name, hit["value"][:40], hit["id"],
+                )
+                resolved.append(AttributeValue(
+                    attribute_id=t.id,
+                    value=hit["value"],
+                    confidence=0.95,
+                    source=Source.OZON_CARD,
+                    value_id=hit["id"],
+                    evidence="ozon_api: authoritative category value",
+                ))
+        return resolved
 
     async def _run_safe_enum_fill_stage(
         self,

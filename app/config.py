@@ -178,6 +178,25 @@ UNIT_NORMALIZE_ENABLED: bool = os.getenv(
     "UNIT_NORMALIZE_ENABLED", "true"
 ).lower() not in ("0", "false", "no")
 
+# ---------------------------------------------------------------------------
+# Ozon-API authoritative value resolution for ТН ВЭД / Тип
+# ---------------------------------------------------------------------------
+# The locally cached Ozon dictionary (ozon_dictionary.json.gz) is stale for a
+# few dict-backed fields: ТН ВЭД (22232) ships dictionary_id=None + a generic
+# 66-code sample, and «Тип» ships 4 unrelated values ("Корзина для белья"…) —
+# the SAME garbage on every category. The LIVE Ozon Seller API
+# (/v1/description-category/attribute/values[/search]) returns the real
+# per-category list with value_ids, free (creds already in .env). When True
+# (default), a late pipeline stage resolves ТН ВЭД / Тип via that API: search
+# the proposed value, else LLM-pick from the authoritative category list. This
+# replaces the ТН ВЭД LLM guess (which produced category-invalid codes, e.g.
+# 9504… for a console Ozon files under 8471…) with a real, value_id-backed code.
+# Creds-gated internally (no-op without OZON_CLIENT_ID/OZON_API_KEY). Set
+# OZON_API_RESOLVE_ENABLED=false to disable.
+OZON_API_RESOLVE_ENABLED: bool = os.getenv(
+    "OZON_API_RESOLVE_ENABLED", "true"
+).lower() not in ("0", "false", "no")
+
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set in environment (.env)")
 if not INTERNAL_SERVICE_SECRET:
