@@ -2791,6 +2791,14 @@ def _is_placeholder_value(raw: object) -> bool:
 # otherwise silently dropped every TnvedSource-validated code (value_id=None).
 _TNVED_ATTR_NAME_MARKERS = ("тн вэд", "тнвэд", "еаэс")
 
+# Open-vocabulary required fields (thousands of values / free-text) — never
+# LLM-pick from the live list (hallucination risk). «Бренд» gets a deterministic
+# "Нет бренда" fallback when the brand extractors found nothing (genuinely
+# brandless goods); the others are left to their dedicated free-text levers.
+_OZON_OPEN_VOCAB_REQUIRED = frozenset({
+    "бренд", "производитель", "модель", "название модели", "партномер", "артикул",
+})
+
 
 def _drop_unresolved_optional_enums(
     merged: list[AttributeValue],
@@ -4921,7 +4929,8 @@ class PipelineOrchestrator:
             f'Поле для заполнения: "{target.name}".\n'
             + (f'Категория: {cat_hint}.\n' if cat_hint else "")
             + "Выбери из списка ОДНО значение, наиболее точно подходящее этому товару.\n"
-            "Верни ТОЛЬКО индекс (число). Если ни одно не подходит — верни -1.\n\n"
+            "Верни ТОЛЬКО индекс (число). ВАЖНО: если ты не уверен или ни одно "
+            "значение точно не подходит — верни -1 (пустое поле честнее неверного).\n\n"
             f"Список:\n{listing}"
         )
         try:
@@ -4931,7 +4940,8 @@ class PipelineOrchestrator:
                 llm.structured_request(
                     system_prompt=(
                         "Ты эксперт по классификации товаров для маркетплейса Ozon. "
-                        "Выбираешь ровно одно значение из предложенного списка по индексу."
+                        "Выбираешь ровно одно значение из списка по индексу, и только "
+                        "когда уверен; при сомнении возвращаешь -1."
                     ),
                     user_text=user_text,
                     response_model=_PickResponse,
@@ -4982,35 +4992,7 @@ class PipelineOrchestrator:
         for v in resolved:
             by_attr.setdefault(v.attribute_id, v)
 
-        for t in targets:
-            name_l = (t.name or "").lower()
-            is_tnved = any(m in name_l for m in _TNVED_ATTR_NAME_MARKERS)
-            is_typ = name_l.strip() == "тип"
-            if not (is_tnved or is_typ):
-                continue
-            cur = by_attr.get(t.id)
-            if cur is not None and cur.value_id is not None:
-                continue  # already resolved to an authoritative value_id
-
-            # 1) cheap search by proposed value (or, for empty Тип, category leaf)
-            hit = None
-            query = None
-            if cur is not None and not isinstance(cur.value, list) and str(cur.value).strip():
-                query = str(cur.value).strip()
-            elif is_typ and leaf:
-                query = leaf
-            if query:
-                hit = await search_value(cat_id, type_id, t.id, query)
-
-            # 2) constrained LLM pick from the authoritative live list
-            if hit is None:
-                cands = await list_values(cat_id, type_id, t.id)
-                if cands:
-                    hit = await self._ozon_api_llm_pick(context, t, cands)
-
-            if hit is None:
-                continue
-
+        def _apply_hit(t: TargetAttribute, cur: Optional[AttributeValue], hit: dict) -> None:
             if cur is not None:
                 logger.info(
                     "[OzonApiResolve] attr=%s '%s': %r → %r (value_id=%s)",
@@ -5033,6 +5015,64 @@ class PipelineOrchestrator:
                     value_id=hit["id"],
                     evidence="ozon_api: authoritative category value",
                 ))
+
+        # Generalised to ALL required targets still lacking an authoritative
+        # value_id — not only ТН ВЭД / Тип. Closes niche required holes (Класс
+        # опасности, etc.) via the same authoritative live-list mechanism.
+        for t in targets:
+            if not t.is_required:
+                continue
+            cur = by_attr.get(t.id)
+            if cur is not None and cur.value_id is not None:
+                continue  # already resolved to an authoritative value_id
+            name_l = (t.name or "").lower().strip()
+
+            # Open-vocabulary required fields: never LLM-pick from thousands of
+            # values. Бренд → deterministic "Нет бренда" (extractors found none →
+            # genuinely brandless). The rest are left to their free-text levers.
+            if name_l in _OZON_OPEN_VOCAB_REQUIRED:
+                if name_l == "бренд":
+                    cur_brand = (
+                        str(cur.value).strip()
+                        if cur is not None and not isinstance(cur.value, list)
+                        else ""
+                    )
+                    if cur_brand:
+                        # An extracted brand (e.g. "Xiaomi") that just lacks a
+                        # value_id — resolve IT to the Ozon brand id. NEVER
+                        # overwrite a real brand with "Нет бренда".
+                        hit = await search_value(cat_id, type_id, t.id, cur_brand)
+                        if hit is not None:
+                            _apply_hit(t, cur, hit)
+                        # no Ozon match → keep the extracted brand as free-text
+                    else:
+                        # Genuinely brandless → Ozon's standard "Нет бренда".
+                        hit = await search_value(cat_id, type_id, t.id, "Нет бренда")
+                        if hit is not None:
+                            _apply_hit(t, cur, hit)
+                continue
+
+            # 1) cheap search by proposed value (or, for empty Тип, category leaf)
+            hit = None
+            query = None
+            if cur is not None and not isinstance(cur.value, list) and str(cur.value).strip():
+                query = str(cur.value).strip()
+            elif name_l == "тип" and leaf:
+                query = leaf
+            if query:
+                hit = await search_value(cat_id, type_id, t.id, query)
+
+            # 2) constrained LLM pick from the authoritative live list. Empty
+            #    list ⇒ field is free-text/not-dict-backed (404) ⇒ skip. The pick
+            #    is conservative (returns -1 → no fill) so an ill-fitting required
+            #    field stays honestly empty rather than getting a guessed value.
+            if hit is None:
+                cands = await list_values(cat_id, type_id, t.id)
+                if cands:
+                    hit = await self._ozon_api_llm_pick(context, t, cands)
+
+            if hit is not None:
+                _apply_hit(t, cur, hit)
         return resolved
 
     async def _run_safe_enum_fill_stage(
