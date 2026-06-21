@@ -56,12 +56,17 @@ class _TnvedResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class TnvedJudge(LlmJudge):
-    """Простой детерминированный judge: принимает только ровно 10 цифр."""
+    """Детерминированный judge: ведущий код значения — ровно 10 цифр.
+
+    Значение может быть голым кодом ("9206000000") ИЛИ полным ярлыком словаря
+    Ozon ("9206000000 - Инструменты музыкальные ударные…"). Проверяем ВЕДУЩИЙ
+    10-значный код, а не все цифры строки (в описании ярлыка тоже бывают цифры,
+    напр. «…6103…» — иначе судья ложно отклонял бы валидный ярлык)."""
     source = Source.LLM_KNOWLEDGE
 
     async def validate(self, value: AttributeValue, context: ExtractionContext) -> bool:
-        digits = re.sub(r"\D", "", str(value.value))
-        return len(digits) == 10
+        m = re.match(r"\s*(\d{10})(?:\D|$)", str(value.value))
+        return bool(m)
 
 
 # ---------------------------------------------------------------------------
@@ -134,12 +139,12 @@ class TnvedSource(AttributeSource):
             return []
 
         # 3a. СЛОВАРНАЯ валидация (источник истины — per-category справочник ТН ВЭД
-        # Ozon, подтверждён dict-backed живым list_values). НЕ эвристика по форме
-        # кода: 9206000000 формально валидный заголовок 9206, но Ozon его не принял
-        # для категории барабана, т.к. его НЕТ в справочнике этой категории.
-        #   int      → код есть в справочнике → отдаём с авторитетным value_id;
-        #   _ABSTAIN → креды+type есть, кода НЕТ → не подставляем (no_data, честнее);
-        #   None     → проверить нечем (нет кред/type/API-сбой) → отдаём код как есть.
+        # Ozon, подтверждён dict-backed живым list_values). Ozon для словарного поля
+        # принимает ПОЛНЫЙ ярлык словаря ("9206000000 - Инструменты музыкальные
+        # ударные…") + value_id, а НЕ голый код — иначе «некорректное значение».
+        #   (value, id) → код есть в справочнике → отдаём ПОЛНЫЙ ярлык + value_id;
+        #   _ABSTAIN    → креды+type есть, кода НЕТ → не подставляем (no_data, честнее);
+        #   None        → проверить нечем (нет кред/type/API-сбой) → отдаём код как есть.
         validated = await self._validate_against_ozon_dict(
             code, tnved_target.id, context,
         )
@@ -150,11 +155,18 @@ class TnvedSource(AttributeSource):
             )
             return []
 
+        if isinstance(validated, tuple):
+            out_value, out_value_id = validated  # полный ярлык словаря + value_id
+            confirmed = True
+        else:
+            out_value, out_value_id = code, None  # справочник недоступен — голый код
+            confirmed = False
+
         return [
             AttributeValue(
                 attribute_id=tnved_target.id,
-                value=code,
-                value_id=validated if isinstance(validated, int) else None,
+                value=out_value,
+                value_id=out_value_id,
                 confidence=0.90,
                 source=Source.LLM_KNOWLEDGE,
                 # "tnved_resolver:" prefix is a machine-readable sentinel used by
@@ -163,7 +175,7 @@ class TnvedSource(AttributeSource):
                 # WEB_SEARCH codes that must be dropped.
                 evidence=(
                     "tnved_resolver: ТН ВЭД ЕАЭС, "
-                    + ("подтверждён справочником Ozon" if isinstance(validated, int)
+                    + ("подтверждён справочником Ozon (полный ярлык+value_id)" if confirmed
                        else "резолв по категории (справочник недоступен)")
                 ),
             )
@@ -183,9 +195,11 @@ class TnvedSource(AttributeSource):
         живым list_values, поэтому «не найдено» = реально нет в справочнике.
 
         Returns:
-          int       — код есть в справочнике (авторитетный value_id);
-          _ABSTAIN  — креды+type есть, поиск выполнен, кода НЕТ → не подставлять;
-          None      — проверить нечем (нет кред / type_id / API-сбой) → отдать как есть.
+          (value, id) — код есть в справочнике: ПОЛНЫЙ ярлык словаря Ozon
+                        ("9206000000 - Инструменты музыкальные ударные…") + value_id.
+                        Ozon принимает именно ярлык, а не голый код;
+          _ABSTAIN    — креды+type есть, поиск выполнен, кода НЕТ → не подставлять;
+          None        — проверить нечем (нет кред / type_id / API-сбой) → отдать как есть.
         """
         type_id = context.ozon_type_id
         if type_id is None or not (os.getenv("OZON_CLIENT_ID") and os.getenv("OZON_API_KEY")):
@@ -199,10 +213,12 @@ class TnvedSource(AttributeSource):
             logger.warning("[TnvedSource] dict-валидация ошибка для %s: %s", code, exc)
             return None
         if hit:
-            # Ведущий код значения: "3926200000 - Одежда…" → "3926200000".
-            lead = re.match(r"\s*(\d{6,10})", str(hit.get("value", "")))
+            hit_value = str(hit.get("value", ""))
+            # Ведущий код значения: "9206000000 - Инструменты…" → "9206000000".
+            lead = re.match(r"\s*(\d{6,10})", hit_value)
             if lead and lead.group(1) == code:
-                return hit.get("id")  # подтверждён + value_id из справочника
+                # ПОЛНЫЙ ярлык словаря + value_id — то, что принимает Ozon.
+                return (hit_value, hit.get("id"))
         return _ABSTAIN  # dict-backed, поиск выполнен, точного кода нет → abstain
 
     @staticmethod
