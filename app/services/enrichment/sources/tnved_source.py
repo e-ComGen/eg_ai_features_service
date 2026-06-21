@@ -34,19 +34,12 @@ from app.services.providers.factory import get_main_manager
 logger = logging.getLogger(__name__)
 
 
-# Заголовок ТАМОЖЕННОЙ группы (4 значащих + 6 нулей, напр. 9206000000) — это НЕ
-# валидный код для декларирования (Ozon отклоняет). LLM часто отдаёт именно его,
-# когда «угадывает» по группе. Детерминированно отбрасываем.
-_GROUP_HEADER_RE = re.compile(r"^\d{4}0{6}$")
-
-
-def _is_group_header_code(code: str) -> bool:
-    """True если код — заголовок группы (NNNN000000), не валидный для декларации."""
-    return bool(_GROUP_HEADER_RE.match(code))
-
-
 # Sentinel: «справочник Ozon искали (есть креды+type_id), кода НЕТ» → abstain.
-# Отличается от None («не смогли проверить — отдать как есть»).
+# Отличается от None («не смогли проверить — отдать код как есть»).
+# Источник истины для ТН ВЭД — per-category справочник Ozon (подтверждён
+# dict-backed живым list_values), а НЕ эвристика по форме кода: 9206000000 —
+# формально валидный заголовок 9206, но Ozon его не принимает для категорий, где
+# его нет в справочнике. Только справочник решает.
 _ABSTAIN = object()
 
 
@@ -140,38 +133,37 @@ class TnvedSource(AttributeSource):
             logger.debug("[TnvedSource] category %s: could not resolve ТН ВЭД", cat_id)
             return []
 
-        # 3a. Гард заголовка группы: 9206000000 и подобные — Ozon отклоняет.
-        if _is_group_header_code(code):
-            logger.info(
-                "[TnvedSource] code %s — заголовок группы, невалиден для декларации "
-                "→ abstain (пусто честнее отклонёнки)", code,
-            )
-            return []
-
-        # 3b. Сверка с справочником ТН ВЭД Ozon — ПОЗИТИВНАЯ (безопасная):
-        # код найден → вешаем авторитетный value_id из справочника. Не найден /
-        # справочник недоступен → отдаём код как есть (гард группы уже прошёл).
-        # Strict-abstain «нет в справочнике → не заполнять» НЕ включаем здесь: пока
-        # не подтверждено живым вызовом, что ТН ВЭД у Ozon dict-backed (иначе 404
-        # на не-словарном атрибуте убил бы ВСЕ коды). См. TODO strict-mode.
-        validated_id = await self._validate_against_ozon_dict(
+        # 3a. СЛОВАРНАЯ валидация (источник истины — per-category справочник ТН ВЭД
+        # Ozon, подтверждён dict-backed живым list_values). НЕ эвристика по форме
+        # кода: 9206000000 формально валидный заголовок 9206, но Ozon его не принял
+        # для категории барабана, т.к. его НЕТ в справочнике этой категории.
+        #   int      → код есть в справочнике → отдаём с авторитетным value_id;
+        #   _ABSTAIN → креды+type есть, кода НЕТ → не подставляем (no_data, честнее);
+        #   None     → проверить нечем (нет кред/type/API-сбой) → отдаём код как есть.
+        validated = await self._validate_against_ozon_dict(
             code, tnved_target.id, context,
         )
+        if validated is _ABSTAIN:
+            logger.info(
+                "[TnvedSource] code %s НЕ в справочнике ТН ВЭД Ozon для cat=%s "
+                "→ abstain (Ozon отклонил бы; no_data честнее)", code, cat_id,
+            )
+            return []
 
         return [
             AttributeValue(
                 attribute_id=tnved_target.id,
                 value=code,
-                value_id=validated_id if isinstance(validated_id, int) else None,
+                value_id=validated if isinstance(validated, int) else None,
                 confidence=0.90,
                 source=Source.LLM_KNOWLEDGE,
                 # "tnved_resolver:" prefix is a machine-readable sentinel used by
                 # the TNVED_SOURCE_FIX_ENABLED filter in pipeline._finalize_async
-                # to distinguish TnvedSource fills (trusted, validated 10-digit code)
-                # from garbage LLM_KNOWLEDGE/WEB_SEARCH codes that must be dropped.
+                # to distinguish TnvedSource fills from garbage LLM_KNOWLEDGE/
+                # WEB_SEARCH codes that must be dropped.
                 evidence=(
                     "tnved_resolver: ТН ВЭД ЕАЭС, "
-                    + ("подтверждён справочником Ozon" if isinstance(validated_id, int)
+                    + ("подтверждён справочником Ozon" if isinstance(validated, int)
                        else "резолв по категории (справочник недоступен)")
                 ),
             )
@@ -185,16 +177,19 @@ class TnvedSource(AttributeSource):
     ):
         """Сверить код с справочником ТН ВЭД Ozon.
 
+        Справочник Ozon отдаёт значения в форме "КОД - описание" (напр.
+        "3926200000 - Одежда..."), поэтому сверяем код с ВЕДУЩИМИ цифрами значения,
+        а не со всеми (в описании тоже есть цифры). ТН ВЭД подтверждён dict-backed
+        живым list_values, поэтому «не найдено» = реально нет в справочнике.
+
         Returns:
-          int   — код подтверждён справочником (авторитетный value_id);
-          None  — не подтверждён (нет кред / type_id / API-сбой / не найден) →
-                  отдать код как есть (гард группы уже отсёк заголовки).
-        TODO strict-mode: когда живым вызовом подтвердим, что ТН ВЭД dict-backed,
-        включить abstain при «creds+type есть, но кода нет» (вернуть _ABSTAIN).
+          int       — код есть в справочнике (авторитетный value_id);
+          _ABSTAIN  — креды+type есть, поиск выполнен, кода НЕТ → не подставлять;
+          None      — проверить нечем (нет кред / type_id / API-сбой) → отдать как есть.
         """
         type_id = context.ozon_type_id
         if type_id is None or not (os.getenv("OZON_CLIENT_ID") and os.getenv("OZON_API_KEY")):
-            return None  # нечем валидировать — отдаём (гард уже прошёл)
+            return None  # нечем валидировать — отдаём код как есть
         try:
             from app.services.enrichment.strategies.dictionaries.ozon_runtime_lookup import (
                 search_value,
@@ -204,10 +199,11 @@ class TnvedSource(AttributeSource):
             logger.warning("[TnvedSource] dict-валидация ошибка для %s: %s", code, exc)
             return None
         if hit:
-            hit_digits = re.sub(r"\D", "", str(hit.get("value", "")))
-            if code == hit_digits or code in hit_digits:
+            # Ведущий код значения: "3926200000 - Одежда…" → "3926200000".
+            lead = re.match(r"\s*(\d{6,10})", str(hit.get("value", "")))
+            if lead and lead.group(1) == code:
                 return hit.get("id")  # подтверждён + value_id из справочника
-        return None  # не подтверждён — отдаём код как есть (safe; strict-mode TODO)
+        return _ABSTAIN  # dict-backed, поиск выполнен, точного кода нет → abstain
 
     @staticmethod
     def _make_cache_key(
