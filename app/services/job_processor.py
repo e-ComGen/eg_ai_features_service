@@ -18,24 +18,16 @@ from .. import config as _config
 # ---------------------------------------------------------------------------
 # New pipeline integration (feature flag USE_NEW_PIPELINE)
 # ---------------------------------------------------------------------------
-# When config.USE_NEW_PIPELINE is True, process_product routes through
-# PipelineAdapter -> PipelineOrchestrator instead of the legacy per-feature flow.
-#
-# TODO(integration): Complete the wiring in process_product below.
-#   The adapter is imported and instantiated but the actual call to
-#   self._pipeline_adapter.run(...) is not yet connected to the full
-#   schema/product mapping because:
-#     1. legacy schema is Dict[str, FeatureOption] (name-keyed, no numeric id)
-#        while TargetAttribute expects an int id — need to decide id assignment
-#        strategy (use hash / DB lookup / positional index).
-#     2. legacy result is {feature_name: value} + debug_info + tokens_used
-#        while orchestrator returns List[base.AttributeValue] — the conversion
-#        helper PipelineAdapter.convert_to_legacy_dict handles value mapping
-#        but debug_info / tokens_used fields would be empty for the new path.
-#     3. caching: the new path bypasses db_cache entirely — decide if caching
-#        should be added at adapter level or removed for the new path.
-#   Until TODO is resolved, enabling USE_NEW_PIPELINE logs a warning and falls
-#   back to the legacy path so no existing behaviour is broken.
+# When config.USE_NEW_PIPELINE is True (PROD воркер запускается с этим env),
+# process_product routes through PipelineAdapter -> PipelineOrchestrator instead
+# of the legacy per-feature flow. WIRING DONE: self._pipeline_adapter.run(...) is connected
+# (see process_product below), schema→TargetAttribute id = caller's real attr id
+# or positional index, and _values_to_legacy_format emits the v2 contract
+# (filled_features + debug_info{value_id,confidence,evidence,source,...} + skipped).
+#   Known Tier-2 TODOs (non-blocking):
+#     - tokens_used = 0 (per-call token counter not yet threaded for billing).
+#     - new path bypasses db_cache by design (avoids stale/poisoned cache);
+#       product-fingerprint cache at adapter level is a future optimisation.
 try:
     from .enrichment.pipeline_adapter import PipelineAdapter as _PipelineAdapter
     _PIPELINE_ADAPTER_AVAILABLE = True
@@ -175,17 +167,27 @@ class JobProcessor:
         values: list[AttributeValue],
         schema: dict[str, FeatureOption],
         targets_raw: list[dict],
+        marketplace: Optional[str] = None,
     ) -> dict:
         """Convert orchestrator output (list[AttributeValue]) to the legacy process_product return format.
 
-        Legacy format:
+        Contract v2 (consumed by eg_importer — отчёт/Excel строит ОН):
             {
                 "product_id": int,          # caller must set this
-                "filled_features": dict,    # feature_name -> value
-                "debug_info": dict,         # feature_name -> {source, confidence, evidence, judge_validated}
+                "filled_features": dict,    # feature_name -> value (заполненные)
+                "debug_info": dict,         # feature_name -> {
+                                            #   attribute_id:int, value_id:int|None,
+                                            #   value_ids:list[int]|None, is_collection:bool,
+                                            #   semantic_type:str|None, source:str|None,
+                                            #   confidence:float, evidence:str|None,
+                                            #   judge_validated:bool, ...legacy placeholders}
                 "tokens_used": int,         # approximate; exact tracking is TODO Tier 2
                 "is_cached": bool,          # new path never caches (TODO Tier 2)
             }
+        ПРИНЦИП: этот сервис отдаёт ТОЛЬКО то, что достаётся у него — значение +
+        авторитетный value_id + источник/уверенность/evidence. Подсчёт
+        заполнено/не-заполнено, вёрстку Excel и выходной файл делает eg_importer
+        (у него есть полный список запрошенных targets → diff по filled_features).
 
         Cost tracking note:
             PipelineOrchestrator does not expose a per-call token count.
@@ -211,6 +213,13 @@ class JobProcessor:
             f_name = id_to_name.get(av.attribute_id, str(av.attribute_id))
             filled_features[f_name] = av.value
             debug_info[f_name] = {
+                # --- CONTRACT v2 (eg_importer): authoritative + identity fields ---
+                "attribute_id": av.attribute_id,   # стабильный числовой ключ (имена хрупкие)
+                "value_id": av.value_id,           # словарный ID Ozon (одиночное) — нужен для импорта
+                "value_ids": av.value_ids,         # словарные ID Ozon (коллекция is_collection)
+                "is_collection": av.is_collection, # value — массив, не скаляр
+                "semantic_type": av.semantic_type, # color|weight|brand… подсказка downstream
+                # --- grounding metadata (только мы это знаем) ---
                 "source": av.source.value if av.source else None,
                 "confidence": av.confidence,
                 "evidence": av.evidence,
@@ -222,12 +231,75 @@ class JobProcessor:
                 "source_urls": None,
             }
 
+        # --- skipped-блок (contract v2): причина пустоты per НЕзаполненный target ---
+        # «Знаем только мы»: платформенное поле (учётные данные продавца, заполнять
+        # нельзя) vs нет данных ни в одном источнике. eg_importer пишет это в отчёт
+        # как 🔒 «ваше поле» vs — «нет данных», не считая платформенное недоработкой.
+        skipped = self._build_skipped(values, targets_raw, marketplace)
+
         return {
             "filled_features": filled_features,
             "debug_info": debug_info,
+            "skipped": skipped,
             "tokens_used": 0,  # TODO(Tier-2-cost-tracking): sum from ExtractionContext.tokens_used
             "is_cached": False,  # TODO(Tier-2-cache): add product-fingerprint cache at adapter level
         }
+
+    @staticmethod
+    def _build_skipped(
+        values: list[AttributeValue],
+        targets_raw: list[dict],
+        marketplace: Optional[str],
+    ) -> dict:
+        """feature_name -> {attribute_id, reason} для каждого НЕзаполненного target.
+
+        reason:
+          "platform_field" — учётное/платформенное поле (баркод/НДС/декларации/ИКПУ…),
+                              сервис намеренно не заполняет → eg_importer метит 🔒.
+          "no_data"        — поле извлекаемое, но ни один источник не дал значение.
+        (Отброс по low-confidence на этом слое неразличим от no_data — кандидаты уже
+        отсеяны пайплайном; при необходимости пробросить — Tier-2.)
+        """
+        try:
+            if (marketplace or "").lower() == "wb":
+                from app.services.enrichment.strategies.dictionaries.wb_field_classifier import (
+                    is_wb_platform_field as _is_platform,
+                )
+            else:
+                from app.services.enrichment.strategies.dictionaries.ozon_field_classifier import (
+                    is_platform_field as _is_platform,
+                )
+        except Exception:  # pragma: no cover — classifier import optional
+            _is_platform = None
+
+        filled_ids = {av.attribute_id for av in values}
+        skipped: dict = {}
+        for idx, raw in enumerate(targets_raw):
+            raw_id = raw.get("id") or raw.get("attribute_id")
+            try:
+                attr_id = int(raw_id) if raw_id is not None else idx
+            except (TypeError, ValueError):
+                attr_id = idx
+            if attr_id in filled_ids:
+                continue
+            name = raw.get("name", str(attr_id))
+            reason = "no_data"
+            if _is_platform is not None:
+                # классификатор читает name/type/is_required/values(=allowed_values)
+                char = {
+                    "name": name,
+                    "type": raw.get("type"),
+                    "is_required": raw.get("is_required"),
+                    "values": raw.get("allowed_values"),
+                    "popular": raw.get("popular"),
+                }
+                try:
+                    if _is_platform(char):
+                        reason = "platform_field"
+                except Exception:  # pragma: no cover
+                    pass
+            skipped[name] = {"attribute_id": attr_id, "reason": reason}
+        return skipped
 
     async def process_product(
         self,
@@ -251,10 +323,13 @@ class JobProcessor:
             # the stable id that both adapter and _values_to_legacy_format agree on.
             targets_raw = [
                 {
-                    "id": idx,
+                    # Real Ozon attribute_id when the caller supplies it (eg-importer);
+                    # falls back to the positional index for callers that don't.
+                    "id": getattr(f_schema, "id", None) or idx,
                     "name": f_name,
                     "type": getattr(f_schema, "type", "text"),
                     "allowed_values": getattr(f_schema, "options", None) or None,
+                    "is_required": bool(getattr(f_schema, "is_required", False)),
                     "semantic_type": None,  # TODO Tier 2: infer from feature name via classifier
                 }
                 for idx, (f_name, f_schema) in enumerate(schema.items())
@@ -267,12 +342,16 @@ class JobProcessor:
                 category_path=getattr(product, "category_path", []),
                 brand=getattr(product, "brand", None),
                 ean=getattr(product, "ean", None),
+                ozon_type_id=getattr(product, "ozon_type_id", None),
                 source_urls=getattr(product, "source_urls", []),
                 image_urls=getattr(product, "image_urls", []),
                 targets_raw=targets_raw,
                 marketplace=options.marketplace if options else None,
             )
-            result_dict = self._values_to_legacy_format(av_list, schema, targets_raw)
+            result_dict = self._values_to_legacy_format(
+                av_list, schema, targets_raw,
+                marketplace=options.marketplace if options else None,
+            )
             return {
                 "product_id": product.id,
                 **result_dict,

@@ -88,8 +88,12 @@ VAGUE_FEATURE_PATTERNS = [
 # ---------------------------------------------------------------------------
 # When True, job_processor routes attribute filling through PipelineOrchestrator
 # via PipelineAdapter instead of the legacy per-feature LLM flow.
-# Default OFF so existing behaviour is completely unchanged.
-# Enable via env: USE_NEW_PIPELINE=true (or "1" / "yes").
+# Новый путь — единственный, где живёт всё качество (value_id-резолв, маркетплейс-
+# пул, merge) И контракт v2 (value_id/confidence/evidence/skipped для eg_importer);
+# он также обходит db_cache (не тянет отравленный кэш). ПРОД (воркер :8002)
+# запускается с USE_NEW_PIPELINE=true в env. Дефолт оставлен false до миграции
+# legacy-path тестов (часть из них пинят старый путь без флага). TODO: сделать
+# новый путь дефолтным, запинив legacy-тесты на USE_NEW_PIPELINE=false.
 USE_NEW_PIPELINE: bool = os.getenv("USE_NEW_PIPELINE", "false").lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------

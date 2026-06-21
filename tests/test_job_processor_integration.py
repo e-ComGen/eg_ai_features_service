@@ -199,8 +199,8 @@ async def test_new_path_called_when_flag_on_returns_legacy_format(monkeypatch):
         client_id=1,
     )
 
-    # All five legacy keys present
-    assert set(result.keys()) == {"product_id", "filled_features", "debug_info", "tokens_used", "is_cached"}
+    # Contract v2 keys present (added "skipped": причина пустоты per НЕзаполненный target)
+    assert set(result.keys()) == {"product_id", "filled_features", "debug_info", "skipped", "tokens_used", "is_cached"}
 
     # tokens_used is int (0 for new path — see TODO Tier-2-cost-tracking)
     assert isinstance(result["tokens_used"], int)
