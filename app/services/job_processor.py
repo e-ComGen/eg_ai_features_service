@@ -45,6 +45,19 @@ _VAGUE_FEATURE_REGEXES = [
 ]
 
 
+def _is_empty_value(value) -> bool:
+    """True если значение «пустое» и не должно считаться заполненным.
+
+    None, пустая строка, пустой список, или список из одних пустышек. Используется
+    как гард контракт-инварианта в _values_to_legacy_format (пустое ≠ filled).
+    """
+    if value is None or value == "" or value == []:
+        return True
+    if isinstance(value, list):
+        return not any(str(x).strip() for x in value)
+    return not str(value).strip()
+
+
 def is_vague_feature_name(name: str) -> bool:
     """
     Returns True if the feature name is a placeholder / meaningless label
@@ -196,6 +209,13 @@ class JobProcessor:
             (e.g. ExtractionContext.tokens_used: int = 0) and increment it inside
             each AttributeSource.extract() call. Expose via orchestrator and sum here.
         """
+        # Гард контракт-инварианта: av с ПУСТЫМ значением (None/""/[] /список из
+        # пустышек) — НЕ «заполнено». Иначе он сел бы в filled_features fake-fill'ом
+        # И выпал бы из skipped (filled_ids его id содержит) → target оказался бы ни
+        # в filled, ни в skipped (протечка). Фильтруем ДО обоих шагов, чтобы такой
+        # target честно ушёл в skipped как no_data.
+        values = [av for av in values if not _is_empty_value(av.value)]
+
         # Build int-id -> feature_name lookup (mirrors adapter's id assignment logic)
         id_to_name: dict[int, str] = {}
         for idx, raw in enumerate(targets_raw):
