@@ -2902,15 +2902,17 @@ def _drop_ungrounded_color_guess(
         return merged
     out: list[AttributeValue] = []
     for v in merged:
-        if (
-            v.attribute_id in color_ids
-            and isinstance(v.value, list)
-            and len(v.value) >= 2
-        ):
+        # Мульти-цвет в ЛЮБОЙ форме: список value (≥2) ИЛИ скаляр value со списком
+        # value_ids (≥2). Донор ozon_card отдаёт value="черный" (СКАЛЯР) + value_ids
+        # на 10/40 цветов — основной цвет одного SKU столько id иметь не может.
+        # Поэтому условие вешаем на ДЛИНУ value_ids, а не на форму value.
+        vlist = isinstance(v.value, list) and len(v.value) >= 2
+        idlist = isinstance(v.value_ids, list) and len(v.value_ids) >= 2
+        if v.attribute_id in color_ids and (vlist or idlist):
             logger.info(
                 "[Pipeline] drop-multivalue-color: дроп мульти-цвета attr=%s src=%s "
-                "value=%r — палитра/разброс, не цвет этого SKU",
-                v.attribute_id, v.source, v.value,
+                "value=%r value_ids=%s — палитра/разброс, не цвет этого SKU",
+                v.attribute_id, v.source, v.value, v.value_ids,
             )
             continue
         out.append(v)

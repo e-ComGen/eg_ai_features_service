@@ -70,6 +70,19 @@ def test_ozon_card_multicolor_palette_dropped():
     assert out == []  # мульти-цвет не привязан к этому SKU → дроп
 
 
+def test_scalar_value_with_palette_value_ids_dropped():
+    """ozon_card форма: value='черный' СКАЛЯР + value_ids=[10/40] → дроп.
+
+    Реальный кейс eg_importer (Adidas 10 ids, PUMA 40): value не список, но
+    value_ids — палитра. Условие на длину value_ids, не на форму value.
+    """
+    av = _av(value="черный", value_ids=[61574, 61571, 61581, 61576, 61579,
+                                        61580, 61583, 61578, 61585, 61586],
+             is_collection=True, source=Source.OZON_CARD)
+    out = _drop_ungrounded_color_guess([av], _TARGETS)
+    assert out == []
+
+
 def test_single_grounded_color_kept():
     """Одиночный grounded-цвет (primary) НЕ трогаем."""
     av = _av(value=["черный"], value_ids=[61574], is_collection=True, source=Source.OZON_CARD)
