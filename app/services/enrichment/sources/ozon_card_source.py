@@ -103,6 +103,45 @@ _OZON_CARD_TOTAL_TIMEOUT = 45.0  # Hard cap on the entire _do_extract (Scrappey 
                                   # Serper-snippet fallback which is what the eval showed
                                   # actually recovers the data when Scrappey hangs.
 
+# ── Scrappey антибот-тюнинг (data-driven; Ozon = RU geo-sensitive) ──────────
+# Раньше слался ГОЛЫЙ {"cmd":"request.get","url":...} — датацентр-IP, без гео, без
+# session. Для Ozon (антибот Qrator) это худший режим → «висит до таймаута». Главные
+# рычаги пробития включаем через env; дефолты под Ozon.
+#   • proxyCountry=Russia — критичный гео-рычаг: без RU-IP Ozon отдаёт капчу/блок.
+#     Дефолт ON (источник Ozon-only, RU geo строго корректен; pure win, не прячем).
+#   • requestType — "browser" (полный рендер+антибот) / "request" (быстрый). ""→не
+#     шлём (cmd:request.get уже браузерный по умолчанию). Опц., под замер.
+#   • proxy — кастомный residential URL (http/socks). ""→не шлём (Scrappey-дефолт).
+#   • session-reuse — общая session на оба вызова (search+features) держит прогретую
+#     антибот-куку. Дефолт OFF: fresh-uuid session требует валидации (создаётся ли
+#     неявно), включаем под измерительный прогон. [[reference_ozon_dict_attr_contract]]
+_SCRAPPEY_PROXY_COUNTRY = os.getenv("OZON_SCRAPPEY_PROXY_COUNTRY", "Russia").strip()
+_SCRAPPEY_REQUEST_TYPE = os.getenv("OZON_SCRAPPEY_REQUEST_TYPE", "").strip()
+_SCRAPPEY_PROXY = os.getenv("OZON_SCRAPPEY_PROXY", "").strip()
+_SCRAPPEY_SESSION_REUSE = os.getenv(
+    "OZON_SCRAPPEY_SESSION_REUSE", "0"
+).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _build_scrappey_payload(target_url: str, session: Optional[str] = None) -> dict:
+    """Собрать Scrappey-payload с антибот-рычагами (proxyCountry/proxy/requestType/session).
+
+    База — legacy cmd-формат (publisher.scrappey.com/api/v1 его принимает); поверх
+    кладём top-level параметры, которые v1 honor-ит вместе с cmd. Пустые env → ключ
+    опускаем (Scrappey берёт свой дефолт). proxyCountry=Russia критичен для Ozon.
+    """
+    payload: dict[str, Any] = {"cmd": "request.get", "url": target_url}
+    if _SCRAPPEY_PROXY_COUNTRY:
+        payload["proxyCountry"] = _SCRAPPEY_PROXY_COUNTRY
+    if _SCRAPPEY_PROXY:
+        payload["proxy"] = _SCRAPPEY_PROXY
+    if _SCRAPPEY_REQUEST_TYPE:
+        payload["requestType"] = _SCRAPPEY_REQUEST_TYPE
+    if session:
+        payload["session"] = session
+    return payload
+
+
 # Regex для парсинга
 _PRODUCT_LINK_RE = re.compile(
     r'<a[^>]+href="(/product/([a-z0-9\-]+)-(\d+)/)[^"]*"[^>]*>(.*?)</a>',
@@ -1001,6 +1040,7 @@ class OzonCardSource(AttributeSource):
         client: httpx.AsyncClient,
         target_url: str,
         min_len: int = _MIN_VALID_HTML_LEN,
+        session: Optional[str] = None,
     ) -> Optional[str]:
         """POST к Scrappey с retry, возвращает HTML response от target_url.
 
@@ -1020,7 +1060,7 @@ class OzonCardSource(AttributeSource):
         for attempt in range(_MAX_RETRIES + 1):
             try:
                 content = await asyncio.wait_for(
-                    self._scrappey_fetch_once(client, target_url),
+                    self._scrappey_fetch_once(client, target_url, session),
                     timeout=_SCRAPPEY_PER_ATTEMPT_TIMEOUT,
                 )
             except asyncio.TimeoutError:
@@ -1074,9 +1114,10 @@ class OzonCardSource(AttributeSource):
         self,
         client: httpx.AsyncClient,
         target_url: str,
+        session: Optional[str] = None,
     ) -> Optional[str]:
         """Один POST к Scrappey, без retry."""
-        payload = {"cmd": "request.get", "url": target_url}
+        payload = _build_scrappey_payload(target_url, session)
         try:
             r = await client.post(
                 _SCRAPPEY_ENDPOINT,
@@ -1163,6 +1204,11 @@ class OzonCardSource(AttributeSource):
         if fallback_query and fallback_query != primary_query:
             queries_to_try.append(fallback_query)
 
+        # Общая Scrappey-session на оба вызова (search+features): прогретая антибот-кука
+        # переиспользуется, не проходим Qrator заново каждым запросом. Дефолт OFF
+        # (_SCRAPPEY_SESSION_REUSE) — включается под измерительный прогон.
+        session = uuid.uuid4().hex if _SCRAPPEY_SESSION_REUSE else None
+
         query: Optional[str] = None
         tiles: list[dict] = []
         for q in queries_to_try:
@@ -1170,7 +1216,7 @@ class OzonCardSource(AttributeSource):
                 "[OzonCard] search query: '%s' (was: '%s')",
                 q, full_name[:80],
             )
-            html = await self._scrappey_fetch(client, f"{_OZON_SEARCH_URL}?text={q}")
+            html = await self._scrappey_fetch(client, f"{_OZON_SEARCH_URL}?text={q}", session=session)
             if html is None:
                 continue
             parsed = self._parse_search_tiles_html(html)
@@ -1207,7 +1253,7 @@ class OzonCardSource(AttributeSource):
         # re-score; keep the better of the two attempts. The hard total timeout
         # (_OZON_CARD_TOTAL_TIMEOUT) still bounds the whole _do_extract.
         if (top_tile is None or mode == "skip") and query is not None:
-            retry_html = await self._scrappey_fetch(client, f"{_OZON_SEARCH_URL}?text={query}")
+            retry_html = await self._scrappey_fetch(client, f"{_OZON_SEARCH_URL}?text={query}", session=session)
             if retry_html is not None:
                 retry_tiles = self._parse_search_tiles_html(retry_html)
                 if retry_tiles:
@@ -1269,7 +1315,7 @@ class OzonCardSource(AttributeSource):
 
         # ---- FEATURES (HTML SSR) ----
         features_url = f"{_OZON_PRODUCT_BASE}{slug}-{pid}/features/"
-        features_html = await self._scrappey_fetch(client, features_url)
+        features_html = await self._scrappey_fetch(client, features_url, session=session)
         if features_html is None:
             return {
                 "query": used_query,
