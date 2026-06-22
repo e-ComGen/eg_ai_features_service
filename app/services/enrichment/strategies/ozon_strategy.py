@@ -684,6 +684,13 @@ class OzonStrategy(MarketplaceStrategy):
         Если у характеристики нет values-списка — возвращает без изменений.
         Для атрибутов с values_truncated=True используй resolve_value_ids_async.
         """
+        # ТН ВЭД: tnved_source уже привязал АВТОРИТЕТНЫЙ живой value_id (search_value
+        # API). Статический словарь держит лишь ~50 sample-кодов на категорию со
+        # СТАЛЫМИ id — пере-резолв по строке-ярлыку перетёр бы верный live-id неверным
+        # (один static-id коллапсировал на десятки разных кодов). Не трогаем.
+        if (attribute_value.evidence or "").startswith("tnved_resolver:"):
+            return attribute_value
+
         cat_id = context.category_id
         type_id = context.ozon_type_id
         attr_id = attribute_value.attribute_id
@@ -730,6 +737,11 @@ class OzonStrategy(MarketplaceStrategy):
         Returns:
             The same AttributeValue object, mutated in-place with value_id / value_ids.
         """
+        # ТН ВЭД: live value_id от tnved_source — авторитетнее статического словаря
+        # (см. resolve_value_ids). Не перетираем.
+        if (attribute_value.evidence or "").startswith("tnved_resolver:"):
+            return attribute_value
+
         cat_id = context.category_id
         type_id = context.ozon_type_id
         attr_id = attribute_value.attribute_id
