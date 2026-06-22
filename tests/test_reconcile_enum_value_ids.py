@@ -8,7 +8,10 @@ ids строго из текста.
 from __future__ import annotations
 
 from app.services.enrichment.base import AttributeValue, TargetAttribute, Source
-from app.services.enrichment.pipeline import _reconcile_enum_value_ids
+from app.services.enrichment.pipeline import (
+    _reconcile_enum_value_ids,
+    _drop_ungrounded_color_guess,
+)
 
 
 COLOR_ID = 10096
@@ -54,3 +57,28 @@ def test_collection_length_mismatch_is_reset():
     av = _av(value=["черный"], value_ids=list(range(15)), is_collection=True)
     out = _reconcile_enum_value_ids([av], _TARGETS)[0]
     assert out.value_ids is None
+
+
+# ── _drop_ungrounded_color_guess: мульти-цвет от ЛЮБОГО источника → no_data ──
+
+def test_ozon_card_multicolor_palette_dropped():
+    """Выровненная мульти-цвет палитра от ozon_card (донор) → дроп (no_data)."""
+    av = _av(value=["черный", "белый", "синий", "серый", "красный"],
+             value_ids=[61574, 61571, 61581, 61576, 61579],
+             is_collection=True, source=Source.OZON_CARD)
+    out = _drop_ungrounded_color_guess([av], _TARGETS)
+    assert out == []  # мульти-цвет не привязан к этому SKU → дроп
+
+
+def test_single_grounded_color_kept():
+    """Одиночный grounded-цвет (primary) НЕ трогаем."""
+    av = _av(value=["черный"], value_ids=[61574], is_collection=True, source=Source.OZON_CARD)
+    out = _drop_ungrounded_color_guess([av], _TARGETS)
+    assert len(out) == 1 and out[0].value == ["черный"]
+
+
+def test_scalar_color_kept():
+    """Скалярный цвет НЕ трогаем."""
+    av = _av(value="черный", value_id=61574, source=Source.OZON_CARD)
+    out = _drop_ungrounded_color_guess([av], _TARGETS)
+    assert len(out) == 1

@@ -2883,14 +2883,19 @@ def _drop_ungrounded_color_guess(
     merged: list[AttributeValue],
     targets: list[TargetAttribute],
 ) -> list[AttributeValue]:
-    """Дроп ungrounded llm_knowledge-цвета в форме СПИСКА (мульти-цвет).
+    """Дроп МУЛЬТИ-цвет «Цвет товара» (СПИСОК ≥2) от ЛЮБОГО источника → no_data.
 
-    Цвет — per-SKU визуальный признак конкретной расцветки. Обучающая память LLM
-    его не знает: на «Nike Air Max 90» она выдаёт СПИСОК ходовых цветов
-    («белый/чёрный/серый/красный/синий») — галлюцинированный разброс, а не цвет
-    товара. У одного SKU одна расцветка, поэтому llm_knowledge-СПИСОК цветов = мусор
-    → дроп (no_data, «пусто честнее мусора»). Grounded-цвет (ozon_card/web_search/
-    vision с фото) и одиночное значение НЕ трогаем.
+    «Цвет товара» (Ozon) = ОСНОВНОЙ/доминирующий цвет ОДНОГО SKU. Мульти-цвет
+    коллекция — это НЕ цвет этого товара, а:
+      • llm_knowledge — галлюцинированный разброс ходовых цветов («Nike Air Max 90»
+        → белый/чёрный/серый/красный/синий);
+      • ozon_card — палитра ВСЕХ расцветок модели от донор-карточки (мульти-
+        вариантный листинг: «Adidas Runfalcon» → черный/белый/синий/серый/красный;
+        «PUMA» → 39 цветов). Выровненная по value↔value_ids, поэтому reconcile её
+        не ловит, но к ЭТОМУ SKU она не привязана.
+    Из названия конкретную расцветку не вывести → честнее no_data, чем залить пачку
+    неверных цветов (eg_importer: «grounded-цвет для ЭТОГО товара либо no_data»).
+    Одиночный (grounded primary) цвет НЕ трогаем.
     """
     color_ids = {t.id for t in targets if _is_color_target(t)}
     if not color_ids:
@@ -2899,14 +2904,13 @@ def _drop_ungrounded_color_guess(
     for v in merged:
         if (
             v.attribute_id in color_ids
-            and v.source == Source.LLM_KNOWLEDGE
             and isinstance(v.value, list)
             and len(v.value) >= 2
         ):
             logger.info(
-                "[Pipeline] drop-ungrounded-color: дроп llm_knowledge-цвета attr=%s "
-                "value=%r — мульти-цвет из обучающей памяти (галлюцинация расцветки)",
-                v.attribute_id, v.value,
+                "[Pipeline] drop-multivalue-color: дроп мульти-цвета attr=%s src=%s "
+                "value=%r — палитра/разброс, не цвет этого SKU",
+                v.attribute_id, v.source, v.value,
             )
             continue
         out.append(v)
