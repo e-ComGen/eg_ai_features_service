@@ -53,6 +53,12 @@ _OZON_CROSSFILL_PAIRS: tuple[tuple[int, int], ...] = (
 # R1: Атрибут «Объединить на одной карточке» (8292) — строится из бренд+модель.
 # Если поле пусто ИЛИ содержит буквальный label поля (невалидно), деривируем.
 _CARD_GROUP_ATTR_ID = 8292
+# Источники, чьё значение для 8292 считаем ненадёжным (угадайка): детерминированная
+# деривация бренд+модель их перебивает. Grounded-источники (OZON_CARD/WB_CARD/
+# DESCRIPTION из собственных данных продавца) НЕ трогаем.
+_CARD_GROUP_UNGROUNDED_SOURCES: frozenset[Source] = frozenset({
+    Source.LLM_KNOWLEDGE, Source.VISION, Source.WEB_SEARCH, Source.SAFE_ENUM_FILL,
+})
 # Стоп-слова категории/гендера, которые нужно срезать из product_name при деривации 8292
 _CARD_GROUP_STOPWORDS: frozenset[str] = frozenset({
     "мужской", "мужская", "мужское", "мужские",
@@ -568,15 +574,22 @@ class OzonStrategy(MarketplaceStrategy):
             )
             field_label = (card_group_target.name if card_group_target else "").lower()
             existing_val: Optional[str] = None
+            existing_src: Optional[Source] = None
             if _CARD_GROUP_ATTR_ID in existing_ids:
                 existing_av = values_by_id.get(_CARD_GROUP_ATTR_ID)
                 if existing_av and existing_av.value is not None:
                     existing_val = str(existing_av.value).strip()
-            # Считаем невалидным: пусто ИЛИ значение совпадает с именем поля/label
+                    existing_src = existing_av.source
+            # Считаем невалидным: пусто ИЛИ значение совпадает с именем поля/label ИЛИ
+            # значение пришло из UNGROUNDED-источника (web_search/llm/vision/safe_enum):
+            # 8292 — merge-ключ карточки, его авторитетная форма = бренд+модель
+            # (детерминированно из имени). Угадайки этих источников (видел «Да»,
+            # «Мужские») — мусор, который надо перебить деривацией.
             is_invalid = (
                 existing_val is None
                 or existing_val == ""
                 or (field_label and existing_val.lower() == field_label)
+                or existing_src in _CARD_GROUP_UNGROUNDED_SOURCES
             )
             if is_invalid:
                 cat_leaf = context.category_path[-1] if context.category_path else None

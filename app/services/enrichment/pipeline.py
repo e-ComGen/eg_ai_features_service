@@ -92,6 +92,13 @@ YANDEX_MARKET_ENABLED: bool = os.environ.get("YANDEX_MARKET_ENABLED", "0") == "1
 # того же товара) не должны перетираться инференсом (LLM-знания / web-поиск), если
 # их confidence лишь незначительно ниже. Band = допустимый зазор.
 _CARD_SOURCES = {Source.WB_CARD, Source.OZON_CARD, Source.LAMODA}
+# Authoritative sources that override fake-confident inference within the protection
+# band. Cards are live per-product listings; IceCat is brand-verified spec data and
+# PDF_DATASHEET is the manufacturer's own datasheet — BOTH more authoritative than a
+# card, yet previously they fought inference on raw confidence and LOST to llm_knowledge's
+# self-assigned 0.95 (e.g. verified IceCat spec beaten by an llm hallucination). Folding
+# them into the protection set lets grounded data win the contradiction. A/B-measured.
+_AUTHORITATIVE_OVERRIDE_SOURCES = _CARD_SOURCES | {Source.ICECAT, Source.PDF_DATASHEET}
 _INFERENCE_SOURCES = {Source.LLM_KNOWLEDGE, Source.WEB_SEARCH}
 _CARD_PROTECTION_BAND = 0.10
 
@@ -2734,9 +2741,9 @@ def _merge_winner(
     """
     # Card-protection band: только карточка-vs-инференс
     card, inference = None, None
-    if challenger.source in _CARD_SOURCES and incumbent.source in _INFERENCE_SOURCES:
+    if challenger.source in _AUTHORITATIVE_OVERRIDE_SOURCES and incumbent.source in _INFERENCE_SOURCES:
         card, inference = challenger, incumbent
-    elif incumbent.source in _CARD_SOURCES and challenger.source in _INFERENCE_SOURCES:
+    elif incumbent.source in _AUTHORITATIVE_OVERRIDE_SOURCES and challenger.source in _INFERENCE_SOURCES:
         card, inference = incumbent, challenger
     if card is not None:
         if card.confidence >= inference.confidence - _CARD_PROTECTION_BAND:
@@ -2854,6 +2861,53 @@ def _drop_unresolved_required_enums(
     return _drop_unresolved_enums(merged, targets, required_only=True)
 
 
+def _is_color_target(target: TargetAttribute) -> bool:
+    """True если таргет — основной атрибут «Цвет» (НЕ «Название цвета» free-text).
+
+    «Цвет товара» — словарный enum конкретной расцветки SKU; «Название цвета» —
+    свободное маркетинговое описание (не трогаем). Детект по semantic_type=="color"
+    ИЛИ имени с «цвет» без «название».
+    """
+    if (target.semantic_type or "").lower() == "color":
+        return True
+    low = (target.name or "").lower()
+    return "цвет" in low and "название" not in low
+
+
+def _drop_ungrounded_color_guess(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+) -> list[AttributeValue]:
+    """Дроп ungrounded llm_knowledge-цвета в форме СПИСКА (мульти-цвет).
+
+    Цвет — per-SKU визуальный признак конкретной расцветки. Обучающая память LLM
+    его не знает: на «Nike Air Max 90» она выдаёт СПИСОК ходовых цветов
+    («белый/чёрный/серый/красный/синий») — галлюцинированный разброс, а не цвет
+    товара. У одного SKU одна расцветка, поэтому llm_knowledge-СПИСОК цветов = мусор
+    → дроп (no_data, «пусто честнее мусора»). Grounded-цвет (ozon_card/web_search/
+    vision с фото) и одиночное значение НЕ трогаем.
+    """
+    color_ids = {t.id for t in targets if _is_color_target(t)}
+    if not color_ids:
+        return merged
+    out: list[AttributeValue] = []
+    for v in merged:
+        if (
+            v.attribute_id in color_ids
+            and v.source == Source.LLM_KNOWLEDGE
+            and isinstance(v.value, list)
+            and len(v.value) >= 2
+        ):
+            logger.info(
+                "[Pipeline] drop-ungrounded-color: дроп llm_knowledge-цвета attr=%s "
+                "value=%r — мульти-цвет из обучающей памяти (галлюцинация расцветки)",
+                v.attribute_id, v.value,
+            )
+            continue
+        out.append(v)
+    return out
+
+
 def _drop_unresolved_enums(
     merged: list[AttributeValue],
     targets: list[TargetAttribute],
@@ -2965,9 +3019,9 @@ def _collection_card_protected(
     чистый инференс (карточки нет) — None → нормальный union.
     """
     card, inference = None, None
-    if a.source in _CARD_SOURCES and b.source in _INFERENCE_SOURCES:
+    if a.source in _AUTHORITATIVE_OVERRIDE_SOURCES and b.source in _INFERENCE_SOURCES:
         card, inference = a, b
-    elif b.source in _CARD_SOURCES and a.source in _INFERENCE_SOURCES:
+    elif b.source in _AUTHORITATIVE_OVERRIDE_SOURCES and a.source in _INFERENCE_SOURCES:
         card, inference = b, a
     if card is None:
         return None
@@ -3059,6 +3113,7 @@ class PipelineOrchestrator:
         onliner_source: Optional[OnlinerSource] = None,
         books_source: Optional[BooksSource] = None,
         lamoda_scrapfly_source: Optional[LamodaScrapflySource] = None,
+        gtin_resolver: Optional[bool] = None,
         classifier: Optional[LlmClassifier] = None,
         cost_predictor: Optional[CostPredictor] = None,
         strategy: Optional[MarketplaceStrategy] = None,
@@ -3115,6 +3170,13 @@ class PipelineOrchestrator:
         # Создаётся ОДИН раз → кэш переживает все товары батча.
         # None → по умолчанию создаём инстанс (всегда нужен для Ozon).
         self._tnved: TnvedSource = tnved_source or TnvedSource()
+        # GTINResolver: name→EAN via Serper (Stage 0.54, before IceCat).
+        # Активен при GTIN_RESOLVE_ENABLED=1 ИЛИ явный gtin_resolver=True.
+        # Флаг хранится как bool — сам resolver импортируется лениво в run().
+        if gtin_resolver is not None:
+            self._gtin_resolver_enabled: bool = gtin_resolver
+        else:
+            self._gtin_resolver_enabled = os.environ.get("GTIN_RESOLVE_ENABLED", "0") == "1"
         # BarcodeSource: verbatim EAN/barcode extractor — zero LLM, zero cost.
         # Always created (cheap singleton, no external deps).
         self._barcode: BarcodeSource = barcode_source or BarcodeSource()
@@ -3368,6 +3430,28 @@ class PipelineOrchestrator:
                 all_values += await self._run_finishing(context, targets, all_values)
                 all_values += await self._generate_annotation(context, targets, all_values)
                 return await self._finalize_async(all_values, targets, context)
+
+        # Stage 0.54: GTINResolver — поиск EAN через Serper (имя→штрихкод).
+        # Обогащает context.ean перед IceCat (Stage 0.55) чтобы тот мог использовать
+        # GTIN lookup (_fetch_features_by_gtin) вместо нестабильного brand+name поиска.
+        # Активен только при GTIN_RESOLVE_ENABLED=1 и отсутствующем context.ean.
+        # НЕ заполняет AttributeValue — только мутирует context.ean.
+        if self._gtin_resolver_enabled and not context.ean:
+            try:
+                from app.services.enrichment.sources.gtin_resolver import resolve_gtin
+                _resolved_ean = await resolve_gtin(context)
+                if _resolved_ean:
+                    context.ean = _resolved_ean
+                    logger.info(
+                        "[Pipeline] Stage 0.54 GTINResolver: context.ean = %s "
+                        "(product=%r brand=%r)",
+                        _resolved_ean, context.product_name, context.brand,
+                    )
+            except Exception as _gtin_exc:
+                logger.warning(
+                    "[Pipeline] Stage 0.54 GTINResolver failed (non-fatal): %s",
+                    _gtin_exc,
+                )
 
         # Stage 0.55: IceCatSource — brand-verified спеки без LLM (IceCat Open API).
         # Дополняет attrs которые OzonCard не закрыл (brand_line skip, outlier товары).
@@ -3636,11 +3720,13 @@ class PipelineOrchestrator:
                 all_values += new_avs
                 filled_so_far = self._merge_high_conf(filled_so_far, new_avs)
 
-        # Stage 4.7: TnvedSource — per-category резолвер ТН ВЭД ЕАЭС.
+        # Stage 4.7: TnvedSource — per-category резолвер ТН ВЭД ЕАЭС (OZON ONLY).
         # Запускается после всех товарных sources: кэш по category_id уже тёплый
         # если несколько товаров одной категории обрабатываются параллельно.
-        new_avs = await self._run_tnved_stage(context, targets, already_filled=filled_so_far)
-        all_values += new_avs
+        # WB ТН ВЭД резолвится из собственного WB-словаря в _apply_wb_api_resolve.
+        if self._strategy.name == "ozon":
+            new_avs = await self._run_tnved_stage(context, targets, already_filled=filled_so_far)
+            all_values += new_avs
 
         # Stage 4.8: SafeEnumFillSource — gated LLM fill for still-empty short
         # optional enum attrs.  Off by default (SAFE_LLM_ENUM_FILL_ENABLED flag).
@@ -3666,8 +3752,14 @@ class PipelineOrchestrator:
         # check — e.g. Бязь on a Nike tee from a web snippet about a different product).
         # Gate B's «correct for THIS exact product» check catches both cases.
         # Skip fills already verbatim-anchored (evidence tag "safe_enum:verbatim_gate").
-        # Off by default; enabled via LLM_KNOWLEDGE_ADVERSARIAL_ENABLED env flag
-        # (name kept for back-compat; now gates both llm_knowledge and web_search).
+        #
+        # OFF by default. This is an ABSENCE-based drop gate: it KEEPS a spec fill only
+        # if an authoritative source independently produced the same value, else DROPS.
+        # A/B on Ozon (2026-06-17) showed this is too blunt — it drops correct-but-
+        # uncorroborated specs (8 ГБ RAM, M.2 SSD) along with real mud (Чипсет=AMD on an
+        # Intel laptop): −8.8 pp opt_honest. The CONTRADICTION-based corroboration-override
+        # (Stage 4.93) supersedes it for mud removal without coverage loss. Kept behind the
+        # flag for the aggressive "empty > wrong" mode when explicitly requested.
         if os.environ.get("LLM_KNOWLEDGE_ADVERSARIAL_ENABLED", "0") == "1":
             # Force-websearch targets are explicitly trusted: exempt their WEB_SEARCH fills
             # from the adversarial gate.  Dropping them + re-firing in finishing would be a
@@ -3981,11 +4073,17 @@ class PipelineOrchestrator:
         # LLM hallucination judge to ALL sources after merge.
         resolved = await self._run_universal_verification_gate(resolved, targets, context)
 
-        # Authoritative ТН ВЭД / Тип resolution via the live Ozon API — runs
-        # AFTER the gates and JUST BEFORE the drop-guards so the real value_ids
-        # it assigns prevent the enum drop-guards from discarding these fields.
-        resolved = await self._apply_ozon_api_resolve(resolved, targets, context)
+        # Authoritative value resolution via the marketplace's OWN live API —
+        # runs AFTER the gates and JUST BEFORE the drop-guards so real value_ids
+        # prevent the enum drop-guards from discarding these fields. Each
+        # marketplace has its own endpoints/value-model (Ozon: numeric value_id;
+        # WB: canonical dictionary string).
+        if self._strategy.name == "ozon":
+            resolved = await self._apply_ozon_api_resolve(resolved, targets, context)
+        elif self._strategy.name == "wb":
+            resolved = await self._apply_wb_api_resolve(resolved, targets, context)
 
+        resolved = _drop_ungrounded_color_guess(resolved, targets)
         resolved = _drop_unresolved_optional_enums(resolved, targets)
         resolved = _drop_unresolved_required_enums(resolved, targets)
         return resolved
@@ -5073,6 +5171,69 @@ class PipelineOrchestrator:
 
             if hit is not None:
                 _apply_hit(t, cur, hit)
+        return resolved
+
+    async def _apply_wb_api_resolve(
+        self,
+        resolved: list[AttributeValue],
+        targets: list[TargetAttribute],
+        context: ExtractionContext,
+    ) -> list[AttributeValue]:
+        """Authoritative WB value resolution via the live WB Content API.
+
+        WB analogue of _apply_ozon_api_resolve, but WB takes VALUE STRINGS
+        validated against its dictionaries (colors/countries/seasons/ТН ВЭД) —
+        not numeric value_ids. For each FILLED WB target that is a dictionary-
+        backed charc, match the extracted value to the canonical WB dictionary
+        string (overwrite value; keep the WB id when present, e.g. country).
+        resolve_wb_value short-circuits to None for non-dictionary charcs, so
+        calling it per value is cheap. Subject id comes from context.category_id
+        (the WB eval puts the WB subjectID there).
+        """
+        subject_id = context.category_id
+        resolve = getattr(self._strategy, "resolve_wb_value", None)
+        if subject_id is None or resolve is None:
+            return resolved
+        targets_by_id = {t.id: t for t in targets}
+        for v in resolved:
+            t = targets_by_id.get(v.attribute_id)
+            if t is None:
+                continue
+            # WB collections (maxCount>1, e.g. Цвет) arrive as a Python list —
+            # resolve each element; scalars resolve as a single-item list.
+            is_list = isinstance(v.value, list)
+            items = v.value if is_list else [v.value]
+            new_items: list = []
+            resolved_id = v.value_id
+            for item in items:
+                val = str(item).strip()
+                if not val:
+                    new_items.append(item)
+                    continue
+                try:
+                    hit = await resolve(int(subject_id), t.name, val)
+                except Exception as exc:
+                    logger.warning("[WbApiResolve] resolve failed attr=%s: %s", t.id, exc)
+                    new_items.append(item)
+                    continue
+                if hit and hit.get("value"):
+                    canonical = hit["value"]
+                    if canonical != val:
+                        logger.info(
+                            "[WbApiResolve] attr=%s '%s': %r → %r (id=%s)",
+                            t.id, t.name, val[:40], canonical[:40], hit.get("id"),
+                        )
+                    new_items.append(canonical)
+                    # Keep the WB id even on an exact-string match (e.g. country
+                    # 'Германия'→'Германия' id=15000096): the id is authoritative,
+                    # not the string equality.
+                    if resolved_id is None and hit.get("id") is not None:
+                        resolved_id = hit["id"]
+                else:
+                    new_items.append(item)
+            v.value = new_items if is_list else new_items[0]
+            if resolved_id is not None:
+                v.value_id = resolved_id
         return resolved
 
     async def _run_safe_enum_fill_stage(

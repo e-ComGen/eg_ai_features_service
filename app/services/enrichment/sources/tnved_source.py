@@ -132,7 +132,7 @@ class TnvedSource(AttributeSource):
 
         # 3. Резолв с double-checked locking по (category_id, type_key)
         cat_id = context.category_id
-        code = await self._resolve_for_category(cat_id, context)
+        code = await self._resolve_for_category(cat_id, context, tnved_target.id)
 
         if code is None:
             logger.debug("[TnvedSource] category %s: could not resolve ТН ВЭД", cat_id)
@@ -242,6 +242,7 @@ class TnvedSource(AttributeSource):
         self,
         cat_id: int,
         context: ExtractionContext,
+        attr_id: int = 0,
     ) -> Optional[str]:
         """Double-checked locking: резолвим ровно 1 раз на (category_id, type_key)."""
         cache_key = self._make_cache_key(cat_id, context)
@@ -265,15 +266,33 @@ class TnvedSource(AttributeSource):
                 return self._cache[cache_key]
 
             # Выполняем LLM-вызов
-            code = await self._call_llm(context)
+            code = await self._call_llm(context, attr_id)
             self._cache[cache_key] = code
             if code:
                 context.llm_calls_so_far += 1
                 logger.info("[TnvedSource] key %s → ТН ВЭД %s", cache_key, code)
             return code
 
-    async def _call_llm(self, context: ExtractionContext) -> Optional[str]:
-        """Один сфокусированный LLM-вызов. Возвращает 10-значный код или None."""
+    async def _call_llm(self, context: ExtractionContext, attr_id: int) -> Optional[str]:
+        """Один сфокусированный LLM-вызов. Возвращает 10-значный код или None.
+
+        Если доступен per-category справочник ТН ВЭД Ozon (есть type_id+креды) —
+        делаем CONSTRAINED-PICK: даём LLM реальные ярлыки словаря и просим выбрать
+        ОДИН наиболее точный. Это убирает класс ошибок «валидный, но не тот подкод»
+        (напр. для кроссовок слепой guess давал 6404199000 «прочая обувь» вместо
+        6404110000 «спортивная обувь» — оба в словаре, но второй правильный).
+        Фоллбэк — слепой guess, когда справочник недоступен (offline/eval).
+        """
+        dict_labels = await self._fetch_dict_labels(context, attr_id)
+        if dict_labels:
+            picked = await self._constrained_pick(context, dict_labels)
+            if picked:
+                return picked
+            logger.info(
+                "[TnvedSource] constrained-pick не дал кода для cat=%s → fallback на слепой guess",
+                context.category_id,
+            )
+
         category_hint = " / ".join(context.category_path) if context.category_path else ""
         user_text = (
             f'Определи 10-значный код ТН ВЭД ЕАЭС для товара: "{context.product_name}".'
@@ -305,6 +324,84 @@ class TnvedSource(AttributeSource):
             return digits
 
         logger.warning("[TnvedSource] invalid ТН ВЭД response: %r (digits=%r)", parsed.code, digits)
+        return None
+
+    async def _fetch_dict_labels(
+        self, context: ExtractionContext, attr_id: int
+    ) -> list[dict]:
+        """Per-category справочник ТН ВЭД Ozon (список {id, value}) или [].
+
+        Возвращает [] когда нечем тянуть (нет type_id / кред / API-сбой) —
+        тогда _call_llm уходит в слепой guess.
+        """
+        type_id = context.ozon_type_id
+        if type_id is None or not (os.getenv("OZON_CLIENT_ID") and os.getenv("OZON_API_KEY")):
+            return []
+        try:
+            from app.services.enrichment.strategies.dictionaries.ozon_runtime_lookup import (
+                list_values,
+            )
+            return await list_values(context.category_id, type_id, attr_id, max_values=300)
+        except Exception as exc:  # pragma: no cover — сетевой сбой не должен ронять стейдж
+            logger.warning("[TnvedSource] list_values ошибка для cat=%s: %s", context.category_id, exc)
+            return []
+
+    async def _constrained_pick(
+        self, context: ExtractionContext, labels: list[dict]
+    ) -> Optional[str]:
+        """Выбрать ОДИН код из реальных ярлыков словаря категории.
+
+        labels: [{"id": int, "value": "КОД - описание"}]. Возвращает 10-значный
+        ведущий код выбранного ярлыка (если он реально присутствует в списке),
+        иначе None (→ фоллбэк на слепой guess).
+        """
+        # Множество допустимых ведущих кодов словаря (для верификации выбора).
+        allowed_codes: set[str] = set()
+        lines: list[str] = []
+        for it in labels:
+            val = str(it.get("value", ""))
+            lead = re.match(r"\s*(\d{6,10})", val)
+            if lead:
+                allowed_codes.add(lead.group(1))
+            lines.append(val)
+        if not allowed_codes:
+            return None
+
+        category_hint = " / ".join(context.category_path) if context.category_path else ""
+        user_text = (
+            f'Товар: "{context.product_name}".'
+            + (f'\nКатегория: {category_hint}.' if category_hint else "")
+            + "\n\nДопустимые коды ТН ВЭД ЕАЭС для этой категории (выбери РОВНО ОДИН, "
+              "наиболее точный для товара):\n"
+            + "\n".join(lines)
+            + "\n\nВерни ТОЛЬКО ведущий 10-значный код выбранной строки, без описания."
+        )
+        try:
+            parsed, _ = await self._llm.structured_request(
+                system_prompt=(
+                    "Ты эксперт по таможенной классификации ЕАЭС. Тебе дан товар и "
+                    "ЗАКРЫТЫЙ список допустимых кодов ТН ВЭД его категории. Выбери из "
+                    "списка ОДИН код, максимально точно соответствующий товару, "
+                    "предпочитая НАИБОЛЕЕ СПЕЦИФИЧНУЮ подкатегорию (например, для "
+                    "спортивной обуви — код спортивной обуви, а не «прочая обувь»). "
+                    "В поле code верни только 10 цифр выбранного кода."
+                ),
+                user_text=user_text,
+                response_model=_TnvedResponse,
+            )
+        except Exception as e:
+            logger.warning("[TnvedSource] constrained-pick LLM call failed: %s", e)
+            return None
+
+        if parsed is None:
+            return None
+        digits = re.sub(r"\D", "", parsed.code)
+        if len(digits) == 10 and digits in allowed_codes:
+            return digits
+        logger.info(
+            "[TnvedSource] constrained-pick вернул %r (digits=%r) — нет в словаре, отбрасываю",
+            getattr(parsed, "code", None), digits,
+        )
         return None
 
     def get_judge(self) -> LlmJudge:
