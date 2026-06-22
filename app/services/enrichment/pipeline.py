@@ -983,6 +983,40 @@ def _apply_brand_from_name(
     # brand_targets содержит только brand-таргеты (детект по id==31 или имени).
     _BRAND_MAX_INLINE = 100  # если allowed_values ≤ 100 → вероятно truncated-срез
 
+    def _try_needle_brand(attr_id: int) -> None:
+        """NEEDLE-фоллбэк: принять context.brand, если он валиден и есть в имени.
+
+        Срабатывает когда словарь брендов пуст/недоступен ИЛИ непуст, но НИ ОДИН
+        словарный бренд не найден в имени (усечённый срез без нужного бренда —
+        иначе бренд silent-пустой). Гарды: токен-матч ≥2 симв.; категорийное
+        слово / гендер / прилагательное — отвергаем. value_id=None →
+        resolve_value_ids_async добьёт через Ozon search_value (truncated path).
+        """
+        ctx_brand = (context.brand or "").strip()
+        if not (ctx_brand and _needle_brand_in_name(ctx_brand, name_tokens)):
+            return
+        all_cat_words = _all_category_words(context.category_path)
+        if _is_category_noun_brand(ctx_brand, all_cat_words):
+            logger.info(
+                "[Pipeline] brand-from-name NEEDLE: attr %s, context.brand=%r "
+                "ОТВЕРГНУТ — совпадает с категорийным словом (category_path=%s)",
+                attr_id, ctx_brand, context.category_path,
+            )
+            return
+        if _is_gender_noise_token(ctx_brand) or _is_adjective_noise_token(ctx_brand):
+            logger.info(
+                "[Pipeline] brand-from-name NEEDLE: attr %s, context.brand=%r "
+                "ОТВЕРГНУТ — гендерное/прилагательное слово, не бренд",
+                attr_id, ctx_brand,
+            )
+            return
+        logger.info(
+            "[Pipeline] brand-from-name NEEDLE: attr %s, context.brand=%r в имени — "
+            "принят напрямую (нет словарного матча, value_id=None → async-resolve)",
+            attr_id, ctx_brand,
+        )
+        resolved_brand[attr_id] = ctx_brand
+
     for attr_id, t in brand_targets.items():
         # Полный список брендов: target.allowed_values (мелкий enum) ИЛИ словарь.
         options = list(t.allowed_values or [])
@@ -1025,44 +1059,15 @@ def _apply_brand_from_name(
                     "двусмысленно, не трогаем",
                     len(real), context.product_name, attr_id,
                 )
+            else:
+                # options непусты, но НИ ОДИН словарный бренд не найден в имени —
+                # вероятно усечённый срез без нужного бренда. NEEDLE по context.brand
+                # (те же гарды) спасает от silent-пустого бренда (drain при truncated
+                # allowed_values 101..N, когда brand_options_fn не запрашивается).
+                _try_needle_brand(attr_id)
         else:
-            # NEEDLE fallback: dict пуст (truncated enum полностью вне первых 5000).
-            # Если context.brand задан и присутствует в имени — принимаем напрямую.
-            # Безопасность:
-            #   а) токен-матч (contiguous), ≥2 символов (у dict-пути ≥3, но needle —
-            #      известный бренд из контекста, поэтому допускаем 2-символьные
-            #      аббревиатуры вроде LG, HP, JBL);
-            #   б) КАТЕГОРИЙНЫЙ ГАРД: кандидат отвергается, если КАЖДЫЙ его токен
-            #      совпадает со стеммом слова из category_path (колонка/книга/машина/
-            #      печь — это тип товара, не бренд). Генеральное правило без хардкода.
-            # value_id будет None → resolve_value_ids_async добьёт его через
-            # Ozon search_value API (truncated enum path).
-            ctx_brand = (context.brand or "").strip()
-            if ctx_brand and _needle_brand_in_name(ctx_brand, name_tokens):
-                # Category-noun guard: отвергаем если каждый токен кандидата — слово
-                # из category_path (любого узла, не только leaf). Расширяем type_words
-                # до полного набора токенов всей цепочки категорий.
-                all_cat_words = _all_category_words(context.category_path)
-                if _is_category_noun_brand(ctx_brand, all_cat_words):
-                    logger.info(
-                        "[Pipeline] brand-from-name NEEDLE: attr %s, context.brand=%r "
-                        "ОТВЕРГНУТ — совпадает с категорийным словом (category_path=%s)",
-                        attr_id, ctx_brand, context.category_path,
-                    )
-                elif _is_gender_noise_token(ctx_brand) or _is_adjective_noise_token(ctx_brand):
-                    logger.info(
-                        "[Pipeline] brand-from-name NEEDLE: attr %s, context.brand=%r "
-                        "ОТВЕРГНУТ — гендерное/прилагательное слово, не бренд",
-                        attr_id, ctx_brand,
-                    )
-                else:
-                    logger.info(
-                        "[Pipeline] brand-from-name NEEDLE: attr %s, context.brand=%r в имени — "
-                        "принят напрямую (dict пуст, value_id=None → async-resolve)",
-                        attr_id, ctx_brand,
-                    )
-                    resolved_brand[attr_id] = ctx_brand
-                    # value_id останется None; resolve_value_ids_async (truncated path) добьёт
+            # options пусто (truncated enum полностью вне первых 5000) → NEEDLE.
+            _try_needle_brand(attr_id)
 
     if not resolved_brand:
         return merged
