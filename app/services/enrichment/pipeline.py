@@ -2913,6 +2913,42 @@ def _drop_ungrounded_color_guess(
     return out
 
 
+def _reconcile_enum_value_ids(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+) -> list[AttributeValue]:
+    """Инвариант: value_ids обязаны 1:1 соответствовать элементам value.
+
+    Донор (ozon_card/competitor_rag мульти-вариантной карточки) иногда приклеивает
+    ВСЮ палитру категории к одному цвет-значению: value='черный', а value_ids — 15
+    реальных id РАЗНЫХ цветов (белый/серый/синий…). eg_importer зипует value↔ids и
+    заливает неверные цвета. Аналогично скаляр НЕ должен нести список value_ids.
+
+    При рассинхроне (len(value_ids) != числу элементов value, либо скаляр со
+    списком >1 id) сбрасываем value_ids/value_id в None — последующий авторитетный
+    resolve_value_ids пересоберёт их СТРОГО из value-текста (черный → [61574]).
+    Выровненные коллекции (len совпадает) не трогаем.
+    """
+    out: list[AttributeValue] = []
+    for v in merged:
+        vids = v.value_ids if isinstance(v.value_ids, list) else None
+        if vids is None:
+            out.append(v)
+            continue
+        elems = v.value if isinstance(v.value, list) else [v.value]
+        scalar_stray = (not v.is_collection) and len(vids) > 1
+        if len(vids) != len(elems) or scalar_stray:
+            logger.info(
+                "[Pipeline] reconcile-enum-ids: attr=%s value=%r — рассинхрон "
+                "(%d value_ids на %d значений), сброс под пере-резолв",
+                v.attribute_id, v.value, len(vids), len(elems),
+            )
+            out.append(v.model_copy(update={"value_ids": None, "value_id": None}))
+        else:
+            out.append(v)
+    return out
+
+
 def _drop_unresolved_enums(
     merged: list[AttributeValue],
     targets: list[TargetAttribute],
@@ -4077,6 +4113,12 @@ class PipelineOrchestrator:
         # evidence-self-admission, fast numeric reject, unit-sanity, and selective
         # LLM hallucination judge to ALL sources after merge.
         resolved = await self._run_universal_verification_gate(resolved, targets, context)
+
+        # value_ids ↔ value reconciliation: сбрасываем рассинхрон ПЕРЕД авторитетным
+        # резолвом, чтобы он пересобрал ids строго из value-текста (донор ozon_card
+        # иногда приклеивает ВСЮ палитру категории — 15 value_id «черный/белый/…» — к
+        # одному цвет-значению; зальётся как неверные цвета).
+        resolved = _reconcile_enum_value_ids(resolved, targets)
 
         # Authoritative value resolution via the marketplace's OWN live API —
         # runs AFTER the gates and JUST BEFORE the drop-guards so real value_ids
