@@ -915,6 +915,59 @@ def _resolve_brand_value_id(
     return None
 
 
+def _derive_context_brand(
+    context: ExtractionContext,
+    targets: list[TargetAttribute],
+    brand_options_fn: Optional[Callable[[int], list[str]]] = None,
+) -> Optional[str]:
+    """Подобрать бренд-кандидат из названия, когда context.brand пуст (Баг 3 eg_importer).
+
+    Продавец оставил колонку «Бренд» пустой, но бренд стоит в начале названия
+    («Nike Air Max 90»). Без context.brand brand-gated источники (ozon_card/regard/
+    onliner/bestbuy/IceCat) не находят donor-карточку и брэнд-гейтят её → Пол/Цвет/
+    Размер каскадят в no_data, хотя бренд явно в имени. Бэкфиллим context.brand
+    ВЫСОКОТОЧНО — той же логикой, что _apply_brand_from_name: ровно ОДИН словарный
+    бренд, присутствующий в имени (containment-дизамбигуация + дроп категория/
+    гендер/прилагательное-шума). Ноль матчей или двусмысленность → None: пустой
+    бренд честнее, чем мусорная донор-карточка не того бренда.
+
+    Не заполняет сам таргет «Бренд» (это делает _apply_brand_from_name POST-merge);
+    только проставляет context.brand как КОНТЕКСТ для источников ДО их запуска.
+    """
+    if (context.brand or "").strip():
+        return None  # бренд задан продавцом — не трогаем
+    brand_targets = [
+        t for t in targets
+        if t.id == _BRAND_TARGET_ATTR_ID or _is_brand_target_name(t.name)
+    ]
+    if not brand_targets:
+        return None
+    name_tokens = _brand_norm_tokens(context.product_name or "")
+    if not name_tokens:
+        return None
+    type_words = _category_type_words(context.category_path)
+    _BRAND_MAX_INLINE = 100  # зеркало _apply_brand_from_name: ≤100 → вероятно truncated-срез
+    for t in brand_targets:
+        options = list(t.allowed_values or [])
+        if brand_options_fn is not None and len(options) <= _BRAND_MAX_INLINE:
+            try:
+                full_opts = list(brand_options_fn(t.id) or [])
+                if len(full_opts) > len(options):
+                    options = full_opts
+            except Exception as exc:  # словарь недоступен — не падаем, пропускаем
+                logger.warning(
+                    "[Pipeline] derive-context-brand: словарь брендов attr %s недоступен: %s",
+                    t.id, exc,
+                )
+        if not options:
+            continue
+        matches = [b for b in options if _brand_in_name(str(b), name_tokens)]
+        real = _disambiguate_brand_matches(matches, name_tokens, type_words)
+        if len(real) == 1:
+            return str(real[0])
+    return None
+
+
 def _apply_brand_from_name(
     merged: list[AttributeValue],
     targets: list[TargetAttribute],
@@ -3374,6 +3427,23 @@ class PipelineOrchestrator:
             self._strategy.normalize_target_with_context(t, context)
             for t in targets
         ]
+
+        # Шаг 0d: бэкфилл context.brand из названия, когда продавец оставил «Бренд»
+        # пустым (Баг 3 eg_importer). Brand-gated источники (ozon_card/regard/onliner/
+        # bestbuy/IceCat) без context.brand не находят/брэнд-гейтят donor-карточку →
+        # Пол/Цвет/Размер каскадят в no_data, хотя бренд стоит в начале имени. Высоко-
+        # точно: ровно один словарный бренд из имени; иначе пусто (честнее мусора).
+        if not (context.brand or "").strip():
+            derived = _derive_context_brand(
+                context, targets,
+                brand_options_fn=lambda attr_id: self._strategy.brand_value_options(attr_id, context),
+            )
+            if derived:
+                logger.info(
+                    "[Pipeline] context.brand бэкфилл из имени: %r (продавец оставил «Бренд» пустым)",
+                    derived,
+                )
+                context.brand = derived
 
         all_values: list[AttributeValue] = []
         # filled_so_far — накапливаем high-confidence AVs для skip-filled кооперации
