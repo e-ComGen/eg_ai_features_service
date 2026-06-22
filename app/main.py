@@ -1,3 +1,12 @@
+# Windows DLL load-order workaround: pyarrow (pulled in via pandas/datasets/
+# sentence-transformers) segfaults with an access violation if it is loaded
+# AFTER torch. Importing it first resolves the native DLL conflict. Guarded so
+# a missing/partial pyarrow can never break startup.
+try:
+    import pyarrow  # noqa: F401
+except Exception:
+    pass
+
 import asyncio
 import logging
 import uuid
@@ -20,6 +29,7 @@ from .config import OPENAI_API_KEY, WEB_SEARCH_MODEL, WEB_SEARCH_MAX_CONCURRENT,
 from .services.excel.wb_excel import WbExcelReader, WbExcelWriter
 from .services.excel.ozon_excel import OzonExcelReader, OzonExcelWriter
 from .services.enrichment.pipeline_adapter import PipelineAdapter
+from .billing_usage import compute_usage
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +140,11 @@ async def process_batch(payload: BatchPayload):
                 clean_data.append({
                     "product_id": prod_id,
                     "filled_features": filled,
-                    "debug_info": debug
+                    "debug_info": debug,
+                    # Контракт v2: skipped-блок (platform_field / no_data) — eg_importer
+                    # отличает «учётное поле продавца» от «нет данных». Без него endpoint
+                    # терял skipped, обещанный контрактом.
+                    "skipped": r.get("skipped", {}),
                 })
 
                 all_features = sorted(debug.keys())
@@ -160,7 +174,7 @@ async def process_batch(payload: BatchPayload):
     except Exception as e:
         print(f"⚠️ Failed to write CSV report: {e}")
 
-    return {"status": "success", "data": clean_data}
+    return {"status": "success", "data": clean_data, "usage": compute_usage(results)}
 
 
 # ---------------------------------------------------------------------------
