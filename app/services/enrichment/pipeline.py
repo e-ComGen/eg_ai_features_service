@@ -3061,6 +3061,46 @@ def _drop_multivalue_color_premerge(
     return out
 
 
+# Color-identity guard: «Цвет товара» — per-SKU расцветка продавца, гадать колорвей
+# НЕЛЬЗЯ (eg_importer: «пусто честнее мусора»). web_search/vision/llm_knowledge/
+# competitor_rag домысливают цвет по вебу/фото/похожим листингам, а не видят расцветку
+# ЭТОГО SKU (PUMA Flyer Runner без цвета в имени → web_search «чёрный»). Per-SKU
+# источники остаются: color-from-name (имя продавца), description (verbatim из описания).
+_COLOR_GUESS_SOURCES = {
+    Source.VISION,
+    Source.WEB_SEARCH,
+    Source.LLM_KNOWLEDGE,
+    Source.COMPETITOR_RAG,
+}
+
+
+def _apply_color_source_guard(
+    all_values: list[AttributeValue],
+    targets: list[TargetAttribute],
+) -> list[AttributeValue]:
+    """Дроп «Цвет товара» от guess-источников ДО merge (миррор brand-source-guard).
+
+    Цвет — per-SKU: web_search/vision/llm_knowledge/competitor_rag гадают колорвей по
+    вебу/фото/похожим, не видят расцветку ЭТОГО SKU. Их цвет-кандидаты выбрасываются.
+    Остаются per-SKU: color-from-name (source=DESCRIPTION, добавляется ПОСЛЕ merge) и
+    verbatim-цвет из описания. Не-цвет таргеты — без изменений.
+    """
+    color_ids = {t.id for t in targets if _is_color_target(t)}
+    if not color_ids:
+        return all_values
+    out: list[AttributeValue] = []
+    for v in all_values:
+        if v.attribute_id in color_ids and v.source in _COLOR_GUESS_SOURCES:
+            logger.info(
+                "[Pipeline] color-guard: дроп цвета attr=%s='%s' (source=%s) — guess "
+                "колорвея, не per-SKU данные продавца",
+                v.attribute_id, v.value, getattr(v.source, "value", v.source),
+            )
+            continue
+        out.append(v)
+    return out
+
+
 def _drop_ungrounded_color_guess(
     merged: list[AttributeValue],
     targets: list[TargetAttribute],
@@ -4889,6 +4929,10 @@ class PipelineOrchestrator:
         # или навеянные только external-guess источниками при нейтральном имени.
         all_values = _apply_gender_guard(all_values, targets, context)
 
+        # Цвет-гард ДО merge: цвет — per-SKU расцветка продавца, guess-источники
+        # (web_search/vision/llm_knowledge/competitor_rag) гадают колорвей по вебу/фото —
+        # дропаем (eg_importer: гадать колорвей нельзя, пусто честнее мусора).
+        all_values = _apply_color_source_guard(all_values, targets)
         # Палитра-цвет ДО merge: донор (WbCard/ozon_card/llm) отдаёт мульти-цвет
         # (палитру расцветок модели), часто НЕ цвета этого SKU. Дропаем до merge,
         # чтобы одиночный grounded-цвет из названия («…чёрные»→чёрный) выиграл merge

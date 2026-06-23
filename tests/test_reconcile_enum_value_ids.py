@@ -13,6 +13,7 @@ from app.services.enrichment.pipeline import (
     _drop_ungrounded_color_guess,
     _is_multivalue_color_value,
     _drop_multivalue_color_premerge,
+    _apply_color_source_guard,
 )
 
 
@@ -143,3 +144,31 @@ def test_premerge_keeps_single_color_only():
     """Если палитры нет — одиночный цвет не трогаем."""
     av = _av(value="черный", value_id=61574)
     assert _drop_multivalue_color_premerge([av], _TARGETS) == [av]
+
+
+# ── _apply_color_source_guard: цвет-гадание от web/vision/llm дропается ────────
+
+def test_color_guard_drops_web_search():
+    """web_search «чёрный» (гадание колорвея PUMA без цвета в имени) → дроп."""
+    av = _av(value="черный", source=Source.WEB_SEARCH)
+    assert _apply_color_source_guard([av], _TARGETS) == []
+
+
+def test_color_guard_drops_vision_and_llm():
+    vis = _av(value="коричневый", source=Source.VISION)
+    llm = _av(value="серый", source=Source.LLM_KNOWLEDGE)
+    assert _apply_color_source_guard([vis, llm], _TARGETS) == []
+
+
+def test_color_guard_keeps_description_color_from_name():
+    """color-from-name (source=DESCRIPTION) — per-SKU, остаётся."""
+    av = _av(value="черный", source=Source.DESCRIPTION, evidence="color_from_name")
+    out = _apply_color_source_guard([av], _TARGETS)
+    assert len(out) == 1 and out[0].value == "черный"
+
+
+def test_color_guard_ignores_noncolor_targets():
+    """Не-цвет атрибут от web_search — не трогаем (гард только для цвета)."""
+    other = AttributeValue(attribute_id=9999, value="Демисезон", confidence=0.9,
+                           source=Source.WEB_SEARCH)
+    assert _apply_color_source_guard([other], _TARGETS) == [other]
