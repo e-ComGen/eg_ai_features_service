@@ -5421,6 +5421,12 @@ class PipelineOrchestrator:
         # value_id — not only ТН ВЭД / Тип. Closes niche required holes (Класс
         # опасности, etc.) via the same authoritative live-list mechanism.
         for t in targets:
+            # Цвет — per-SKU расцветка продавца: НЕ дорезолвируем из словаря категории.
+            # LLM-pick «белый» из 651 цвета на пустом таргете = гадание колорвея
+            # (eg_importer: «гадать колорвей нельзя, пусто честнее мусора»). Цвет из
+            # имени уже получил value_id через resolve_value_ids — api-resolve ему не нужен.
+            if _is_color_target(t):
+                continue
             if not t.is_required:
                 continue
             cur = by_attr.get(t.id)
