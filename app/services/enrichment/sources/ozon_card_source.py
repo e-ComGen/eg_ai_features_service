@@ -105,11 +105,16 @@ _OZON_CARD_TOTAL_TIMEOUT = 45.0  # Hard cap on the entire _do_extract (Scrappey 
 
 # ── Scrappey антибот-тюнинг (data-driven, env-управляемый) ──────────────────
 # Раньше слался ГОЛЫЙ {"cmd":"request.get","url":...} — это base. Думали, что datacenter
-# без гео = причина «висит до таймаута»; добавили рычаги. ИЗМЕРИЛИ (measure_scrappey_ozon.py,
-# 23.06, n=6): datacenter-baseline бьёт Ozon 4/6 (66%) после ретраев, а proxyCountry=Russia
-# сделал ХУЖЕ — 2/6 (33%) и медленнее (RU-residential латентнее, чаще режется 18s-капом).
-# Поэтому ВСЕ рычаги дефолт-OFF (база = проверенный datacenter), оставлены как env-knobs
-# под дальнейшие замеры (напр. requestType=browser ещё не мерян).
+# без гео = причина «висит до таймаута»; добавили рычаги. ИЗМЕРИЛИ ВСЕ (measure_scrappey_ozon.py,
+# 23.06, n=6) — datacenter-base ЛУЧШИЙ из всех:
+#   A datacenter (база):              4/6 (66%), 13 кр, 191с  ← лучший
+#   B residential-RU (proxyCountry):  2/6 (33%), 16 кр, 258с  — хуже+медленнее (RU-residential
+#                                                               латентнее, режется 18s-капом)
+#   C residential-RU + browser:       0/6 (0%),  16 кр, 311с  — browser возвращает пост-JS DOM,
+#                                                               SSR-парсер _parse_search_tiles_html
+#                                                               его не разбирает → no_tiles
+# Вывод: НИ ОДИН рычаг не бьёт datacenter-базу; browser вообще ломает парсинг. ВСЕ дефолт-OFF
+# (база = проверенный datacenter). Knobs оставлены, но без иллюзий — гео/browser = дуды.
 #   • OZON_SCRAPPEY_PROXY_COUNTRY — гео (напр. "Russia"). ""→datacenter (дефолт, 66%).
 #   • OZON_SCRAPPEY_REQUEST_TYPE — "browser" (полный рендер+антибот) / "request". ""→не шлём.
 #   • OZON_SCRAPPEY_PROXY — кастомный residential URL (http/socks). ""→Scrappey-дефолт.

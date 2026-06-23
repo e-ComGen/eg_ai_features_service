@@ -134,16 +134,24 @@ async def _run_config(name: str, cfg: dict, products: list) -> None:
     print(f"  stages: {stages}")
 
 
-async def _main(full: bool, n: int) -> None:
+async def _main(full: bool, n: int, only: str) -> None:
     if not os.environ.get("SCRAPPEY_KEY"):
         print("❌ SCRAPPEY_KEY не задан в окружении. Раскомментируй SCRAPPEY_KEY в .env "
               "(строка ~34) и перезапусти. Без ключа probe() вернёт пусто.")
         sys.exit(2)
 
     products = _PRODUCTS[:n]
-    order = ["A baseline-datacenter", "B residential-RU-raw"]
-    if full:
-        order += ["C residential-RU-browser", "D RU-browser+session"]
+    by_letter = {name[0]: name for name in _CONFIGS}  # 'A'→'A baseline-datacenter', ...
+    if only:
+        letters = [c.strip().upper() for c in only.split(",") if c.strip()]
+        order = [by_letter[ltr] for ltr in letters if ltr in by_letter]
+    else:
+        order = [by_letter["A"], by_letter["B"]]
+        if full:
+            order += [by_letter["C"], by_letter["D"]]
+    if not order:
+        print("❌ Нечего гонять — проверь --only/--full.")
+        sys.exit(2)
     print(f"Прогон конфигов: {order}  (по {len(products)} товаров)")
     for name in order:
         await _run_config(name, _CONFIGS[name], products)
@@ -156,5 +164,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true", help="включить дорогие конфиги C+D (browser)")
     ap.add_argument("--n", type=int, default=6, help="сколько товаров прогнать на конфиг (дефолт 6)")
+    ap.add_argument("--only", type=str, default="", help="гнать только эти конфиги, напр. 'C,D' (буквы)")
     args = ap.parse_args()
-    asyncio.run(_main(args.full, args.n))
+    asyncio.run(_main(args.full, args.n, args.only))
