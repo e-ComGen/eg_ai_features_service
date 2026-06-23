@@ -968,6 +968,85 @@ def _derive_context_brand(
     return None
 
 
+_COLOR_FROM_NAME_EVIDENCE = "color_from_name"
+# Окончания рус. прилагательных (длиннейшие первыми) — стем цвета: черные↔черный.
+_COLOR_ADJ_ENDINGS = (
+    "ого", "его", "ыми", "ими", "ому", "ему",
+    "ый", "ий", "ой", "ая", "яя", "ое", "ее", "ые", "ие",
+    "ым", "им", "ых", "их", "ую", "юю", "ом", "ем",
+    # Соединительные гласные сложных цветов: «черн-О-белый», «темн-О-синий»,
+    # «син-Е-зелёный» — чтобы комбинирующая форма стемилась к базовому цвету
+    # (черно→черн, темно→темн) и сложный цвет ловился/детектился как двусмысленный.
+    "о", "е",
+)
+
+
+def _color_stem(word: str) -> str:
+    """Стем цвета-прилагательного: ё→е, lower, срез согласующего окончания.
+
+    «чёрные»/«чёрный»/«чёрная»→«черн»; «синие»/«синий»→«син». Срезаем только если
+    остаётся ≥3 символов основы (не курочим короткие слова).
+    """
+    w = word.strip().lower().replace("ё", "е")
+    for end in _COLOR_ADJ_ENDINGS:
+        if len(w) - len(end) >= 3 and w.endswith(end):
+            return w[:-len(end)]
+    return w
+
+
+def _apply_color_from_name(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+    context: ExtractionContext,
+) -> list[AttributeValue]:
+    """Заполнить ПУСТОЙ «Цвет товара» цветом из НАЗВАНИЯ (расцветка продавца).
+
+    Цвет — per-SKU вариантная ось; единственный надёжный источник — само название
+    («…чёрные»→чёрный). Доноры (WbCard/ozon_card) отдают палитру ЧУЖОЙ расцветки
+    (дропается `_drop_multivalue_color_premerge`). Матчим токены имени против
+    allowed_values цвета по СТЕМУ (черные↔черный); ровно один матч → заполняем
+    ВАЛИДНЫМ словарным значением (value_id добьёт resolve_value_ids). Ноль или
+    двусмысленность (черно-белые → 2 цвета) → не трогаем (пусто честнее). Только
+    пустой таргет — одиночный grounded-цвет донора не перетираем.
+    """
+    color_targets = [t for t in targets if _is_color_target(t) and t.allowed_values]
+    if not color_targets:
+        return merged
+    name_tokens = _brand_norm_tokens(context.product_name or "")
+    if not name_tokens:
+        return merged
+    name_stems = {_color_stem(t) for t in name_tokens}
+
+    filled_ids = {
+        v.attribute_id for v in merged
+        if v.value not in (None, "", []) and not (isinstance(v.value, str) and not v.value.strip())
+    }
+    additions: list[AttributeValue] = []
+    for t in color_targets:
+        if t.id in filled_ids:
+            continue
+        matches: list[str] = []
+        for val in t.allowed_values:
+            val_words = _brand_norm_tokens(str(val))
+            if not val_words:
+                continue
+            val_stems = [_color_stem(w) for w in val_words]
+            if all(s in name_stems for s in val_stems):
+                matches.append(str(val))
+        uniq = list(dict.fromkeys(matches))
+        if len(uniq) == 1:
+            logger.info("[Pipeline] color-from-name: attr=%s ← %r (из названия)", t.id, uniq[0])
+            additions.append(AttributeValue(
+                attribute_id=t.id, value=uniq[0], confidence=0.8,
+                source=Source.DESCRIPTION, evidence=_COLOR_FROM_NAME_EVIDENCE,
+            ))
+        elif len(uniq) > 1:
+            logger.info(
+                "[Pipeline] color-from-name: attr=%s двусмысленно %s — не трогаем", t.id, uniq,
+            )
+    return merged + additions
+
+
 def _apply_brand_from_name(
     merged: list[AttributeValue],
     targets: list[TargetAttribute],
@@ -4826,6 +4905,11 @@ class PipelineOrchestrator:
             brand_options_fn=lambda attr_id: self._strategy.brand_value_options(attr_id, context),
             brand_id_fn=lambda attr_id: self._strategy.brand_value_id_options(attr_id, context),
         )
+
+        # Color-from-name: цвет per-SKU, надёжный источник — название («…чёрные»→чёрный).
+        # Заполняет ПУСТОЙ «Цвет товара» одним словарным цветом из имени (доноры дают
+        # палитру чужой расцветки, уже дропнутую). ДО resolve_value_ids — получит value_id.
+        merged = _apply_color_from_name(merged, targets, context)
 
         # Strategy post-processing FIRST (добавляет CategoryDefaults + cross-fills с source=DESCRIPTION).
         # Должно идти ДО resolve_value_ids, иначе свежедобавленные AVs не получат value_id.
