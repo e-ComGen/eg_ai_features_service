@@ -103,19 +103,19 @@ _OZON_CARD_TOTAL_TIMEOUT = 45.0  # Hard cap on the entire _do_extract (Scrappey 
                                   # Serper-snippet fallback which is what the eval showed
                                   # actually recovers the data when Scrappey hangs.
 
-# ── Scrappey антибот-тюнинг (data-driven; Ozon = RU geo-sensitive) ──────────
-# Раньше слался ГОЛЫЙ {"cmd":"request.get","url":...} — датацентр-IP, без гео, без
-# session. Для Ozon (антибот Qrator) это худший режим → «висит до таймаута». Главные
-# рычаги пробития включаем через env; дефолты под Ozon.
-#   • proxyCountry=Russia — критичный гео-рычаг: без RU-IP Ozon отдаёт капчу/блок.
-#     Дефолт ON (источник Ozon-only, RU geo строго корректен; pure win, не прячем).
-#   • requestType — "browser" (полный рендер+антибот) / "request" (быстрый). ""→не
-#     шлём (cmd:request.get уже браузерный по умолчанию). Опц., под замер.
-#   • proxy — кастомный residential URL (http/socks). ""→не шлём (Scrappey-дефолт).
-#   • session-reuse — общая session на оба вызова (search+features) держит прогретую
-#     антибот-куку. Дефолт OFF: fresh-uuid session требует валидации (создаётся ли
-#     неявно), включаем под измерительный прогон. [[reference_ozon_dict_attr_contract]]
-_SCRAPPEY_PROXY_COUNTRY = os.getenv("OZON_SCRAPPEY_PROXY_COUNTRY", "Russia").strip()
+# ── Scrappey антибот-тюнинг (data-driven, env-управляемый) ──────────────────
+# Раньше слался ГОЛЫЙ {"cmd":"request.get","url":...} — это base. Думали, что datacenter
+# без гео = причина «висит до таймаута»; добавили рычаги. ИЗМЕРИЛИ (measure_scrappey_ozon.py,
+# 23.06, n=6): datacenter-baseline бьёт Ozon 4/6 (66%) после ретраев, а proxyCountry=Russia
+# сделал ХУЖЕ — 2/6 (33%) и медленнее (RU-residential латентнее, чаще режется 18s-капом).
+# Поэтому ВСЕ рычаги дефолт-OFF (база = проверенный datacenter), оставлены как env-knobs
+# под дальнейшие замеры (напр. requestType=browser ещё не мерян).
+#   • OZON_SCRAPPEY_PROXY_COUNTRY — гео (напр. "Russia"). ""→datacenter (дефолт, 66%).
+#   • OZON_SCRAPPEY_REQUEST_TYPE — "browser" (полный рендер+антибот) / "request". ""→не шлём.
+#   • OZON_SCRAPPEY_PROXY — кастомный residential URL (http/socks). ""→Scrappey-дефолт.
+#   • OZON_SCRAPPEY_SESSION_REUSE — общая session на search+features. Дефолт OFF.
+# [[reference_ozon_dict_attr_contract]] [[feedback_scraper_service_choice]]
+_SCRAPPEY_PROXY_COUNTRY = os.getenv("OZON_SCRAPPEY_PROXY_COUNTRY", "").strip()
 _SCRAPPEY_REQUEST_TYPE = os.getenv("OZON_SCRAPPEY_REQUEST_TYPE", "").strip()
 _SCRAPPEY_PROXY = os.getenv("OZON_SCRAPPEY_PROXY", "").strip()
 _SCRAPPEY_SESSION_REUSE = os.getenv(

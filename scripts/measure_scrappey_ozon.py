@@ -38,6 +38,11 @@ except Exception:
 # Путь к проекту
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Грузим .env тем же механизмом, что и приложение (app/config.py) — чтобы скрипт
+# увидел SCRAPPEY_KEY и OZON_* без ручной передачи в окружение.
+from dotenv import load_dotenv  # noqa: E402
+load_dotenv()
+
 from app.services.enrichment.base import ExtractionContext  # noqa: E402
 from app.services.enrichment.sources import ozon_card_source as ocs  # noqa: E402
 
@@ -89,7 +94,7 @@ def _install_credit_counter() -> dict:
     return counter
 
 
-async def _run_config(name: str, cfg: dict) -> None:
+async def _run_config(name: str, cfg: dict, products: list) -> None:
     _apply_config(cfg)
     key = os.environ.get("SCRAPPEY_KEY")
     source = ocs.OzonCardSource(scrappey_key=key)
@@ -104,7 +109,7 @@ async def _run_config(name: str, cfg: dict) -> None:
     stages: dict[str, int] = {}
     chars_total = 0
     t0 = time.monotonic()
-    for pid, (name_str, brand) in enumerate(_PRODUCTS, 1):
+    for pid, (name_str, brand) in enumerate(products, 1):
         ctx = ExtractionContext(
             product_id=pid, product_name=name_str, category_id=_CAT_ID,
             category_path=_CAT_PATH, brand=brand,
@@ -122,25 +127,26 @@ async def _run_config(name: str, cfg: dict) -> None:
               f"chars={res.get('raw_chars', 0):3d} score={res.get('match_score')} {dt:4.1f}s")
 
     dt_all = time.monotonic() - t0
-    n = len(_PRODUCTS)
+    n = len(products)
     print(f"\n  ИТОГ {name}: пробито {found}/{n} ({100*found//n}%), "
           f"кредитов(Scrappey-вызовов)={counter['calls']}, "
           f"avg_chars={chars_total // max(found,1)}, {dt_all:.0f}s")
     print(f"  stages: {stages}")
 
 
-async def _main(full: bool) -> None:
+async def _main(full: bool, n: int) -> None:
     if not os.environ.get("SCRAPPEY_KEY"):
         print("❌ SCRAPPEY_KEY не задан в окружении. Раскомментируй SCRAPPEY_KEY в .env "
               "(строка ~34) и перезапусти. Без ключа probe() вернёт пусто.")
         sys.exit(2)
 
+    products = _PRODUCTS[:n]
     order = ["A baseline-datacenter", "B residential-RU-raw"]
     if full:
         order += ["C residential-RU-browser", "D RU-browser+session"]
-    print(f"Прогон конфигов: {order}  (по {len(_PRODUCTS)} товаров)")
+    print(f"Прогон конфигов: {order}  (по {len(products)} товаров)")
     for name in order:
-        await _run_config(name, _CONFIGS[name])
+        await _run_config(name, _CONFIGS[name], products)
 
     print(f"\n{'#'*72}\nГотово. Сравни hit-rate vs кредиты по конфигам выше и реши, "
           f"стоит ли держать Scrappey ON и в каком режиме.\n{'#'*72}")
@@ -149,5 +155,6 @@ async def _main(full: bool) -> None:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true", help="включить дорогие конфиги C+D (browser)")
+    ap.add_argument("--n", type=int, default=6, help="сколько товаров прогнать на конфиг (дефолт 6)")
     args = ap.parse_args()
-    asyncio.run(_main(args.full))
+    asyncio.run(_main(args.full, args.n))

@@ -21,13 +21,19 @@ def _build(url="https://www.ozon.ru/product/x-1/features/", session=None,
     return m._build_scrappey_payload(url, session)
 
 
-def test_default_includes_proxy_country_russia():
-    """Дефолт: cmd+url+proxyCountry=Russia (гео-рычаг), без proxy/requestType/session."""
+def test_default_is_bare_datacenter_base():
+    """Дефолт = проверенный datacenter-base (замер 23.06: 66% vs RU 33%).
+
+    Все антибот-рычаги OFF по умолчанию: payload = {cmd,url} как старое поведение,
+    без proxyCountry/proxy/requestType/session. Рычаги — opt-in через env.
+    """
     p = m._build_scrappey_payload("https://www.ozon.ru/product/x-1/features/")
     assert p["cmd"] == "request.get"
     assert p["url"].endswith("/features/")
-    assert p.get("proxyCountry") == "Russia"  # ключевой рычаг ON по умолчанию
-    assert "session" not in p  # session-reuse дефолт OFF
+    assert "proxyCountry" not in p  # дефолт datacenter, не Russia
+    assert "proxy" not in p
+    assert "requestType" not in p
+    assert "session" not in p
 
 
 def test_session_added_only_when_passed():
