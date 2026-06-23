@@ -240,6 +240,16 @@ _OZON_SERPER_CARD_FINDING = os.getenv(
     "OZON_SERPER_CARD_FINDING", "1"
 ).strip().lower() not in ("0", "false", "no", "off", "")
 
+# Serper-FIRST: дёргать Serper-card-finding ПЕРВЫМ, до внутреннего поиска Ozon.
+# Внутренний поиск Ozon — самая флаковая/троттлимая часть (2 Scrappey-вызова с ретраями
+# на блокируемой search-странице). Если Google и так надёжно находит URL — идём сразу
+# на /features/ (1 фетч вместо search+features) → ВДВОЕ меньше запросов к Ozon → меньше
+# троттла, быстрее, дешевле. Ozon-поиск остаётся фоллбэком (когда Google не индексирует
+# товар / гард отверг). Гард по бренду тот же. Дефолт ON. Требует _OZON_SERPER_CARD_FINDING.
+_OZON_SERPER_FIRST = os.getenv(
+    "OZON_SERPER_FIRST", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
+
 # Similarity thresholds (понижены для (V2/V3/Plus/Bronze) вариаций — title часто
 # содержит "Блок питания + brand + model + V3 80 Plus Gold (MPE-XXX-...)", т.е.
 # много шума вокруг query "brand + model").
@@ -1226,6 +1236,17 @@ class OzonCardSource(AttributeSource):
         # (_SCRAPPEY_SESSION_REUSE) — включается под измерительный прогон.
         session = uuid.uuid4().hex if _SCRAPPEY_SESSION_REUSE else None
 
+        # Serper-FIRST: пробуем Google-card ДО флакового внутреннего поиска Ozon.
+        # Успех → 1 Scrappey-фетч (/features/) вместо search+features → меньше троттла.
+        # serper_tried гасит повторный Serper-вызов в фоллбэках ниже.
+        serper_tried = False
+        if _OZON_SERPER_FIRST and _OZON_SERPER_CARD_FINDING:
+            serper = await self._try_serper_card(context, client, session)
+            serper_tried = True
+            if serper is not None and serper.get("stage") == "ok":
+                return serper
+            logger.info("[OzonCard] Serper-first не дал карточку → внутренний поиск Ozon")
+
         query: Optional[str] = None
         tiles: list[dict] = []
         for q in queries_to_try:
@@ -1246,10 +1267,11 @@ class OzonCardSource(AttributeSource):
 
         if not tiles or query is None:
             logger.info("[OzonCard] no search tiles ни для primary ни для fallback")
-            # Поиск Ozon флакнул — пробуем найти карточку через Google (Serper).
-            serper = await self._try_serper_card(context, client, session)
-            if serper is not None and serper.get("stage") == "ok":
-                return serper
+            # Поиск Ozon флакнул — Google (Serper), если ещё не пробовали (serper-first).
+            if not serper_tried:
+                serper = await self._try_serper_card(context, client, session)
+                if serper is not None and serper.get("stage") == "ok":
+                    return serper
             return {
                 "query": used_query,
                 "tiles_count": 0,
@@ -1295,10 +1317,11 @@ class OzonCardSource(AttributeSource):
                 "[OzonCard] best score=%.1f < %.0f — skip",
                 top_score, _BRAND_LINE_THRESHOLD,
             )
-            # Ozon-tile ниже порога — Google может найти точную карточку (Serper).
-            serper = await self._try_serper_card(context, client, session)
-            if serper is not None and serper.get("stage") == "ok":
-                return serper
+            # Ozon-tile ниже порога — Google может найти точную карточку (если ещё не пробовали).
+            if not serper_tried:
+                serper = await self._try_serper_card(context, client, session)
+                if serper is not None and serper.get("stage") == "ok":
+                    return serper
             return {
                 "query": used_query,
                 "tiles_count": len(tiles),

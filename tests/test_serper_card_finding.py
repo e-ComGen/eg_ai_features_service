@@ -116,3 +116,63 @@ def test_try_serper_card_disabled_returns_none(monkeypatch):
     src = ocs.OzonCardSource(scrappey_key="x")
     out = asyncio.run(src._try_serper_card(_ctx(), client=None))
     assert out is None
+
+
+# ── Serper-FIRST: основной путь до внутреннего поиска Ozon ─────────────────────
+
+def test_serper_first_flag_default_on():
+    assert ocs._OZON_SERPER_FIRST is True
+
+
+def test_serper_first_short_circuits_ozon_search(monkeypatch):
+    """Serper-first ON + карточка найдена → возвращаем её, внутренний поиск Ozon НЕ дёргаем.
+
+    Это и есть фикс троттла: 1 Scrappey-фетч (/features/ внутри _try_serper_card)
+    вместо search+features. Проверяем, что _scrappey_fetch (search-страница) = 0 вызовов.
+    """
+    src = ocs.OzonCardSource(scrappey_key="x")
+    ok = {"stage": "ok", "raw_chars": [{"name": "Цвет", "value": "черный", "value_ids": []}],
+          "image_urls": [], "match_class": "exact", "match_score": 90.0,
+          "card_url": "u", "card_title": "t", "query": "serper", "tiles_count": 0}
+
+    async def _fake_serper(context, client, session=None):
+        return ok
+
+    calls = {"scrappey": 0}
+
+    async def _fake_scrappey(client, url, min_len=0, session=None):
+        calls["scrappey"] += 1
+        return None
+
+    monkeypatch.setattr(ocs, "_OZON_SERPER_FIRST", True)
+    monkeypatch.setattr(ocs, "_OZON_SERPER_CARD_FINDING", True)
+    monkeypatch.setattr(src, "_try_serper_card", _fake_serper)
+    monkeypatch.setattr(src, "_scrappey_fetch", _fake_scrappey)
+    out = asyncio.run(src._fetch_card_raw(_ctx(), client=None))
+    assert out["stage"] == "ok"
+    assert calls["scrappey"] == 0  # внутренний поиск Ozon не дёргался — троттл-нагрузка снижена
+
+
+def test_serper_first_falls_through_when_no_card(monkeypatch):
+    """Serper-first не нашёл → НЕ короткозамыкаем, идём во внутренний поиск Ozon.
+
+    И фоллбэк-Serper НЕ дёргается повторно (serper_tried). Внутренний поиск
+    замокан в no_tiles → итог no_tiles, а _try_serper_card вызван РОВНО раз.
+    """
+    src = ocs.OzonCardSource(scrappey_key="x")
+    serper_calls = {"n": 0}
+
+    async def _fake_serper(context, client, session=None):
+        serper_calls["n"] += 1
+        return None  # карточку не нашли
+
+    async def _fake_scrappey(client, url, min_len=0, session=None):
+        return None  # внутренний поиск тоже пуст → no_tiles
+
+    monkeypatch.setattr(ocs, "_OZON_SERPER_FIRST", True)
+    monkeypatch.setattr(ocs, "_OZON_SERPER_CARD_FINDING", True)
+    monkeypatch.setattr(src, "_try_serper_card", _fake_serper)
+    monkeypatch.setattr(src, "_scrappey_fetch", _fake_scrappey)
+    out = asyncio.run(src._fetch_card_raw(_ctx(), client=None))
+    assert out["stage"] == "no_tiles"
+    assert serper_calls["n"] == 1  # serper-first попробовал 1 раз, фоллбэк не дублировал
