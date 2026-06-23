@@ -43,6 +43,25 @@ logger = logging.getLogger(__name__)
 _ABSTAIN = object()
 
 
+# Маркеры снятых с действия / недействующих записей словаря ТН ВЭД Ozon.
+# Ярлык вида "6203423100 - (Действие прекращено с 15.09.2024) … брюки … из
+# денима" — код семантически верный, но запись депрекейтнута: Ozon её отвергнет
+# (Баг 4 eg_importer). Отфильтровываем такие записи из constrained-pick и из
+# dict-валидации, чтобы не отдать value_id недействующей записи.
+_DEPRECATED_LABEL_RE = re.compile(
+    r"действие\s+(?:прекращено|приостановлено)"
+    r"|прекращ[еён]+о\s+(?:с\s+)?\d"
+    r"|утратил[аои]?\s+силу"
+    r"|исключ[еён]+",
+    re.IGNORECASE,
+)
+
+
+def _is_deprecated_dict_label(value: str) -> bool:
+    """True, если ярлык словаря помечен как снятый с действия/недействующий."""
+    return bool(_DEPRECATED_LABEL_RE.search(value or ""))
+
+
 # ---------------------------------------------------------------------------
 # Structured response model для LLM-запроса
 # ---------------------------------------------------------------------------
@@ -214,6 +233,14 @@ class TnvedSource(AttributeSource):
             return None
         if hit:
             hit_value = str(hit.get("value", ""))
+            # Снятая с действия запись (Баг 4): код верный, но Ozon её отвергнет —
+            # не отдаём value_id недействующей записи. Abstain честнее мусора.
+            if _is_deprecated_dict_label(hit_value):
+                logger.info(
+                    "[TnvedSource] код %s резолвится в СНЯТУЮ с действия запись словаря "
+                    "(%s) → abstain", code, hit_value[:80],
+                )
+                return _ABSTAIN
             # Ведущий код значения: "9206000000 - Инструменты…" → "9206000000".
             lead = re.match(r"\s*(\d{6,10})", hit_value)
             if lead and lead.group(1) == code:
@@ -341,10 +368,20 @@ class TnvedSource(AttributeSource):
             from app.services.enrichment.strategies.dictionaries.ozon_runtime_lookup import (
                 list_values,
             )
-            return await list_values(context.category_id, type_id, attr_id, max_values=300)
+            raw = await list_values(context.category_id, type_id, attr_id, max_values=300)
         except Exception as exc:  # pragma: no cover — сетевой сбой не должен ронять стейдж
             logger.warning("[TnvedSource] list_values ошибка для cat=%s: %s", context.category_id, exc)
             return []
+        # Отсеять снятые с действия записи (Баг 4): чтобы constrained-pick не мог
+        # выбрать депрекейтнутый код — Ozon отвергнет его value_id.
+        active = [it for it in raw if not _is_deprecated_dict_label(str(it.get("value", "")))]
+        dropped = len(raw) - len(active)
+        if dropped:
+            logger.info(
+                "[TnvedSource] отфильтровано %d снятых с действия ярлыков ТН ВЭД для cat=%s",
+                dropped, context.category_id,
+            )
+        return active
 
     async def _constrained_pick(
         self, context: ExtractionContext, labels: list[dict]
