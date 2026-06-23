@@ -22,6 +22,8 @@ _RUNTIME = "app.services.enrichment.strategies.dictionaries.ozon_runtime_lookup"
 _ENV = {"OZON_CLIENT_ID": "x", "OZON_API_KEY": "y"}
 
 _DEPRECATED = "6203423100 - (Действие прекращено с 15.09.2024) брюки из денима"
+# Действующий брат-эквивалент: ТОТ ЖЕ код 6203423100, другой value_id/ярлык.
+_ACTIVE_SIBLING = "6203423100 - МАРКИРОВКА РФ - Брюки и бриджи мужские из денима"
 _ACTIVE = "6203423900 - Брюки мужские из прочих текстильных материалов"
 
 
@@ -67,13 +69,33 @@ def test_fetch_dict_labels_filters_deprecated():
     assert [it["id"] for it in out] == [972056540]  # снятый ярлык ушёл
 
 
-# ── _validate_against_ozon_dict: defense — снятый хит → abstain ───────────────
+# ── _validate_against_ozon_dict: действующий брат-эквивалент, не no_data ──────
 
-def test_validate_rejects_deprecated_hit():
-    """Даже если search_value вернул снятую запись (blind-guess путь) → abstain."""
+def test_validate_picks_active_sibling_same_code():
+    """Баг 4 переоткрыт: снят и активный делят код 6203423100 → берём value_id
+    ДЕЙСТВУЮЩЕГО (971398593), НЕ no_data и НЕ снятый 972056539."""
+    raw = [
+        {"id": 972056539, "value": _DEPRECATED},        # снят
+        {"id": 971398593, "value": _ACTIVE_SIBLING},    # действует, тот же код
+    ]
+
     async def _run():
         src = TnvedSource()
         with patch.dict("os.environ", _ENV), \
+             patch(f"{_RUNTIME}.list_values", return_value=raw):
+            return await src._validate_against_ozon_dict("6203423100", 22232, _ctx())
+
+    out = asyncio.run(_run())
+    assert out == (_ACTIVE_SIBLING, 971398593)
+
+
+def test_validate_abstains_when_no_active_equivalent():
+    """В словаре код есть ТОЛЬКО снятый, действующего брата нет → abstain (no_data)."""
+    async def _run():
+        src = TnvedSource()
+        with patch.dict("os.environ", _ENV), \
+             patch(f"{_RUNTIME}.list_values",
+                   return_value=[{"id": 972056539, "value": _DEPRECATED}]), \
              patch(f"{_RUNTIME}.search_value",
                    return_value={"id": 972056539, "value": _DEPRECATED}):
             return await src._validate_against_ozon_dict("6203423100", 22232, _ctx())
@@ -81,14 +103,28 @@ def test_validate_rejects_deprecated_hit():
     assert asyncio.run(_run()) is _ABSTAIN
 
 
-def test_validate_accepts_active_hit():
-    """Действующая запись → (полный ярлык, value_id)."""
+def test_validate_accepts_active_code():
+    """Действующий код напрямую в активном словаре → (полный ярлык, value_id)."""
     async def _run():
         src = TnvedSource()
         with patch.dict("os.environ", _ENV), \
-             patch(f"{_RUNTIME}.search_value",
-                   return_value={"id": 972056540, "value": _ACTIVE}):
+             patch(f"{_RUNTIME}.list_values",
+                   return_value=[{"id": 972056540, "value": _ACTIVE}]):
             return await src._validate_against_ozon_dict("6203423900", 22232, _ctx())
 
     out = asyncio.run(_run())
     assert out == (_ACTIVE, 972056540)
+
+
+def test_validate_fallback_search_when_code_beyond_list_cap():
+    """Код вне 300-кэша list_values → targeted search; действующий хит принимается."""
+    async def _run():
+        src = TnvedSource()
+        with patch.dict("os.environ", _ENV), \
+             patch(f"{_RUNTIME}.list_values", return_value=[]), \
+             patch(f"{_RUNTIME}.search_value",
+                   return_value={"id": 971398632, "value": "6204623100 - МАРКИРОВКА РФ - Брюки женские"}):
+            return await src._validate_against_ozon_dict("6204623100", 22232, _ctx())
+
+    out = asyncio.run(_run())
+    assert out == ("6204623100 - МАРКИРОВКА РФ - Брюки женские", 971398632)

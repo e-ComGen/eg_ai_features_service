@@ -213,16 +213,31 @@ class TnvedSource(AttributeSource):
         а не со всеми (в описании тоже есть цифры). ТН ВЭД подтверждён dict-backed
         живым list_values, поэтому «не найдено» = реально нет в справочнике.
 
+        Снятая с действия запись и её ДЕЙСТВУЮЩИЙ брат-эквивалент в словаре Ozon
+        имеют ОДИН и тот же код, но разные value_id/ярлык (активный помечен
+        «МАРКИРОВКА РФ»). Баг 4: нельзя отдавать value_id снятой записи И нельзя
+        падать в no_data, если действующий эквивалент есть. Поэтому резолвим код
+        через АКТИВНЫЙ (отфильтрованный от снятых) словарь и берём value_id
+        действующего брата; abstain — только если активного варианта нет вовсе.
+
         Returns:
-          (value, id) — код есть в справочнике: ПОЛНЫЙ ярлык словаря Ozon
-                        ("9206000000 - Инструменты музыкальные ударные…") + value_id.
+          (value, id) — есть ДЕЙСТВУЮЩАЯ запись с этим кодом: ПОЛНЫЙ ярлык + value_id.
                         Ozon принимает именно ярлык, а не голый код;
-          _ABSTAIN    — креды+type есть, поиск выполнен, кода НЕТ → не подставлять;
+          _ABSTAIN    — креды+type есть, но действующей записи с кодом НЕТ → no_data;
           None        — проверить нечем (нет кред / type_id / API-сбой) → отдать как есть.
         """
         type_id = context.ozon_type_id
         if type_id is None or not (os.getenv("OZON_CLIENT_ID") and os.getenv("OZON_API_KEY")):
             return None  # нечем валидировать — отдаём код как есть
+
+        # 1. Действующий эквивалент кода ищем в АКТИВНОМ словаре (_fetch_dict_labels
+        #    уже отсеял снятые ярлыки). Снятый и активный делят код → берём активный.
+        active = await self._fetch_dict_labels(context, attr_id)
+        match = self._first_active_with_code(active, code)
+        if match is not None:
+            return (str(match.get("value", "")), match.get("id"))
+
+        # 2. Фоллбэк: код за пределами 300-кэша list_values → targeted search_value.
         try:
             from app.services.enrichment.strategies.dictionaries.ozon_runtime_lookup import (
                 search_value,
@@ -233,20 +248,30 @@ class TnvedSource(AttributeSource):
             return None
         if hit:
             hit_value = str(hit.get("value", ""))
-            # Снятая с действия запись (Баг 4): код верный, но Ozon её отвергнет —
-            # не отдаём value_id недействующей записи. Abstain честнее мусора.
-            if _is_deprecated_dict_label(hit_value):
-                logger.info(
-                    "[TnvedSource] код %s резолвится в СНЯТУЮ с действия запись словаря "
-                    "(%s) → abstain", code, hit_value[:80],
-                )
-                return _ABSTAIN
-            # Ведущий код значения: "9206000000 - Инструменты…" → "9206000000".
             lead = re.match(r"\s*(\d{6,10})", hit_value)
-            if lead and lead.group(1) == code:
+            if lead and lead.group(1) == code and not _is_deprecated_dict_label(hit_value):
                 # ПОЛНЫЙ ярлык словаря + value_id — то, что принимает Ozon.
                 return (hit_value, hit.get("id"))
-        return _ABSTAIN  # dict-backed, поиск выполнен, точного кода нет → abstain
+            if _is_deprecated_dict_label(hit_value):
+                logger.info(
+                    "[TnvedSource] код %s: search вернул СНЯТУЮ запись, действующего "
+                    "эквивалента в словаре нет (%s) → abstain", code, hit_value[:80],
+                )
+        return _ABSTAIN  # dict-backed, действующей записи с кодом нет → abstain
+
+    @staticmethod
+    def _first_active_with_code(labels: list[dict], code: str) -> Optional[dict]:
+        """Первая запись активного словаря, чей ВЕДУЩИЙ код == code.
+
+        labels уже отфильтрованы от снятых (_fetch_dict_labels), поэтому любое
+        совпадение — действующая запись. Ведущий код: "6203423100 - МАРКИРОВКА
+        РФ - Брюки…" → "6203423100".
+        """
+        for it in labels:
+            lead = re.match(r"\s*(\d{6,10})", str(it.get("value", "")))
+            if lead and lead.group(1) == code:
+                return it
+        return None
 
     @staticmethod
     def _make_cache_key(
