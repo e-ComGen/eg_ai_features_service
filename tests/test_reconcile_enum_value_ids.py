@@ -11,6 +11,8 @@ from app.services.enrichment.base import AttributeValue, TargetAttribute, Source
 from app.services.enrichment.pipeline import (
     _reconcile_enum_value_ids,
     _drop_ungrounded_color_guess,
+    _is_multivalue_color_value,
+    _drop_multivalue_color_premerge,
 )
 
 
@@ -95,3 +97,49 @@ def test_scalar_color_kept():
     av = _av(value="черный", value_id=61574, source=Source.OZON_CARD)
     out = _drop_ungrounded_color_guess([av], _TARGETS)
     assert len(out) == 1
+
+
+# ── _is_multivalue_color_value: строка-палитра через ; / , / / ───────────────
+
+def test_string_palette_semicolon_is_multi():
+    """WbCard-кейс: 'коричневый; темно-коричневый; белый; ...' (строка) → мульти."""
+    assert _is_multivalue_color_value("коричневый; темно-коричневый; белый; зеленый", None) is True
+
+
+def test_string_palette_comma_and_slash_is_multi():
+    assert _is_multivalue_color_value("белый, синий", None) is True
+    assert _is_multivalue_color_value("белый/чёрный", None) is True
+
+
+def test_single_color_string_not_multi():
+    """Один цвет (даже с дефисом «темно-синий») — НЕ мульти."""
+    assert _is_multivalue_color_value("черный", None) is False
+    assert _is_multivalue_color_value("темно-синий", 61574) is False
+
+
+def test_list_and_valueids_forms_multi():
+    assert _is_multivalue_color_value(["белый", "чёрный"], None) is True
+    assert _is_multivalue_color_value("черный", [10, 40]) is True
+
+
+# ── _drop_multivalue_color_premerge: одиночный цвет из имени выживает ──────────
+
+def test_premerge_drops_palette_keeps_single_name_color():
+    """WB-палитра (строка ;) дропается ДО merge, одиночный «черный» из имени остаётся.
+
+    Реальный баг: «Nike Air Max 90 чёрные» → WbCard вернул палитру другой расцветки
+    'коричневый; ...; бирюзовый' conf 0.93. Без pre-merge дропа она вытесняла бы
+    «черный» из описания. После — палитра уходит ДО merge, остаётся верный цвет.
+    """
+    palette = _av(value="коричневый; темно-коричневый; белый; зеленый; бирюзовый",
+                  confidence=0.93, source=Source.WB_CARD)
+    name_color = _av(value="черный", confidence=0.8, source=Source.DESCRIPTION)
+    out = _drop_multivalue_color_premerge([palette, name_color], _TARGETS)
+    assert len(out) == 1
+    assert out[0].value == "черный"  # одиночный grounded-цвет выжил
+
+
+def test_premerge_keeps_single_color_only():
+    """Если палитры нет — одиночный цвет не трогаем."""
+    av = _av(value="черный", value_id=61574)
+    assert _drop_multivalue_color_premerge([av], _TARGETS) == [av]

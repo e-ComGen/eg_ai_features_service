@@ -2932,6 +2932,56 @@ def _is_color_target(target: TargetAttribute) -> bool:
     return "цвет" in low and "название" not in low
 
 
+def _is_multivalue_color_value(value, value_ids) -> bool:
+    """True если значение цвета — палитра/мульти-цвет (НЕ один цвет SKU).
+
+    Формы палитры от разных источников:
+      • список ≥2 (llm_knowledge: «белый/чёрный/серый…»);
+      • строка с ≥2 частями через `;`/`,`/`/` (WB/marketplace _map_characteristics
+        join-ит мультизначение: «коричневый; темно-коричневый; белый; зеленый…» —
+        реальный кейс WbCard для «Nike Air Max 90 чёрные», донор другой расцветки);
+      • value_ids ≥2 (ozon_card api-resolve: скаляр value + 10/40 dict-id).
+    Один цвет SKU ни одной из этих форм не имеет.
+    """
+    if isinstance(value, list) and len(value) >= 2:
+        return True
+    if isinstance(value_ids, list) and len(value_ids) >= 2:
+        return True
+    if isinstance(value, str):
+        parts = [p for p in re.split(r"[;,/]", value) if p.strip()]
+        if len(parts) >= 2:
+            return True
+    return False
+
+
+def _drop_multivalue_color_premerge(
+    all_values: list[AttributeValue],
+    targets: list[TargetAttribute],
+) -> list[AttributeValue]:
+    """ДО merge выкинуть палитру-цвета (мульти), чтобы ОДИНОЧНЫЙ grounded-цвет
+    (из названия товара / точного донора) выиграл merge и заполнился.
+
+    Без этого высоко-conf палитра (WbCard conf 0.93) вытесняет одиночный цвет в
+    merge, а post-merge гард потом дропает палитру → теряем ОБА (пусто вместо
+    верного цвета из названия). Дроп палитры до merge решает: палитра уходит,
+    одиночный цвет остаётся единственным кандидатом и наполняет таргет.
+    """
+    color_ids = {t.id for t in targets if _is_color_target(t)}
+    if not color_ids:
+        return all_values
+    out: list[AttributeValue] = []
+    for v in all_values:
+        if v.attribute_id in color_ids and _is_multivalue_color_value(v.value, v.value_ids):
+            logger.info(
+                "[Pipeline] pre-merge drop-multivalue-color: attr=%s src=%s value=%r "
+                "value_ids=%s — палитра донора, не цвет этого SKU",
+                v.attribute_id, v.source, v.value, v.value_ids,
+            )
+            continue
+        out.append(v)
+    return out
+
+
 def _drop_ungrounded_color_guess(
     merged: list[AttributeValue],
     targets: list[TargetAttribute],
@@ -2959,9 +3009,7 @@ def _drop_ungrounded_color_guess(
         # value_ids (≥2). Донор ozon_card отдаёт value="черный" (СКАЛЯР) + value_ids
         # на 10/40 цветов — основной цвет одного SKU столько id иметь не может.
         # Поэтому условие вешаем на ДЛИНУ value_ids, а не на форму value.
-        vlist = isinstance(v.value, list) and len(v.value) >= 2
-        idlist = isinstance(v.value_ids, list) and len(v.value_ids) >= 2
-        if v.attribute_id in color_ids and (vlist or idlist):
+        if v.attribute_id in color_ids and _is_multivalue_color_value(v.value, v.value_ids):
             logger.info(
                 "[Pipeline] drop-multivalue-color: дроп мульти-цвета attr=%s src=%s "
                 "value=%r value_ids=%s — палитра/разброс, не цвет этого SKU",
@@ -4761,6 +4809,12 @@ class PipelineOrchestrator:
         # vision/cards). Отсекает гендерные «Пол»-значения, конфликтующие с именем
         # или навеянные только external-guess источниками при нейтральном имени.
         all_values = _apply_gender_guard(all_values, targets, context)
+
+        # Палитра-цвет ДО merge: донор (WbCard/ozon_card/llm) отдаёт мульти-цвет
+        # (палитру расцветок модели), часто НЕ цвета этого SKU. Дропаем до merge,
+        # чтобы одиночный grounded-цвет из названия («…чёрные»→чёрный) выиграл merge
+        # и заполнился, а не был вытеснен высоко-conf палитрой. [[honest_gap_composition]]
+        all_values = _drop_multivalue_color_premerge(all_values, targets)
         merged = self._merge(all_values)
 
         # Brand-from-name POST-merge: имя товара авторитетно для бренда. Заполняет
