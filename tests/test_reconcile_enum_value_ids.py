@@ -160,8 +160,15 @@ def test_color_guard_drops_vision_and_llm():
     assert _apply_color_source_guard([vis, llm], _TARGETS) == []
 
 
+def test_color_guard_drops_donor_card():
+    """ozon_card/wb_card цвет (колорвей похожего листинга) → дроп (PUMA→«белый» баг)."""
+    oz = _av(value="белый", source=Source.OZON_CARD)
+    wb = _av(value="серый", source=Source.WB_CARD)
+    assert _apply_color_source_guard([oz, wb], _TARGETS) == []
+
+
 def test_color_guard_keeps_description_color_from_name():
-    """color-from-name (source=DESCRIPTION) — per-SKU, остаётся."""
+    """color-from-name (source=DESCRIPTION) — per-SKU, остаётся (единственный allowlist)."""
     av = _av(value="черный", source=Source.DESCRIPTION, evidence="color_from_name")
     out = _apply_color_source_guard([av], _TARGETS)
     assert len(out) == 1 and out[0].value == "черный"

@@ -3061,39 +3061,37 @@ def _drop_multivalue_color_premerge(
     return out
 
 
-# Color-identity guard: «Цвет товара» — per-SKU расцветка продавца, гадать колорвей
-# НЕЛЬЗЯ (eg_importer: «пусто честнее мусора»). web_search/vision/llm_knowledge/
-# competitor_rag домысливают цвет по вебу/фото/похожим листингам, а не видят расцветку
-# ЭТОГО SKU (PUMA Flyer Runner без цвета в имени → web_search «чёрный»). Per-SKU
-# источники остаются: color-from-name (имя продавца), description (verbatim из описания).
-_COLOR_GUESS_SOURCES = {
-    Source.VISION,
-    Source.WEB_SEARCH,
-    Source.LLM_KNOWLEDGE,
-    Source.COMPETITOR_RAG,
-}
+# Color-identity guard (ALLOWLIST): «Цвет товара» — per-SKU расцветка продавца. НИ ОДИН
+# источник, кроме собственного текста товара, не знает колорвей ЭТОГО SKU: доноры
+# (ozon_card/wb_card) дают цвет ПОХОЖЕГО листинга (PUMA Flyer Runner без цвета в имени →
+# ozon_card «белый»); web_search/vision/llm_knowledge/competitor_rag — гадают по вебу/фото.
+# eg_importer: «гадать колорвей нельзя, пусто честнее мусора». Поэтому для цвета оставляем
+# ТОЛЬКО source=DESCRIPTION — это и color-from-name (добавляется post-merge), и verbatim-
+# цвет из описания товара. Всё остальное (доноры/веб/vision/llm) дропается ДО merge.
+_COLOR_ALLOWED_SOURCES = {Source.DESCRIPTION}
 
 
 def _apply_color_source_guard(
     all_values: list[AttributeValue],
     targets: list[TargetAttribute],
 ) -> list[AttributeValue]:
-    """Дроп «Цвет товара» от guess-источников ДО merge (миррор brand-source-guard).
+    """Гейт «Цвет товара» на per-SKU источники (ALLOWLIST=DESCRIPTION), дроп ДО merge.
 
-    Цвет — per-SKU: web_search/vision/llm_knowledge/competitor_rag гадают колорвей по
-    вебу/фото/похожим, не видят расцветку ЭТОГО SKU. Их цвет-кандидаты выбрасываются.
-    Остаются per-SKU: color-from-name (source=DESCRIPTION, добавляется ПОСЛЕ merge) и
-    verbatim-цвет из описания. Не-цвет таргеты — без изменений.
+    Цвет — per-SKU данные продавца; знают его только имя/описание самого товара.
+    Доноры (ozon_card/wb_card) копируют цвет похожего листинга, web/vision/llm гадают
+    колорвей — всё это не цвет ЭТОГО SKU → дроп. Остаётся source=DESCRIPTION: color-from-
+    name (добавляется ПОСЛЕ merge, гард его не видит → не трогает) + verbatim из описания.
+    Не-цвет таргеты — без изменений.
     """
     color_ids = {t.id for t in targets if _is_color_target(t)}
     if not color_ids:
         return all_values
     out: list[AttributeValue] = []
     for v in all_values:
-        if v.attribute_id in color_ids and v.source in _COLOR_GUESS_SOURCES:
+        if v.attribute_id in color_ids and v.source not in _COLOR_ALLOWED_SOURCES:
             logger.info(
-                "[Pipeline] color-guard: дроп цвета attr=%s='%s' (source=%s) — guess "
-                "колорвея, не per-SKU данные продавца",
+                "[Pipeline] color-guard: дроп цвета attr=%s='%s' (source=%s) — не per-SKU "
+                "(колорвей знают только имя/описание товара)",
                 v.attribute_id, v.value, getattr(v.source, "value", v.source),
             )
             continue
