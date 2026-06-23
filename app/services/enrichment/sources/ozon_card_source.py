@@ -225,8 +225,20 @@ _SERPER_TIMEOUT = 15
 # Regex для извлечения pid из ссылки вида /product/<slug>-<pid>/ или
 # product/...-123456789 в любом тексте (link или snippet).
 _SERPER_PID_RE = re.compile(r"/product/[a-z0-9\-]*?-(\d{5,})/?", re.IGNORECASE)
+# Slug + pid из URL карточки: /product/<slug>-<pid>/ → (slug, pid).
+_SERPER_SLUG_PID_RE = re.compile(r"/product/([a-z0-9\-]+?)-(\d{5,})/?", re.IGNORECASE)
 # fallback: «Артикул: 1240096510» в сниппете.
 _SERPER_ARTICUL_RE = re.compile(r"(?:артикул|sku)\D{0,3}(\d{5,})", re.IGNORECASE)
+
+# Serper-assisted card-finding: когда внутренний поиск Ozon флачит (no_tiles/low_match),
+# найти точный URL товара через Google (он индексирует ozon.ru надёжнее, чем держится
+# их антибот-search), затем Scrappey тащит ТОЛЬКО /features/ найденного URL. Цель —
+# поднять 66%-потолок за счёт search/match-промахов (не антибот). Гард: Serper-карточка
+# проходит ТОТ ЖЕ match-скоринг, что и Ozon-tile → чужой бренд/тип отсекается.
+# Дефолт ON (только ДОБАВЛЯет fallback при провале основного пути; гард не пускает мусор).
+_OZON_SERPER_CARD_FINDING = os.getenv(
+    "OZON_SERPER_CARD_FINDING", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
 
 # Similarity thresholds (понижены для (V2/V3/Plus/Bronze) вариаций — title часто
 # содержит "Блок питания + brand + model + V3 80 Plus Gold (MPE-XXX-...)", т.е.
@@ -1234,6 +1246,10 @@ class OzonCardSource(AttributeSource):
 
         if not tiles or query is None:
             logger.info("[OzonCard] no search tiles ни для primary ни для fallback")
+            # Поиск Ozon флакнул — пробуем найти карточку через Google (Serper).
+            serper = await self._try_serper_card(context, client, session)
+            if serper is not None and serper.get("stage") == "ok":
+                return serper
             return {
                 "query": used_query,
                 "tiles_count": 0,
@@ -1279,6 +1295,10 @@ class OzonCardSource(AttributeSource):
                 "[OzonCard] best score=%.1f < %.0f — skip",
                 top_score, _BRAND_LINE_THRESHOLD,
             )
+            # Ozon-tile ниже порога — Google может найти точную карточку (Serper).
+            serper = await self._try_serper_card(context, client, session)
+            if serper is not None and serper.get("stage") == "ok":
+                return serper
             return {
                 "query": used_query,
                 "tiles_count": len(tiles),
@@ -1638,6 +1658,113 @@ class OzonCardSource(AttributeSource):
             seen.add(name_low)
             out.append({"name": name, "value": value, "value_ids": []})
         return out
+
+    async def _serper_find_card(self, context: ExtractionContext) -> Optional[dict]:
+        """Найти точный URL Ozon-товара через Serper (Google индексирует ozon.ru
+        надёжнее их собственного антибот-поиска).
+
+        Возвращает {card_url, slug, pid, title} первого organic-результата
+        ozon.ru/product/...-<pid>/ или None. Никогда не падает.
+        """
+        try:
+            from app.services.providers.factory import get_web_search_client
+            client = get_web_search_client()
+        except Exception as exc:
+            logger.info("[OzonCard] serper-find: web_search client unavailable: %s", exc)
+            return None
+        if client is None:
+            logger.info("[OzonCard] serper-find: PROVIDER_WEB_SEARCH != serper → skip")
+            return None
+
+        product_name = context.product_name.strip()
+        try:
+            res = await client.search(
+                f"{product_name} ozon",
+                num_results=_SERPER_NUM_RESULTS,
+                timeout=_SERPER_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.info("[OzonCard] serper-find: Serper search failed: %s", exc)
+            return None
+
+        for org in res.organic_results:
+            link = org.link or ""
+            m = _SERPER_SLUG_PID_RE.search(link)
+            if not m:
+                continue
+            slug, pid = m.group(1), m.group(2)
+            return {
+                "card_url": f"{_OZON_PRODUCT_BASE}{slug}-{pid}/",
+                "slug": slug,
+                "pid": pid,
+                "title": (org.title or "").strip(),
+            }
+        logger.info("[OzonCard] serper-find: no ozon.ru/product/ organic для '%s'", product_name[:60])
+        return None
+
+    async def _try_serper_card(
+        self,
+        context: ExtractionContext,
+        client: httpx.AsyncClient,
+        session: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Serper-assisted card-finding: URL товара через Google (в обход флакового
+        поиска Ozon) → Scrappey-фетч /features/ → parse полной карточки.
+
+        Гард: Serper-карточка проходит ТОТ ЖЕ _pick_best_match/_classify_match скоринг,
+        что и Ozon-tile — чужой бренд/тип/модель уходит ниже порога → отвергаем (пусто
+        честнее мусорной донор-карточки). Возвращает raw-dict в формате _fetch_card_raw
+        (stage=ok|fetch_fail|parse_empty) или None (не нашли / гард отверг / выключено).
+        """
+        if not _OZON_SERPER_CARD_FINDING:
+            return None
+        found = await self._serper_find_card(context)
+        if not found:
+            return None
+
+        full_name = context.product_name.strip()
+        cat_leaf = context.category_path[-1] if context.category_path else None
+        title = found["title"]
+        slug, pid, card_url = found["slug"], found["pid"], found["card_url"]
+
+        # Гард: тот же скоринг, что для Ozon-tile (бренд/тип/модель-mismatch штрафы).
+        pseudo_tile = {"title": title, "slug": slug, "pid": pid}
+        _t, score = self._pick_best_match(
+            full_name, [pseudo_tile], category_leaf=cat_leaf,
+            query_brand=context.brand, query_name=full_name,
+        )
+        mode = self._classify_match(score)
+        if mode == "skip":
+            logger.info(
+                "[OzonCard] Serper-card '%s' score=%.1f < %.0f — отвергнут гардом",
+                title[:60], score, _BRAND_LINE_THRESHOLD,
+            )
+            return None
+
+        logger.info(
+            "[OzonCard] Serper-card найден: '%s' score=%.1f mode=%s pid=%s → фетч /features/",
+            title[:60], score, mode, pid,
+        )
+        base = {
+            "query": f"serper:{full_name[:40]}",
+            "tiles_count": 0,
+            "match_score": score,
+            "match_class": mode,
+            "card_url": card_url,
+            "card_title": title,
+        }
+        features_url = f"{_OZON_PRODUCT_BASE}{slug}-{pid}/features/"
+        features_html = await self._scrappey_fetch(client, features_url, session=session)
+        if features_html is None:
+            return {**base, "raw_chars": [], "image_urls": [], "stage": "fetch_fail"}
+
+        chars = self._parse_characteristics_html(features_html)
+        image_urls = self._extract_image_urls(features_html)
+        if not chars:
+            return {**base, "raw_chars": [], "image_urls": image_urls, "stage": "parse_empty"}
+
+        logger.info("[OzonCard] Serper-card HIT: '%s' → %d chars", title[:60], len(chars))
+        return {**base, "raw_chars": chars, "image_urls": image_urls, "stage": "ok"}
 
     async def _serper_snippet_fallback(
         self,

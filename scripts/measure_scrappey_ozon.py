@@ -66,19 +66,23 @@ _CAT_ID = 15621048
 
 # ── Конфиги (имя → словарь модульных констант) ────────────────────────────────
 _CONFIGS = {
-    "A baseline-datacenter": dict(country="", req="", proxy="", session=False),
-    "B residential-RU-raw": dict(country="Russia", req="", proxy="", session=False),
-    "C residential-RU-browser": dict(country="Russia", req="browser", proxy="", session=False),
-    "D RU-browser+session": dict(country="Russia", req="browser", proxy="", session=True),
+    "A baseline-datacenter": dict(country="", req="", proxy="", session=False, serper=False),
+    "B residential-RU-raw": dict(country="Russia", req="", proxy="", session=False, serper=False),
+    "C residential-RU-browser": dict(country="Russia", req="browser", proxy="", session=False, serper=False),
+    "D RU-browser+session": dict(country="Russia", req="browser", proxy="", session=True, serper=False),
+    # E — главный новый рычаг: datacenter + Serper-card-finding (Google находит URL
+    # карточки в обход флакового поиска Ozon). Сравнивать с A (тот же datacenter, serper off).
+    "E datacenter+serper-card": dict(country="", req="", proxy="", session=False, serper=True),
 }
 
 
 def _apply_config(cfg: dict) -> None:
-    """Перезаписать модульные Scrappey-константы под конфиг (читаются на каждый payload)."""
+    """Перезаписать модульные Scrappey/Serper-константы под конфиг (читаются на каждый вызов)."""
     ocs._SCRAPPEY_PROXY_COUNTRY = cfg["country"]
     ocs._SCRAPPEY_REQUEST_TYPE = cfg["req"]
     ocs._SCRAPPEY_PROXY = cfg["proxy"]
     ocs._SCRAPPEY_SESSION_REUSE = cfg["session"]
+    ocs._OZON_SERPER_CARD_FINDING = cfg.get("serper", False)
 
 
 def _install_credit_counter() -> dict:
@@ -102,7 +106,8 @@ async def _run_config(name: str, cfg: dict, products: list) -> None:
 
     print(f"\n{'='*72}\n  КОНФИГ: {name}")
     print(f"  proxyCountry={cfg['country']!r} requestType={cfg['req']!r} "
-          f"proxy={'set' if cfg['proxy'] else 'none'} session_reuse={cfg['session']}")
+          f"proxy={'set' if cfg['proxy'] else 'none'} session_reuse={cfg['session']} "
+          f"serper_card={cfg.get('serper', False)}")
     print(f"{'='*72}")
 
     found = 0
