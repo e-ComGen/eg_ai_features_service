@@ -21,6 +21,7 @@ In-process cache:
     - Value vocabularies are stable between requests.
     Use ``clear_lookup_cache()`` in tests to reset state.
 """
+import asyncio
 import os
 import logging
 from typing import Optional
@@ -31,6 +32,7 @@ log = logging.getLogger(__name__)
 
 OZON_BASE_URL = "https://api-seller.ozon.ru"
 SEARCH_ENDPOINT = "/v1/description-category/attribute/values/search"
+TREE_ENDPOINT = "/v1/description-category/tree"
 
 # In-process cache: (cat_id, type_id, attr_id, query_lower) -> {"id": int, "value": str} | None
 _lookup_cache: dict[tuple[int, int, int, str], Optional[dict]] = {}
@@ -220,3 +222,76 @@ async def list_values(
 
     _values_cache[cache_key] = out
     return out
+
+
+# ---------------------------------------------------------------------------
+# Live description_category_id resolution from the category tree
+# ---------------------------------------------------------------------------
+# Зачем: category_id из шаблона caller'а (eg_importer) может быть УСТАРЕВШИМ —
+# values-API отвечает «category with level_3_id=... and type=... is not found».
+# Правильный description_category_id — это родитель type_id в ЖИВОМ дереве Ozon
+# (тостер: type 96031 живёт под dcid 17039630, а не под шаблонным 47156221).
+# Грузим дерево один раз на процесс, строим {type_id: parent_description_category_id}.
+_type_to_dcid: dict[int, int] = {}
+_tree_loaded = False
+_tree_lock = asyncio.Lock()
+
+
+def clear_tree_cache() -> None:
+    """Сбросить кэш дерева категорий. Для тестов."""
+    global _tree_loaded
+    _type_to_dcid.clear()
+    _tree_loaded = False
+
+
+def _walk_tree(nodes, parent_dcid: Optional[int]) -> None:
+    for n in nodes or []:
+        dcid = n.get("description_category_id")
+        tid = n.get("type_id")
+        if tid is not None and parent_dcid is not None:
+            _type_to_dcid[int(tid)] = int(parent_dcid)
+        child_parent = dcid if dcid is not None else parent_dcid
+        _walk_tree(n.get("children"), child_parent)
+
+
+async def _load_tree(client_id: Optional[str], api_key: Optional[str]) -> None:
+    global _tree_loaded
+    cid = client_id or os.getenv("OZON_CLIENT_ID", "")
+    key = api_key or os.getenv("OZON_API_KEY", "")
+    if not cid or not key:
+        _tree_loaded = True  # нечем грузить — не долбим повторно
+        return
+    headers = {"Client-Id": cid, "Api-Key": key, "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                OZON_BASE_URL + TREE_ENDPOINT, headers=headers, json={"language": "DEFAULT"}
+            )
+        if r.status_code == 200:
+            _walk_tree(r.json().get("result"), None)
+            log.info("ozon tree: загружено %d type→category маппингов", len(_type_to_dcid))
+        else:
+            log.warning("ozon tree: HTTP %d: %s", r.status_code, r.text[:200])
+    except httpx.HTTPError as exc:  # pragma: no cover — сеть не должна ронять стейдж
+        log.warning("ozon tree: network error: %s", exc)
+    _tree_loaded = True
+
+
+async def resolve_description_category_id(
+    type_id: Optional[int],
+    *,
+    client_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Optional[int]:
+    """Вернуть живой description_category_id (родитель type_id) или None.
+
+    None если: type_id не задан, дерево недоступно (нет кред/сеть) или type_id в
+    дереве не найден. Вызывающая сторона тогда фоллбэчит на свой category_id.
+    """
+    if type_id is None:
+        return None
+    if not _tree_loaded:
+        async with _tree_lock:
+            if not _tree_loaded:
+                await _load_tree(client_id, api_key)
+    return _type_to_dcid.get(int(type_id))

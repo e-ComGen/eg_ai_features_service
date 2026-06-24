@@ -3347,6 +3347,104 @@ def _merge_collection(
     })
 
 
+# Backfill allowed_values из живого словаря Ozon (list_values API) для enum-полей,
+# у которых caller не прислал options. Бэг (eg_importer, тостер): «Количество
+# отделений» — закрытый словарь {1,2,3,4}, но options не пришёл → enum-гейт нечем
+# было активировать → verbatim «8» из описания протекало. Локального словаря Ozon
+# у движка для многих категорий нет, но API отдаёт точный список. Тот же механизм,
+# что у ТН ВЭД. После бэкфилла classify_target→enum и _enforce_allowed_values сам
+# режет out-of-list значения.
+_OZON_API_ENUM_OPTIONS = os.getenv("OZON_API_ENUM_OPTIONS_ENABLED", "1").lower() not in (
+    "0", "false", "no",
+)
+# Кап на размер списка: закрытые словари малы (цвет ~57, страна ~250). Если API
+# отдал ≥ капа — это усечённый/огромный справочник (бренд, ТН ВЭД), его НЕЛЬЗЯ
+# использовать как allowlist (выкинули бы валидные значения вне первой страницы).
+_ENUM_OPTIONS_CAP = 512
+_ENUM_OPTIONS_CONCURRENCY = 6
+
+
+def _is_enum_options_candidate(target: TargetAttribute) -> bool:
+    """Стоит ли пытаться тянуть словарь из API для target с пустым allowed_values.
+
+    Пропускаем заведомо свободные поля: ТН ВЭД (свой резолвер), url/model_name/
+    dimensions и числовые-с-единицей (Вт/см/мм/г/м) — они не словарные.
+    """
+    if target.allowed_values:
+        return False
+    if "тн вэд" in target.name.lower():
+        return False  # резолвится TnvedSource, не словарный allowlist
+    if classify_target(target) in ("url", "model_name", "dimensions"):
+        return False
+    if (extract_unit(target.name) or "").strip():
+        return False  # свободное числовое поле с единицей измерения
+    return True
+
+
+async def _backfill_allowed_values_from_api(
+    targets: list[TargetAttribute],
+    context: ExtractionContext,
+) -> list[TargetAttribute]:
+    """Заполнить allowed_values из Ozon list_values для enum-полей без options.
+
+    Возвращает НОВЫЙ список targets (model_copy с обновлённым allowed_values там,
+    где словарь найден). Безопасно при любом сбое: при отсутствии type_id/кред/сети
+    возвращает targets как есть. Усечённые/огромные словари (≥ _ENUM_OPTIONS_CAP)
+    НЕ применяются — иначе резали бы валидные значения вне первой страницы.
+    """
+    if not _OZON_API_ENUM_OPTIONS:
+        return targets
+    type_id = context.ozon_type_id
+    if type_id is None or not (os.getenv("OZON_CLIENT_ID") and os.getenv("OZON_API_KEY")):
+        return targets
+    candidates = [t for t in targets if _is_enum_options_candidate(t)]
+    if not candidates:
+        return targets
+
+    from app.services.enrichment.strategies.dictionaries.ozon_runtime_lookup import (
+        list_values, resolve_description_category_id,
+    )
+
+    # category_id из шаблона caller'а бывает устаревшим → values-API «not found».
+    # Берём живой description_category_id (родитель type_id) из дерева Ozon; если
+    # дерево недоступно/тип не найден — фоллбэк на присланный category_id.
+    eff_cat = await resolve_description_category_id(type_id) or context.category_id
+
+    sem = asyncio.Semaphore(_ENUM_OPTIONS_CONCURRENCY)
+
+    async def _fetch(t: TargetAttribute) -> tuple[int, Optional[list[str]]]:
+        async with sem:
+            try:
+                vals = await list_values(
+                    eff_cat, type_id, t.id, max_values=_ENUM_OPTIONS_CAP,
+                )
+            except Exception as exc:  # pragma: no cover — сеть не должна ронять стейдж
+                logger.warning("[Pipeline] list_values options-backfill ошибка attr=%s: %s", t.id, exc)
+                return t.id, None
+        if not vals or len(vals) >= _ENUM_OPTIONS_CAP:
+            return t.id, None  # не словарь / усечён → не применяем как allowlist
+        opts = [str(v.get("value", "")) for v in vals if v.get("value") not in (None, "")]
+        return t.id, (opts or None)
+
+    results = dict(await asyncio.gather(*(_fetch(t) for t in candidates)))
+
+    out: list[TargetAttribute] = []
+    filled = 0
+    for t in targets:
+        opts = results.get(t.id)
+        if opts:
+            out.append(t.model_copy(update={"allowed_values": opts}))
+            filled += 1
+        else:
+            out.append(t)
+    if filled:
+        logger.info(
+            "[Pipeline] options-backfill из Ozon API: %d enum-полей закрыто словарём "
+            "(cat=%s type=%s)", filled, context.category_id, type_id,
+        )
+    return out
+
+
 class PipelineOrchestrator:
     """Sequential cost-aware pipeline.
 
@@ -3592,6 +3690,12 @@ class PipelineOrchestrator:
             self._strategy.normalize_target_with_context(t, context)
             for t in targets
         ]
+        # Шаг 0c.5: бэкфилл allowed_values из живого словаря Ozon (list_values API)
+        # для enum-полей, которым caller не прислал options (eg_importer тостер:
+        # «Количество отделений» — закрытый {1,2,3,4}, но options пуст → enum-гейт
+        # молчал → verbatim «8» из описания протекало). После — _enforce_allowed_values
+        # сам режет out-of-list. Тот же API-механизм, что у ТН ВЭД.
+        targets = await _backfill_allowed_values_from_api(targets, context)
 
         # Шаг 0d: бэкфилл context.brand из названия, когда продавец оставил «Бренд»
         # пустым (Баг 3 eg_importer). Brand-gated источники (ozon_card/regard/onliner/
@@ -4214,6 +4318,43 @@ class PipelineOrchestrator:
                     )
                     continue
             filtered_values.append(v)
+
+        # Enum-membership гард (Баг тостер: IceCat смапил «уровней поджаривания=8»
+        # → «Количество отделений», у которого закрытый словарь {1,2,3,4}). LLM-гейт
+        # _enforce_allowed_values работает только на LLM-слое — IceCat/marketplace/
+        # donor-источники его ОБХОДЯТ. Здесь, до resolve_value_ids, дропаем скалярное
+        # значение, которое реально не принадлежит allowed_values (тот же _map_enum_value:
+        # exact→норм→fuzzy-порог). «пусто честнее мусора». Исключения: ТН ВЭД
+        # (allowed_values ~50-code sample, но фактически free-text — режет TnvedSource)
+        # и бренд (free-text/truncated). Списки (is_collection) тут не трогаем.
+        from app.services.enrichment.strategies.ozon_strategy import _map_enum_value
+        _ENUM_GUARD_EXEMPT_MARKERS = ("тн вэд", "тнвэд", "еаэс", "бренд")
+        enum_guarded: list[AttributeValue] = []
+        for v in filtered_values:
+            tgt = targets_by_id.get(v.attribute_id)
+            if (
+                tgt is None
+                or not tgt.allowed_values
+                or isinstance(v.value, list)
+                or (v.evidence or "").startswith("tnved_resolver:")
+                or any(m in (tgt.name or "").lower() for m in _ENUM_GUARD_EXEMPT_MARKERS)
+            ):
+                enum_guarded.append(v)
+                continue
+            canon_map = {str(a).strip().lower(): str(a) for a in tgt.allowed_values}
+            allowed_list = [str(a) for a in tgt.allowed_values]
+            canon = _map_enum_value(v.value, canon_map, allowed_list)
+            if canon is None:
+                logger.info(
+                    "[Pipeline] enum-membership дроп: attr=%s value=%r source=%s — "
+                    "не принадлежит allowed_values (%d значений)",
+                    v.attribute_id, v.value, v.source.value, len(allowed_list),
+                )
+                continue
+            if canon != v.value:
+                v = v.model_copy(update={"value": canon})  # каноническая форма словаря
+            enum_guarded.append(v)
+        filtered_values = enum_guarded
 
         # TNVED_SOURCE_FIX_ENABLED: drop LLM_KNOWLEDGE/WEB_SEARCH values for ТН ВЭД
         # attributes UNLESS they came from TnvedSource (sentinel prefix "tnved_resolver:"
