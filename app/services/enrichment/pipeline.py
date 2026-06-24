@@ -2919,6 +2919,131 @@ _PLACEHOLDER_VALUES: frozenset[str] = frozenset({
 })
 
 
+_ENUM_GUARD_EXEMPT_MARKERS = ("тн вэд", "тнвэд", "еаэс", "бренд")
+# Порог для членов МНОГОЗНАЧНОГО словарного поля. Используем token_set_ratio,
+# а НЕ WRatio: члены — многословные фразы («Автоматическое центрирование тостов»),
+# где WRatio раздувает score на общем хвосте («…тостов») и пропускает мусор
+# («подогрев готовых тостов»→86), одновременно роняя легит-вариант
+# («автоцентрирование тостов»→81<85). token_set_ratio награждает общие токены без
+# учёта порядка/лишних слов: экстра-подъем=100, автоцентрирование=81 (легит),
+# подогрев=52, выдвижной=39 — чистое разделение на пороге 80.
+_ENUM_MEMBER_TOKENSET_THRESHOLD = 80
+
+
+def _match_collection_member(
+    raw: object,
+    norm_options: "list[tuple[str, str]]",
+) -> "Optional[str]":
+    """Сматчить ОДИН член многозначного поля с каноном словаря или None.
+
+    norm_options — [(normalized_allowed, canonical_allowed)]. Стратегии:
+    1. Нормализованный exact (ё→е, латиница→кириллица — как словарь).
+    2. rapidfuzz token_set_ratio ≥ порога (переставленные/усечённые фразы).
+    Ниже порога → None («пусто честнее мусора», не форсим ближайший).
+    """
+    from app.services.enrichment.strategies.dictionaries.ozon_loader import _normalize_token
+
+    if raw is None:
+        return None
+    key = str(raw).strip().lower()
+    if not key:
+        return None
+    norm_key = _normalize_token(key)
+    if not norm_key:
+        return None
+    for n, canon in norm_options:
+        if n and n == norm_key:
+            return canon
+    try:
+        from rapidfuzz import fuzz, process
+        best = process.extractOne(
+            norm_key, [n for n, _ in norm_options], scorer=fuzz.token_set_ratio
+        )
+        if best and best[1] >= _ENUM_MEMBER_TOKENSET_THRESHOLD:
+            return norm_options[best[2]][1]
+    except Exception as exc:  # pragma: no cover — rapidfuzz всегда есть
+        logger.warning("enum-member rapidfuzz failed: %s", exc)
+    return None
+
+
+def _apply_enum_membership_guard(
+    values: "list[AttributeValue]",
+    targets_by_id: "dict[int, TargetAttribute]",
+) -> "list[AttributeValue]":
+    """Дропнуть/каноникализировать enum-значения, не принадлежащие allowed_values.
+
+    Работает ДО resolve_value_ids: ленивый Ozon-search присвоил бы вне-словарному
+    мусору («выдвижной лоток») какой-нибудь id, и он бы протёк. LLM-гейт
+    _enforce_allowed_values действует только на LLM-слое — IceCat/marketplace/donor
+    его ОБХОДЯТ, поэтому фильтруем здесь, для любого источника.
+
+    - Скаляр: маппим через _map_enum_value (exact→норм→fuzzy-порог); None → дроп.
+    - Список (Ⓜ️ многозначное поле): каноникализируем КАЖДЫЙ член, дропаем
+      вне-словарные, дедуп с сохранением порядка; пустой результат → дроп поля.
+    Исключения: ТН ВЭД (free-text код, режет TnvedSource), бренд (free-text),
+    поля без allowed_values, и значения с evidence-сентинелом tnved_resolver:.
+    «пусто честнее мусора».
+    """
+    from app.services.enrichment.strategies.ozon_strategy import _map_enum_value
+
+    out: list[AttributeValue] = []
+    for v in values:
+        tgt = targets_by_id.get(v.attribute_id)
+        if (
+            tgt is None
+            or not tgt.allowed_values
+            or (v.evidence or "").startswith("tnved_resolver:")
+            or any(m in (tgt.name or "").lower() for m in _ENUM_GUARD_EXEMPT_MARKERS)
+        ):
+            out.append(v)
+            continue
+        canon_map = {str(a).strip().lower(): str(a) for a in tgt.allowed_values}
+        allowed_list = [str(a) for a in tgt.allowed_values]
+        if isinstance(v.value, list):
+            from app.services.enrichment.strategies.dictionaries.ozon_loader import _normalize_token
+            norm_options = [(_normalize_token(str(a).strip().lower()), str(a))
+                            for a in tgt.allowed_values]
+            kept: list = []
+            seen: set = set()
+            for el in v.value:
+                c = _match_collection_member(el, norm_options)
+                if c is None:
+                    logger.info(
+                        "[Pipeline] enum-membership дроп (член списка): attr=%s "
+                        "элемент=%r source=%s — вне allowed_values (%d значений)",
+                        v.attribute_id, el, v.source.value, len(allowed_list),
+                    )
+                    continue
+                if c.lower() in seen:
+                    continue
+                seen.add(c.lower())
+                kept.append(c)
+            if not kept:
+                logger.info(
+                    "[Pipeline] enum-membership дроп: attr=%s — ни один член %r "
+                    "не в словаре (%d значений)",
+                    v.attribute_id, v.value, len(allowed_list),
+                )
+                continue
+            if kept != list(v.value):
+                # состав/форма изменились → сбрасываем value_ids под пере-резолв ниже
+                v = v.model_copy(update={"value": kept, "value_ids": None})
+            out.append(v)
+            continue
+        canon = _map_enum_value(v.value, canon_map, allowed_list)
+        if canon is None:
+            logger.info(
+                "[Pipeline] enum-membership дроп: attr=%s value=%r source=%s — "
+                "не принадлежит allowed_values (%d значений)",
+                v.attribute_id, v.value, v.source.value, len(allowed_list),
+            )
+            continue
+        if canon != v.value:
+            v = v.model_copy(update={"value": canon})  # каноническая форма словаря
+        out.append(v)
+    return out
+
+
 def _is_placeholder_value(raw: object) -> bool:
     """True если значение — заведомый плейсхолдер/пустышка.
 
@@ -4326,35 +4451,11 @@ class PipelineOrchestrator:
         # значение, которое реально не принадлежит allowed_values (тот же _map_enum_value:
         # exact→норм→fuzzy-порог). «пусто честнее мусора». Исключения: ТН ВЭД
         # (allowed_values ~50-code sample, но фактически free-text — режет TnvedSource)
-        # и бренд (free-text/truncated). Списки (is_collection) тут не трогаем.
-        from app.services.enrichment.strategies.ozon_strategy import _map_enum_value
-        _ENUM_GUARD_EXEMPT_MARKERS = ("тн вэд", "тнвэд", "еаэс", "бренд")
-        enum_guarded: list[AttributeValue] = []
-        for v in filtered_values:
-            tgt = targets_by_id.get(v.attribute_id)
-            if (
-                tgt is None
-                or not tgt.allowed_values
-                or isinstance(v.value, list)
-                or (v.evidence or "").startswith("tnved_resolver:")
-                or any(m in (tgt.name or "").lower() for m in _ENUM_GUARD_EXEMPT_MARKERS)
-            ):
-                enum_guarded.append(v)
-                continue
-            canon_map = {str(a).strip().lower(): str(a) for a in tgt.allowed_values}
-            allowed_list = [str(a) for a in tgt.allowed_values]
-            canon = _map_enum_value(v.value, canon_map, allowed_list)
-            if canon is None:
-                logger.info(
-                    "[Pipeline] enum-membership дроп: attr=%s value=%r source=%s — "
-                    "не принадлежит allowed_values (%d значений)",
-                    v.attribute_id, v.value, v.source.value, len(allowed_list),
-                )
-                continue
-            if canon != v.value:
-                v = v.model_copy(update={"value": canon})  # каноническая форма словаря
-            enum_guarded.append(v)
-        filtered_values = enum_guarded
+        # и бренд (free-text/truncated). Многозначные (Ⓜ️) словарные поля
+        # («Функциональные особенности», «Системы защиты», «Режимы тостера») —
+        # тоже закрытые словари: фильтруем КАЖДЫЙ член списка, иначе мусор от
+        # не-LLM источников (IceCat/donor) протекает мимо LLM-гейта.
+        filtered_values = _apply_enum_membership_guard(filtered_values, targets_by_id)
 
         # TNVED_SOURCE_FIX_ENABLED: drop LLM_KNOWLEDGE/WEB_SEARCH values for ТН ВЭД
         # attributes UNLESS they came from TnvedSource (sentinel prefix "tnved_resolver:"
