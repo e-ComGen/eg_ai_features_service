@@ -89,3 +89,41 @@ class TestShelfLifeCuratedConstant:
         assert len(found) == 1
         assert found[0].value == "548"
         assert found[0].source == Source.DESCRIPTION
+
+    def test_I1_force_websearch_excludes_attr_5379_alt_dcid(self):
+        """When resolved_category_id matches alt dcid 200001282, attr 5379 is excluded from force_websearch."""
+        targets = [
+            TargetAttribute(id=5379, name="Срок годности в днях", type="numeric"),
+            TargetAttribute(id=9999, name="Другой numeric", type="numeric"),
+        ]
+        ctx = ExtractionContext(
+            product_id=1,
+            product_name="Test",
+            category_id=200001282,
+            resolved_category_id=200001282,
+        )
+        strategy = OzonStrategy()
+        result = strategy.force_websearch_targets(targets, ctx)
+        assert 9999 in result
+        assert 5379 not in result
+
+    def test_I1_post_process_returns_548_alt_dcid(self):
+        """post_process_values returns curated value '548' for attr 5379 when alt dcid 200001282 matches."""
+        targets = [
+            TargetAttribute(id=5379, name="Срок годности в днях", type="numeric", is_required=True),
+        ]
+        values: List[AttributeValue] = []
+        ctx = ExtractionContext(
+            product_id=1,
+            product_name="Test",
+            category_id=200001282,
+            resolved_category_id=200001282,
+        )
+        strategy = OzonStrategy()
+        # Mock resolve_value_ids to be a no-op
+        strategy.resolve_value_ids = MagicMock(return_value=None)
+        result = strategy.post_process_values(values, targets, ctx)
+        found = [v for v in result if v.attribute_id == 5379]
+        assert len(found) == 1
+        assert found[0].value == "548"
+        assert found[0].source == Source.DESCRIPTION

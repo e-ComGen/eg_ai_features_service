@@ -57,6 +57,11 @@ CATEGORY_DEFAULTS: dict[int, dict[int, tuple[str, Optional[int]]]] = {
         # web_search якорил перфюмерные 1095дн (prompt_router:189); 548 = royalcanin 18 мес.
         5379: ("548", None),
     },
+    200001282: {  # Корм сухой (альт. dcid, type_id=91925) — двойник 17028670
+        # Срок годности в днях (5379, Integer). Та же курируемая константа: сухой корм = 18 мес.
+        # type_id 91925 мапится на 2 dcid; курируем оба, иначе live-резолв в 200001282 вернёт web_search 1095.
+        5379: ("548", None),
+    },
 }
 
 
