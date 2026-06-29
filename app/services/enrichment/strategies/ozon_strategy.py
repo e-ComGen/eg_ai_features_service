@@ -411,20 +411,22 @@ class OzonStrategy(MarketplaceStrategy):
         # иначе вызываем resolve_value_ids чтобы найти id через ozon_loader.
         cat_defaults = CATEGORY_DEFAULTS.get(getattr(context, "resolved_category_id", None) if getattr(context, "resolved_category_id", None) is not None else context.category_id, {})
         for attr_id, default_payload in cat_defaults.items():
-            if attr_id not in target_ids or attr_id in existing_ids:
+            if attr_id not in target_ids:
                 continue
+            if attr_id in existing_ids:
+                values = [v for v in values if v.attribute_id != attr_id]
+                existing_ids.discard(attr_id)
             value_text, default_vid = default_payload
             av = AttributeValue(
                 attribute_id=attr_id,
                 value=value_text,
                 confidence=_DEFAULT_CONFIDENCE,
                 source=Source.DESCRIPTION,
-                evidence="category default",
+                evidence="category default (authoritative override)",
             )
             if default_vid is not None:
                 av.value_id = default_vid
             else:
-                # Fallback: пробуем найти value_id через словарь.
                 self.resolve_value_ids(av, context)
             extras.append(av)
             existing_ids.add(attr_id)
