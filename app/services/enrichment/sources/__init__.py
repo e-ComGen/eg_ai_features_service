@@ -19,6 +19,7 @@ from .regard_source import RegardSource
 from .bestbuy_source import BestBuySource
 from .onliner_source import OnlinerSource
 from .books_source import BooksSource
+from .lamoda_scrapfly_source import LamodaScrapflySource
 
 __all__ = [
     "DescriptionSource",
@@ -41,4 +42,5 @@ __all__ = [
     "BestBuySource",
     "OnlinerSource",
     "BooksSource",
+    "LamodaScrapflySource",
 ]

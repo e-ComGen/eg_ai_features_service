@@ -32,6 +32,7 @@ PRODUCTS = [
     {"id": 1, "name": "Nike Air Max 90 черные", "brand": "Nike"},
     {"id": 2, "name": "Adidas Runfalcon 3.0 синие", "brand": "Adidas"},
     {"id": 3, "name": "Nike Air Max 90", "brand": "Nike"},
+    {"id": 4, "name": "PUMA Flyer Runner", "brand": "PUMA"},  # eg_importer p3: web_search гадал «чёрный»
 ]
 
 
@@ -39,7 +40,7 @@ def _payload():
     return {
         "client_id": 1,
         "use_cache": False,
-        "options": {"marketplace": "ozon", "enable_vision": False, "enable_web_search": False},
+        "options": {"marketplace": "ozon", "enable_vision": True, "enable_web_search": True},
         "schemas": {str(CAT): SCHEMA},
         "products": [
             {

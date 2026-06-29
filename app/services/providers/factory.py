@@ -198,6 +198,9 @@ def get_openai_strict_manager() -> "OpenAIStrictProvider | None":
     Используется sources для маршрутизации вызовов с __has_enum_constraints__=True
     через OpenAI gpt-4.1-mini strict mode вместо DeepSeek JSON mode.
     """
+    if not config.USE_OPENAI_STRICT:
+        logger.debug("get_openai_strict_manager: USE_OPENAI_STRICT=false, returning None (DeepSeek fallback)")
+        return None
     if not config.OPENAI_API_KEY:
         logger.debug("get_openai_strict_manager: OPENAI_API_KEY not set, returning None")
         return None

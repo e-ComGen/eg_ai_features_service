@@ -454,6 +454,12 @@ class IceCatSource(AttributeSource):
         # Клиент Serper и LLM для MPN lookup — lazy init при первом вызове если не заданы
         self._serper_client = serper_client  # можно передать явно (для тестов)
         self._mpn_llm_manager = mpn_llm_manager  # можно передать явно (для тестов)
+        # Кэш имён продуктов IceCat: (brand, code) → "Product Name" из ответа API.
+        # Заполняется параллельно с _cache при 200 для donor-gate проверки.
+        self._icecat_product_name_cache: dict[tuple[str, str], str] = {}
+        # LLM-гейт «тот же товар» для эвристически подобранных кодов IceCat
+        from app.services.enrichment.sources.donor_gate import DonorMatchGate
+        self._donor_gate = DonorMatchGate()
 
     @property
     def source_type(self) -> Source:
@@ -614,6 +620,21 @@ class IceCatSource(AttributeSource):
                     "[IceCat] 200 brand='%s' code='%s' → %d features",
                     brand, code, len(result),
                 )
+                # LLM donor-gate: эвристический код мог подобрать похожий товар
+                # (A500S → A50). Проверяем имя продукта из IceCat vs наш product_name.
+                cache_key = (brand.lower(), code.lower())
+                icecat_product_name = self._icecat_product_name_cache.get(cache_key, "")
+                if icecat_product_name:
+                    same = await self._donor_gate.is_same_product(
+                        product_name, icecat_product_name
+                    )
+                    if not same:
+                        logger.info(
+                            "[IceCat] DonorGate DIFFERENT target='%s' icecat='%s' "
+                            "code='%s' — отбрасываем",
+                            product_name[:60], icecat_product_name[:60], code,
+                        )
+                        continue  # пробуем следующий кандидат
                 return result
 
         logger.debug(
@@ -853,6 +874,19 @@ class IceCatSource(AttributeSource):
 
         features = self._parse_response(data)
         self._cache[cache_key] = features
+        # Сохраняем имя продукта IceCat для donor-gate
+        try:
+            icecat_name = (
+                data.get("data", {})
+                .get("Product", {})
+                .get("Name", {})
+                .get("Value", "")
+                or ""
+            )
+            if icecat_name:
+                self._icecat_product_name_cache[cache_key] = icecat_name.strip()
+        except Exception:
+            pass
         return features
 
     async def _fetch_features_by_gtin(

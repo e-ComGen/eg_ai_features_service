@@ -56,6 +56,9 @@ class Source(StrEnum):
     WB_CARD = "wb_card"                 # копия характеристик из live-карточки Wildberries (открытое API, без Scrappey)
     UGC = "ugc"                         # отзывы + Q&A с Ozon/WB (user-generated, реальные пользователи)
     SAFE_ENUM_FILL = "safe_enum_fill"   # gated LLM fill: short optional enum, двойной Gate (verbatim + adversarial)
+    LAMODA = "lamoda"                   # копия характеристик из live-карточки Lamoda (через Scrapfly + residential proxy)
+    YANDEX_MARKET = "yandex_market"     # характеристики из карточки Яндекс.Маркет (через ZenRows + LLM-экстрактор)
+    WEB_MARKETPLACE = "web_marketplace"  # характеристики со спец-маркета (ZenRows + grounded LLM-экстрактор)
 
 
 # Source priority при tie-break (если confidence равна).
@@ -72,6 +75,9 @@ SOURCE_PRIORITY: dict[Source, int] = {
     Source.UGC: 2,                 # отзывы реальных покупателей — обычно про конкретный товар, но noisy
     Source.LLM_KNOWLEDGE: 1,       # общие знания
     Source.SAFE_ENUM_FILL: 1,      # gated LLM enum fill — уровень знаний, но двойной gate
+    Source.LAMODA: 4,              # копия с pre-modered Lamoda-карточки — авторитетный карточный источник
+    Source.YANDEX_MARKET: 3,       # карточка Яндекс.Маркет — LLM-экстрактор, чуть ниже вербатим-копии
+    Source.WEB_MARKETPLACE: 3,    # специализированный маркет — ZenRows+LLM, тот же уровень что Яндекс
 }
 
 
@@ -88,6 +94,9 @@ SOURCE_CONFIDENCE_THRESHOLDS: dict[Source, float] = {
     Source.COMPETITOR_RAG: 0.80,   # consensus из реальных Ozon-листингов — высокая точность
     Source.UGC: 0.75,              # отзывы/Q&A — шумные, низкий порог, всегда через judge
     Source.SAFE_ENUM_FILL: 0.82,   # gated LLM fill — adversarial guard, но всё равно LLM-инференс
+    Source.LAMODA: 0.90,           # копия с pre-modered Lamoda-карточки — высокий порог без judge
+    Source.YANDEX_MARKET: 0.82,    # LLM-экстрактор с grounding-проверкой — ниже вербатим-порога
+    Source.WEB_MARKETPLACE: 0.82,  # аналогично Яндекс.Маркет — ZenRows+LLM, grounded
 }
 
 

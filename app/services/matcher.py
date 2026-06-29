@@ -236,11 +236,19 @@ class MatcherService:
         best_lev_option = None
 
         for opt in options:
-            score = fuzz.ratio(target_clean, opt.lower())
+            # WRatio (token/partial-aware) instead of plain ratio — matches the
+            # eg-importer value_normalizer, so a value that CONTAINS the option as a
+            # token resolves instead of being dropped (e.g. "Беспроводная связь -
+            # Bluetooth 5.0" → "Bluetooth"). Clamped to 90 (WRatio is more lenient
+            # than ratio; ≥90 keeps it false-positive-safe, same as eg-importer).
+            score = fuzz.WRatio(target_clean, opt.lower())
             if score > best_lev_score:
                 best_lev_score = score
                 best_lev_option = opt
 
+        # Keep the original threshold: WRatio already matches a superset of ratio at
+        # the same cutoff, so this is a pure upgrade (never fewer matches). Raising
+        # the short-target cutoff to 90 regressed short enum values, so leave 85/90.
         threshold = 85 if len(target_clean) < 5 else 90
 
         if best_lev_score >= threshold:

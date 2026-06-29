@@ -60,6 +60,9 @@ from app.services.enrichment.sources.yandex_market_source import YandexMarketSou
 from app.services.enrichment.pipeline import YANDEX_MARKET_ENABLED
 
 # 40 товаров — каждый в своей категории Ozon (cat_id, type_id, product_name)
+# Можно заменить список через EVAL_PRODUCTS_FILE=path/to/file.py (импортирует PRODUCTS из файла)
+_ext_products_file = os.environ.get("EVAL_PRODUCTS_FILE", "").strip()
+
 PRODUCTS = [
     (15621050,  95139, "Смартфон Samsung Galaxy A55 5G 8/256GB"),
     (17028619,  91477, "Ноутбук ASUS VivoBook 15 X1504VA Core i5"),
@@ -102,6 +105,14 @@ PRODUCTS = [
     (17028701,  96958, "Электросамокат Ninebot KickScooter E2"),
     (17028612,  91910, "Блок питания Cooler Master MWE Gold 750 V2"),
 ]
+
+if _ext_products_file:
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_eval_products_ext", Path(_ext_products_file).resolve())
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    PRODUCTS = _mod.PRODUCTS
+    print(f"[Eval] EVAL_PRODUCTS_FILE loaded: {_ext_products_file} ({len(PRODUCTS)} products)", flush=True)
 
 
 def build_targets(chars: list[dict]) -> list[TargetAttribute]:
@@ -374,9 +385,17 @@ async def main():
         vals = [v for v in values if v is not None]
         return sum(vals) / len(vals) if vals else 0.0
 
-    avg_req = safe_avg([r["coverage_required"] for r in active])
-    avg_opt_raw = safe_avg([r["coverage_optional_raw"] for r in active])
-    avg_opt_honest = safe_avg([r["coverage_optional_honest"] for r in active])
+    # GLOBAL RATIO (Σfilled/Σdenom) — честный знаменатель по всему пулу, НЕ
+    # average-of-ratios (тот занижает: товар с 2 полями весит как товар с 40).
+    def global_ratio(num_key: str, den_key: str) -> float:
+        den = sum(r.get(den_key) or 0 for r in active)
+        num = sum(r.get(num_key) or 0 for r in active)
+        return num / den if den else 0.0
+
+    avg_req = global_ratio("filled_required", "chars_required")
+    avg_opt_honest = global_ratio("filled_opt_extractable", "chars_opt_extractable")
+    avg_opt_raw = safe_avg([r["coverage_optional_raw"] for r in active])  # raw оставлен mean
+    mean_opt_honest = safe_avg([r["coverage_optional_honest"] for r in active])
     total_vid_resolved = sum(r["value_id_resolved"] for r in active)
     total_vid_total = sum(r["value_id_total"] for r in active)
 
@@ -426,9 +445,10 @@ async def main():
 
     print("=" * 110, flush=True)
     print(f"\nAGGREGATE  ({n} active + {len(skipped)} skipped, {t_elapsed:.1f}s)", flush=True)
-    print(f"  Coverage required:         {avg_req*100:.1f}%", flush=True)
-    print(f"  Coverage optional_raw:     {avg_opt_raw*100:.1f}%", flush=True)
-    print(f"  Coverage optional_honest:  {avg_opt_honest*100:.1f}%", flush=True)
+    print(f"  Coverage required:         {avg_req*100:.1f}%  (global ratio Σfilled/Σdenom)", flush=True)
+    print(f"  Coverage optional_raw:     {avg_opt_raw*100:.1f}%  (mean-of-ratios)", flush=True)
+    print(f"  Coverage optional_honest:  {avg_opt_honest*100:.1f}%  (global ratio)", flush=True)
+    print(f"    └ mean-of-ratios:        {mean_opt_honest*100:.1f}%  (per-product avg, для сверки)", flush=True)
     print(f"  value_id resolution:       {total_vid_resolved}/{total_vid_total} ({total_vid_resolved/max(total_vid_total,1)*100:.1f}%)", flush=True)
     print(f"  Should-fill (req>=80%):    {should_fill_count}/{n} ({should_fill_rate*100:.1f}%)", flush=True)
     print(f"  Sources: {dict(source_counts)}", flush=True)
@@ -449,6 +469,7 @@ async def main():
         "coverage_required": avg_req,
         "coverage_optional_raw": avg_opt_raw,
         "coverage_optional_honest": avg_opt_honest,
+        "coverage_optional_honest_mean_of_ratios": mean_opt_honest,
         "value_id_resolved": total_vid_resolved,
         "value_id_total": total_vid_total,
         "should_fill_rate": should_fill_rate,

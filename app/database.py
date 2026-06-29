@@ -1,9 +1,10 @@
+import os
 from datetime import datetime, timezone
 from sqlalchemy import Column, Integer, String, DateTime, text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-DATABASE_URL = "sqlite+aiosqlite:///./features_service.db"
+DATABASE_URL = os.getenv("WORKER_DB_URL", "sqlite+aiosqlite:///./features_service.db")
 
 # pool_size=40: Даем базе столько же каналов, сколько у нас потоков
 engine = create_async_engine(

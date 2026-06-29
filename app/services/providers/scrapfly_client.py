@@ -67,6 +67,7 @@ async def scrapfly_fetch(
     url: str,
     render_js: bool = True,
     wait_for_selector: Optional[str] = None,
+    rendering_wait: Optional[int] = None,
     country: str = "ru",
     proxy_pool: str = "public_residential_pool",
     timeout: float = _DEFAULT_TIMEOUT,
@@ -124,6 +125,10 @@ async def scrapfly_fetch(
     }
     if wait_for_selector:
         params["wait_for_selector"] = wait_for_selector
+    if rendering_wait:
+        # Extra wait (ms) AFTER page-ready so JS-heavy SPAs (Lamoda) finish
+        # hydrating the attribute block — fixes "empty content (upstream=200)".
+        params["rendering_wait"] = str(rendering_wait)
 
     # Encode all params with %XX (not +) so the nested url value stays a valid URL.
     query_string = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)

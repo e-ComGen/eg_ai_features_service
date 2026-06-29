@@ -19,7 +19,9 @@ Spec: docs/architecture/pipeline.md  (step I)
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from typing import Any, Optional
 
 from app.services.enrichment.base import (
@@ -32,12 +34,73 @@ from app.services.enrichment.strategies.factory import get_strategy
 
 logger = logging.getLogger(__name__)
 
+# Rich card sources (WbCard, IceCat) are OPT-IN on the /process-batch path:
+# they make 1 Serper + N card.json fetches per product, so they stay OFF unless
+# the deployment opts in. Latency is further bounded by:
+#   WB_CARD_MAX_FETCHED (card.json fetch cap), WB_CARD_INJECT_IMAGES=false
+#   (suppress the Vision trigger), and RICH_SOURCE_TIMEOUT_S (hard per-source cap).
+_RICH_SOURCES_ENABLED = os.getenv("PIPELINE_RICH_SOURCES", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+_RICH_SOURCE_TIMEOUT_S = float(os.getenv("RICH_SOURCE_TIMEOUT_S", "25"))
+
+
+class _TimeoutSource:
+    """Wrap an AttributeSource so extract() can never exceed a hard timeout.
+
+    On timeout OR any error → returns [] (the product keeps every other source's
+    fills; one slow card source can never stall or fail the whole batch). Every
+    other attribute (is_applicable, source_type, get_judge, …) proxies to inner.
+    """
+
+    def __init__(self, inner: Any, timeout_s: float, label: str):
+        self._inner = inner
+        self._timeout_s = timeout_s
+        self._label = label
+
+    def __getattr__(self, name: str) -> Any:
+        # Only reached for attributes not set on the wrapper itself.
+        return getattr(self._inner, name)
+
+    async def extract(self, *args: Any, **kwargs: Any) -> list:
+        try:
+            return await asyncio.wait_for(
+                self._inner.extract(*args, **kwargs), timeout=self._timeout_s
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] hard timeout after %.0fs → [] (other sources unaffected)",
+                self._label, self._timeout_s,
+            )
+            return []
+        except Exception as exc:  # noqa: BLE001 — never let a card source break the product
+            logger.warning("[%s] failed: %s → []", self._label, exc)
+            return []
+
 
 class PipelineAdapter:
     """Thin layer: legacy payload <-> new orchestrator types."""
 
     def __init__(self, orchestrator: Optional[PipelineOrchestrator] = None):
-        self._orch = orchestrator or PipelineOrchestrator()
+        # Opt-in rich card sources, each behind a hard timeout. When disabled
+        # (default) both stay None → the orchestrator skips those stages exactly
+        # as before. WbCardSource self-discovers from product_name (Serper→card.json,
+        # free); IceCatSource is brand-verified API. Both no-op without keys.
+        self._wb_card = None
+        self._icecat = None
+        if _RICH_SOURCES_ENABLED:
+            from app.services.enrichment.sources.wb_card_source import WbCardSource
+            from app.services.enrichment.sources.icecat_source import IceCatSource
+            self._wb_card = _TimeoutSource(WbCardSource(), _RICH_SOURCE_TIMEOUT_S, "WbCard")
+            self._icecat = _TimeoutSource(IceCatSource(), _RICH_SOURCE_TIMEOUT_S, "IceCat")
+            logger.info(
+                "[PipelineAdapter] rich sources ENABLED (WbCard+IceCat, timeout=%.0fs)",
+                _RICH_SOURCE_TIMEOUT_S,
+            )
+        self._orch = orchestrator or PipelineOrchestrator(
+            wb_card_source=self._wb_card,
+            icecat_source=self._icecat,
+        )
 
     async def run(
         self,
@@ -48,6 +111,7 @@ class PipelineAdapter:
         category_path: list[str] | None = None,
         brand: Optional[str] = None,
         ean: Optional[str] = None,
+        ozon_type_id: Optional[int] = None,
         source_urls: list[str] | None = None,
         image_urls: list[str] | None = None,
         targets_raw: list[dict] | None = None,
@@ -86,7 +150,7 @@ class PipelineAdapter:
             image_urls=image_urls or [],
             max_cost_usd=max_cost_usd,
             marketplace=marketplace,
-            # ozon_type_id: нет источника на стороне адаптера — проставляется выше (addon/job)
+            ozon_type_id=ozon_type_id,  # forwarded by eg-importer → OzonStrategy value_id resolution
         )
 
         targets: list[TargetAttribute] = []
@@ -104,6 +168,7 @@ class PipelineAdapter:
                     name=raw.get("name", "unknown"),
                     type=raw.get("type", "text"),
                     allowed_values=raw.get("allowed_values"),
+                    is_required=bool(raw.get("is_required", False)),
                     semantic_type=raw.get("semantic_type"),
                     description=raw.get("description"),
                 )
@@ -113,7 +178,13 @@ class PipelineAdapter:
         # Otherwise reuse the default orchestrator (avoids unnecessary instantiation).
         strategy = get_strategy(marketplace)
         if marketplace:
-            orch = PipelineOrchestrator(strategy=strategy)
+            # Carry the (timeout-wrapped) rich sources into the marketplace-specific
+            # orchestrator too — None when the opt-in flag is off → bare, as before.
+            orch = PipelineOrchestrator(
+                strategy=strategy,
+                wb_card_source=self._wb_card,
+                icecat_source=self._icecat,
+            )
         else:
             orch = self._orch
         return await orch.enrich(context, targets)

@@ -12,9 +12,19 @@ class ResearchMode(str, Enum):
 
 
 class FeatureOption(BaseModel):
+    # Real marketplace attribute_id (Ozon). Forwarded by eg-importer so the
+    # pipeline's field-map sources (WbCard/IceCat) and value_id resolution land
+    # on the right attribute instead of a positional index. None → adapter falls
+    # back to the positional index (back-compat for callers that omit it).
+    id: Optional[int] = None
     type: str
     options: List[Any] = []
 
+    # Marketplace-required flag. Forwarded by callers (e.g. eg-importer ai_fill)
+    # from the real Ozon/WB schema so the pipeline can apply required-only logic
+    # (required-enum mud-gate, finishing priority, required gender fallback).
+    # Defaults False — back-compat for callers that omit it.
+    is_required: bool = False
     suffix: Optional[str] = ""
     prefix: Optional[str] = ""
     # Operator-configured extraction constraint forwarded from admin_rules.settings.
@@ -34,6 +44,15 @@ class ProductData(BaseModel):
     name: str
     description: Optional[str] = ""
     price: Union[float, int, str, None] = 0.0
+    # Identifiers that unlock the rich enrichment sources. Forwarded by callers
+    # (e.g. eg-importer ai_fill): brand → brand-fill + IceCat brand match;
+    # ean → IceCat / barcode authoritative specs. process_product already
+    # forwards these into the pipeline via getattr.
+    brand: Optional[str] = None
+    ean: Optional[str] = None
+    # Ozon type_id → lets OzonStrategy resolve dictionary value_ids for this exact
+    # category/type (the eval passes this; the integration used to drop it).
+    ozon_type_id: Optional[int] = None
     context: ProductContext
     languages: List[str] = ["en"]
     source_urls: List[str] = Field(default_factory=list)

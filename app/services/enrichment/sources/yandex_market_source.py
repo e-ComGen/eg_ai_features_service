@@ -14,9 +14,9 @@ Serper находит URL карточки (`site:market.yandex.ru`), карто
     (/product--<slug>/<id> и /product/<id>). Подтверждено зеркалом wb_card.
   • Сама страница market.yandex.ru за Yandex SmartCaptcha: IP+fingerprint-гейт,
     режет datacenter-IP. Прямой httpx с серверного IP → captcha/redirect. Нужен
-    Scrappey (как OzonCardSource) или аналогичный super-proxy. БЕЗ Scrappey-бюджета
-    живой fetch не проверить → _fetch_card_html помечен TODO и по умолчанию
-    отдаёт None (graceful []).
+    residential super-proxy с JS-рендером. Используем Scrape.do (SCRAPEDO_TOKEN)
+    — подтверждено: render=True + super_proxy=True тянет market.yandex.ru 200 OK,
+    ~2MB реального HTML.
   • Что на странице ЕСТЬ для парсинга (когда HTML получен):
       1. `<script type="application/ld+json">` Product-разметка: name, brand,
          offers, category — НО обычно БЕЗ полной таблицы характеристик (только
@@ -35,7 +35,7 @@ ENUM: переиспользуем Source.OZON_CARD (НЕ добавляем Sou
 pre-modered marketplace-карточки, смапленная на Ozon-словарь» — ровно наш случай.
 При реальном подключении к pipeline enum можно выделить отдельно.
 
-Cost: 1 Serper-запрос (~$0.001) + 1 Scrappey-запрос/товар (~$0.0002-0.001).
+Cost: 1 Serper-запрос (~$0.001) + 1 Scrape.do-запрос/товар (render+super).
 Latency: ~1-3s Serper + 8-20s Scrappey.
 """
 from __future__ import annotations
@@ -77,7 +77,7 @@ from app.services.enrichment.sources.wb_card_source import (
     _type_lemma,            # noun-aware lemma for card-type compatibility check
 )
 from app.services.providers.factory import get_web_search_client
-from app.services.providers.scrappey_client import scrappey_fetch as _scrappey_fetch_page
+from app.services.providers.scrapedo_client import scrapedo_fetch as _scrapedo_fetch_page
 
 logger = logging.getLogger(__name__)
 
@@ -118,10 +118,10 @@ _CACHE_MAX = 256
 # _SCRAPPEY_MAX_ATTEMPTS=2: 1 attempt + 1 retry. Worst-case: 2×30s + 2s backoff = 62s.
 # _YM_TOTAL_TIMEOUT=80s: 2×30s Scrappey + 2s backoff + Serper overhead = ~62s typical
 # worst-case. 80s cap avoids the old 90s full-hang behaviour.
-_SCRAPPEY_HTTP_TIMEOUT = 30.0         # httpx-level fallback (belt-and-suspenders)
-_SCRAPPEY_PER_ATTEMPT_TIMEOUT = 30.0  # asyncio.wait_for per Scrappey call
-_SCRAPPEY_MAX_ATTEMPTS = 2            # 1 attempt + 1 retry on timeout
-_YM_TOTAL_TIMEOUT = 80.0
+_SCRAPPEY_HTTP_TIMEOUT = 95.0         # httpx-level fallback (belt-and-suspenders)
+_SCRAPPEY_PER_ATTEMPT_TIMEOUT = 95.0  # asyncio.wait_for per Scrape.do call (render+super ≈ 83s)
+_SCRAPPEY_MAX_ATTEMPTS = 1            # render+super is ~83s; one attempt fits, a retry would blow the cap
+_YM_TOTAL_TIMEOUT = 120.0
 
 # Извлечение product-id/slug из URL карточки Маркета. Покрывает форматы:
 #   https://market.yandex.ru/product--<slug>/<digits>
@@ -227,7 +227,6 @@ class YandexMarketSource(AttributeSource):
     def __init__(
         self,
         web_search_client: Any = None,
-        scrappey_key: Optional[str] = None,
         **kwargs: Any,
     ):
         _ = kwargs
@@ -244,7 +243,7 @@ class YandexMarketSource(AttributeSource):
                 self._search_client = None
 
         import os
-        self._scrappey_key = scrappey_key or os.environ.get("SCRAPPEY_KEY")
+        self._scrapedo_token = os.environ.get("SCRAPEDO_TOKEN")
 
         self._judge = OzonCardJudge()  # reuse: same accept-on-confidence semantics
         self._cache: "OrderedDict[tuple[str, str], list[AttributeValue]]" = OrderedDict()
@@ -257,6 +256,7 @@ class YandexMarketSource(AttributeSource):
     def is_applicable(self, context: ExtractionContext, target: TargetAttribute) -> bool:
         return bool(
             self._search_client
+            and self._scrapedo_token
             and context.product_name
             and len(context.product_name.strip()) >= 5
         )
@@ -432,12 +432,12 @@ class YandexMarketSource(AttributeSource):
         return out[:_MAX_CANDIDATES]
 
     async def _fetch_card_html(self, url: str) -> Optional[str]:
-        """Скачать HTML карточки market.yandex.ru через Scrappey browser-bypass.
+        """Скачать HTML карточки market.yandex.ru через Scrape.do browser-bypass.
 
         market.yandex.ru за Yandex SmartCaptcha (IP+fingerprint гейт, режет
         datacenter-IP). Прямой httpx с серверного IP вернёт captcha/redirect.
-        Scrappey запускает реальный браузер и обходит этот гейт (тот же путь,
-        что OzonCardSource для ozon.ru).
+        Scrape.do запускает headless-браузер с residential-proxy (super=true) и
+        обходит этот гейт.
 
         Fail-fast retry: per-attempt asyncio.wait_for cap = _SCRAPPEY_PER_ATTEMPT_TIMEOUT
         (30s). On timeout, retries up to _SCRAPPEY_MAX_ATTEMPTS=2 total. Worst-case:
@@ -446,32 +446,37 @@ class YandexMarketSource(AttributeSource):
         Возвращает HTML response на success, None если все попытки провалились.
         Парсинг (_parse_card) полностью готов к такому HTML.
         """
-        if not self._scrappey_key:
+        if not self._scrapedo_token:
             logger.info(
-                "[YandexMarket] _fetch_card_html: SCRAPPEY_KEY не задан → None (graceful)"
+                "[YandexMarket] _fetch_card_html: SCRAPEDO_TOKEN не задан → None (graceful)"
             )
             return None
 
         for attempt in range(_SCRAPPEY_MAX_ATTEMPTS):
             try:
-                html = await asyncio.wait_for(
-                    _scrappey_fetch_page(url, timeout=_SCRAPPEY_HTTP_TIMEOUT),
+                result = await asyncio.wait_for(
+                    _scrapedo_fetch_page(
+                        url,
+                        render=True,
+                        super_proxy=True,
+                        timeout=_SCRAPPEY_HTTP_TIMEOUT,
+                    ),
                     timeout=_SCRAPPEY_PER_ATTEMPT_TIMEOUT,
                 )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "[YandexMarket] scrappey-attempt-%d-timeout (%.0fs) for %s",
+                    "[YandexMarket] scrapedo-attempt-%d-timeout (%.0fs) for %s",
                     attempt + 1, _SCRAPPEY_PER_ATTEMPT_TIMEOUT, url[:80],
                 )
                 if attempt + 1 < _SCRAPPEY_MAX_ATTEMPTS:
                     logger.info(
-                        "[YandexMarket] scrappey-retry attempt %d/%d for %s",
+                        "[YandexMarket] scrapedo-retry attempt %d/%d for %s",
                         attempt + 2, _SCRAPPEY_MAX_ATTEMPTS, url[:80],
                     )
                     await asyncio.sleep(2.0)
                     continue
                 logger.warning(
-                    "[YandexMarket] all-failed-empty: all %d Scrappey attempts timed out for %s",
+                    "[YandexMarket] all-failed-empty: all %d Scrape.do attempts timed out for %s",
                     _SCRAPPEY_MAX_ATTEMPTS, url[:80],
                 )
                 return None
@@ -480,20 +485,25 @@ class YandexMarketSource(AttributeSource):
                     "[YandexMarket] _fetch_card_html: error for %s: %s → None", url[:80], exc
                 )
                 return None
-            if html:
+            if result.success and result.content:
+                html = result.content
                 logger.info(
                     "[YandexMarket] _fetch_card_html: got %d chars for %s", len(html), url[:80]
                 )
                 return html
-            # Empty response — treat as soft fail, retry
+            # Failed or empty — log and maybe retry
+            logger.info(
+                "[YandexMarket] scrapedo fetch failed (success=%s, err=%s) for %s",
+                result.success, result.error, url[:80],
+            )
             if attempt + 1 < _SCRAPPEY_MAX_ATTEMPTS:
                 logger.info(
-                    "[YandexMarket] scrappey-retry attempt %d/%d (empty response) for %s",
+                    "[YandexMarket] scrapedo-retry attempt %d/%d (failed response) for %s",
                     attempt + 2, _SCRAPPEY_MAX_ATTEMPTS, url[:80],
                 )
                 await asyncio.sleep(2.0)
                 continue
-            logger.info("[YandexMarket] all-failed-empty: empty response after %d attempts for %s",
+            logger.info("[YandexMarket] all-failed-empty: failed after %d Scrape.do attempts for %s",
                         _SCRAPPEY_MAX_ATTEMPTS, url[:80])
             return None
         return None

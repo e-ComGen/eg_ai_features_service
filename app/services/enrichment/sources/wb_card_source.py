@@ -340,7 +340,11 @@ _CONF_BRAND_LINE = 0.85
 _CONF_GENDER_DOWNWEIGHT = 0.40
 
 _EXACT_THRESHOLD = 78.0
-_BRAND_LINE_THRESHOLD = 60.0
+# Поднят 60→64 (2026-06-21): затягиваем brand_line — слабейшие доноры (score
+# 60-63) давали больше мусора, чем покрытия. Валидируется 40-прогоном; при
+# регрессии opt_honest откатить. Phys-спеки brand_line-доноров отдельно режутся
+# _is_brand_line_phys_spec (вес/габариты model-specific).
+_BRAND_LINE_THRESHOLD = 64.0
 
 # Standalone short integer tokens acting as a model index ("Series 9",
 # "Mi Band 8", "Nordman 8") — captured even as a single digit, which
@@ -385,6 +389,25 @@ _BRAND_LINE_BLACKLIST: frozenset[str] = frozenset(name.lower() for name in {
     "ID товара",
     "ID карточки",
 })
+
+
+# Brand-line PHYS-SPEC guard — substring-набор model-specific ФИЗИЧЕСКИХ спеков.
+# Вес и габариты различаются от модели к модели → донор-сосед (другая модель того
+# же бренда) НЕ должен их поставлять (источник мусора: Razer мышь → «Вес=1г» от
+# карточки Xbox-версии). Exact-match доноров это НЕ касается (тот же товар → те же
+# размеры) — гард срабатывает только в mode=="brand_line". Substring, не exact,
+# чтобы покрыть варианты имён («Вес товара с упаковкой», «Ширина предмета» …).
+_BRAND_LINE_PHYS_SPEC_SUBSTRINGS: tuple[str, ...] = (
+    "вес", "масса",
+    "ширина", "высота", "глубина", "длина", "габарит",
+    "размер упаковки", "размер предмета", "размер товара",
+)
+
+
+def _is_brand_line_phys_spec(name_low: str) -> bool:
+    """True если имя charc — model-specific физ.спек (вес/габарит), который
+    brand_line-донор поставлять НЕ должен («пусто честнее мусора»)."""
+    return any(sub in name_low for sub in _BRAND_LINE_PHYS_SPEC_SUBSTRINGS)
 
 
 # Attr IDs for «Российский размер» (clothing) and «Российский размер» (footwear).
@@ -1685,6 +1708,14 @@ class WbCardSource(AttributeSource):
             char_name_low = char_name.lower()
 
             if mode == "brand_line" and char_name_low in _BRAND_LINE_BLACKLIST:
+                continue
+
+            # Физ.спеки (вес/габариты) от brand_line-донора = чужая модель = мусор.
+            if mode == "brand_line" and _is_brand_line_phys_spec(char_name_low):
+                logger.info(
+                    "[WbCard] brand_line phys-spec DROP '%s'='%s' (model-specific, "
+                    "донор другой модели)", char_name, char_val,
+                )
                 continue
 
             target_id: Optional[int] = None

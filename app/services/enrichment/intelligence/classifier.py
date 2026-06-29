@@ -79,9 +79,10 @@ class LlmClassifier:
             "6. Precise numeric product specs (exact weight, dimensions, battery) of well-known products: "
             "['llm_knowledge', 'web_search'].\n"
             "7. Precise specs of obscure/niche products: ['web_search'].\n"
-            "7b. Customs/classification codes (attribute name contains 'ТН ВЭД', 'OKPD', "
-            "'код ЕАЭС', 'код товара'): ALWAYS include 'web_search' first — these require "
-            "live database lookup, LLM knowledge of customs codes is unreliable.\n"
+            "7b. Customs/classification codes (attribute name contains 'OKPD', 'код товара'): "
+            "include 'web_search' for lookup. NOTE: 'ТН ВЭД'/'ТНВЭД'/'код ЕАЭС' attributes "
+            "are handled exclusively by TnvedSource — route to ['llm_knowledge'] only, "
+            "web_search returns garbage for these.\n"
             "8. Nothing fits: [] (give up).\n"
             "Return short reasoning (max 200 chars)."
         )
@@ -124,13 +125,16 @@ class LlmClassifier:
             if sources and Source.WEB_SEARCH not in sources:
                 result[attr_id] = sources + [Source.WEB_SEARCH]
 
-        # Force-route: code-lookup attributes (ТН ВЭД, OKPD, EAEU codes) ALWAYS need
-        # live database lookup — LLM knowledge of customs codes is unreliable and
-        # the LLM classifier sometimes routes these to llm_knowledge only. Web_search
-        # is mandatory; llm_knowledge kept as cheap fallback. See Phase 2 #3 fix:
-        # v18 regression where Classifier stopped routing attr 22232 (ТН ВЭД) to
-        # web_search for 5 PSU products (CM MWE, CM V850 SFX, Zalman, EVGA, Chieftec).
-        always_websearch_keywords = ("ТН ВЭД", "OKPD", "OKPD2", "код ЕАЭС", "код товара")
+        # Force-route: OKPD/OKPD2 code attributes need web_search for live lookup.
+        # NOTE: ТН ВЭД / ТНВЭД / код ЕАЭС are intentionally EXCLUDED from this list.
+        # They are handled exclusively by TnvedSource (per-category LLM, 10-digit
+        # validated, deduplicated via double-checked locking).  web_search returns
+        # hallucinated garbage for ТН ВЭД (e.g. «цилиндры для контактных линз» on a
+        # car stereo) — dropping it here prevents that source from winning in merge.
+        # See TNVED_SOURCE_FIX_ENABLED filter in pipeline._finalize_async for the
+        # drop-gate that eliminates any remaining LLM_KNOWLEDGE/WEB_SEARCH ТН ВЭД
+        # values that slip through from other stages.
+        always_websearch_keywords = ("OKPD", "OKPD2", "код товара")
         for attr in unfilled_attributes:
             name_lower = attr.name
             if any(kw in name_lower for kw in always_websearch_keywords):

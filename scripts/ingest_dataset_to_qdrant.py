@@ -885,27 +885,41 @@ def stream_amazon(category: str, limit: int) -> Iterator[tuple[str, str, dict]]:
     except ImportError:
         sys.exit("[Error] datasets not installed.")
 
-    parquet_shard = (
-        f"hf://datasets/McAuley-Lab/Amazon-Reviews-2023/"
-        f"raw_meta_{category}/full-00000-of-00001.parquet"
-    )
-    parquet_glob = (
-        f"hf://datasets/McAuley-Lab/Amazon-Reviews-2023/"
-        f"raw_meta_{category}/full-*.parquet"
-    )
-    print(f"[Amazon] Loading raw_meta_{category} streaming ...")
+    repo = "McAuley-Lab/Amazon-Reviews-2023"
+    base = f"hf://datasets/{repo}"
+    # Not every category is published as parquet. The big apparel categories
+    # (Amazon_Fashion, Clothing_Shoes_and_Jewelry) exist ONLY as JSONL under
+    # raw/meta_categories/meta_<cat>.jsonl — the raw_meta_<cat>/full-*.parquet
+    # glob matches nothing there and load_dataset silently yields 0 rows.
+    # Detect the layout (one list_repo_files call, no hardcoded category list)
+    # and route accordingly so any category works.
     try:
+        from huggingface_hub import HfApi  # type: ignore
+        repo_files = HfApi(token=HF_TOKEN or None).list_repo_files(
+            repo, repo_type="dataset"
+        )
+    except Exception as e:
+        print(f"[Amazon] WARN: list_repo_files failed ({e}); assuming parquet layout")
+        repo_files = []
+    has_parquet = any(
+        f.startswith(f"raw_meta_{category}/") and f.endswith(".parquet")
+        for f in repo_files
+    )
+    if has_parquet:
+        print(f"[Amazon] Loading raw_meta_{category}/full-*.parquet streaming ...")
         ds = load_dataset(
             "parquet",
-            data_files={"full": parquet_shard},
+            data_files={"full": f"{base}/raw_meta_{category}/full-*.parquet"},
             split="full",
             streaming=True,
             token=HF_TOKEN or None,
         )
-    except Exception:
+    else:
+        jsonl_path = f"{base}/raw/meta_categories/meta_{category}.jsonl"
+        print(f"[Amazon] Loading {jsonl_path} (JSONL layout) streaming ...")
         ds = load_dataset(
-            "parquet",
-            data_files={"full": parquet_glob},
+            "json",
+            data_files={"full": jsonl_path},
             split="full",
             streaming=True,
             token=HF_TOKEN or None,
