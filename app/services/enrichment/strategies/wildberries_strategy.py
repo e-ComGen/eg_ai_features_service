@@ -1,4 +1,4 @@
-"""WildberriesStrategy — marketplace-specific logic for WB Content API.
+﻿"""WildberriesStrategy — marketplace-specific logic for WB Content API.
 
 Validates enum attributes against live WB dictionaries (colors, countries,
 seasons, ТН ВЭД) via wb_runtime_lookup. Falls back gracefully (fail-open)
@@ -12,15 +12,14 @@ from .base import MarketplaceStrategy, ValidationResult
 from app.services.enrichment.base import (
     AttributeValue, TargetAttribute, ExtractionContext,
 )
-from app.services.enrichment.strategies.dictionaries.loader import (
-    get_wb_characteristics_for_category,
-)
 from app.services.enrichment.strategies.dictionaries.wb_runtime_lookup import (
     resolve_value,
+    get_directory,
     _COLOR_NAMES,
     _COUNTRY_NAMES,
     _SEASON_NAMES,
     _TNVED_NAMES,
+    _GENDER_NAMES,
 )
 
 log = logging.getLogger(__name__)
@@ -39,7 +38,7 @@ WB_BANNED_PHRASES = frozenset({
 })
 
 # Charc names that have WB dictionary backing (lowercased union)
-_DICT_BACKED_CHARCS: frozenset[str] = _COLOR_NAMES | _COUNTRY_NAMES | _SEASON_NAMES | _TNVED_NAMES
+_DICT_BACKED_CHARCS: frozenset[str] = _COLOR_NAMES | _COUNTRY_NAMES | _SEASON_NAMES | _TNVED_NAMES | _GENDER_NAMES
 
 
 def _is_dict_backed(charc_name: str) -> bool:
@@ -148,13 +147,74 @@ class WildberriesStrategy(MarketplaceStrategy):
         return ValidationResult(is_valid=True, normalized_value=value)
 
     def normalize_target(self, target: TargetAttribute) -> TargetAttribute:
-        """Enrich allowed_values from WB dictionary when category is known.
-
-        TODO (Tier 2): TargetAttribute currently does not carry a category_id
-        field.  Once it does, look up the subject in the WB dictionary and
-        merge allowed_values so the AI can use them as enum hints.
-        """
+        """Context-free path — no-op, returns target unchanged."""
         return target
+
+    def normalize_target_with_context(
+        self,
+        target: TargetAttribute,
+        context: ExtractionContext,
+    ) -> TargetAttribute:
+        """Enrich allowed_values for color targets from WB dictionary.
+
+        If target.allowed_values is already set, returns target unchanged.
+        For color targets (semantic_type == 'color' or name contains 'цвет'
+        but not 'название') with empty allowed_values, fetches color list
+        from WB runtime lookup and populates allowed_values.
+        On any failure, returns target unchanged (fail-open).
+        """
+        # Idempotent: if already populated, return as-is
+        if target.allowed_values:
+            return target
+
+        # Check if this is a color target
+        name_lower = (target.name or "").lower()
+        is_color = (
+            (target.semantic_type or "").lower() == "color"
+            or ("цвет" in name_lower and "название" not in name_lower)
+        )
+        if not is_color:
+            return target
+
+        # Attempt to fetch colors from WB directory
+        try:
+            items = _run_async(get_directory("colors"))
+            names = [item["name"] for item in items if item.get("name")]
+            if names:
+                return target.model_copy(update={"allowed_values": names})
+        except Exception as exc:
+            log.warning(
+                "wb_strategy: failed to fetch colors for target=%r: %s; fail-open",
+                target.name, exc,
+            )
+
+        # Fail-open: return target unchanged
+        return target
+
+    def resolve_value_ids(
+        self,
+        attribute_value: AttributeValue,
+        context: ExtractionContext,
+    ) -> AttributeValue:
+        """Keep color-from-name fills alive through the value_id drop-guard.
+
+        WB colours have no numeric value_id (the dictionary is name-only), so a
+        value added by ``_apply_color_from_name`` carries value_id=None and would
+        be dropped by ``_drop_unresolved_optional_enums``.  It is already
+        validated against the WB colour dictionary, so stamp a sentinel
+        value_id=0 to survive the drop; a later real WB-API resolve only ever
+        overwrites a non-None id.  All other values pass through unchanged.
+        """
+        # "color_from_name" mirrors pipeline._COLOR_FROM_NAME_EVIDENCE
+        # (kept as a literal here to avoid a circular import).
+        if (
+            attribute_value.value_id is None
+            and attribute_value.evidence == "color_from_name"
+            and isinstance(attribute_value.value, str)
+            and attribute_value.value.strip()
+        ):
+            return attribute_value.model_copy(update={"value_id": 0})
+        return attribute_value
 
     async def resolve_wb_value(
         self,
