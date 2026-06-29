@@ -3533,7 +3533,10 @@ async def _backfill_allowed_values_from_api(
     # category_id из шаблона caller'а бывает устаревшим → values-API «not found».
     # Берём живой description_category_id (родитель type_id) из дерева Ozon; если
     # дерево недоступно/тип не найден — фоллбэк на присланный category_id.
-    eff_cat = await resolve_description_category_id(type_id) or context.category_id
+    _live_dcid = await resolve_description_category_id(type_id)
+    eff_cat = _live_dcid or context.category_id
+    if _live_dcid:
+        context.resolved_category_id = _live_dcid
 
     sem = asyncio.Semaphore(_ENUM_OPTIONS_CONCURRENCY)
 

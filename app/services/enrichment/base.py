@@ -171,6 +171,7 @@ class ExtractionContext(BaseModel):
     # Marketplace-specific fields
     marketplace: Optional[str] = None          # "ozon" | "wb" | None
     ozon_type_id: Optional[int] = None         # Ozon type_id для точного словарного поиска
+    resolved_category_id: Optional[int] = None  # живой Ozon dcid из ozon_type_id; при заданности перекрывает шаблонный category_id для резолва value_id
 
     # Cost tracking
     cost_so_far_usd: float = 0.0

@@ -23,6 +23,7 @@ from app.services.enrichment.strategies.dictionaries.ozon_loader import (
 )
 from app.services.enrichment.strategies.dictionaries.ozon_runtime_lookup import (
     search_value as _runtime_search_value,
+    resolve_description_category_id,
 )
 from app.services.enrichment.strategies.dictionaries.category_defaults import (
     CATEGORY_DEFAULTS,
@@ -586,7 +587,7 @@ class OzonStrategy(MarketplaceStrategy):
         if (attribute_value.evidence or "").startswith("tnved_resolver:"):
             return attribute_value
 
-        cat_id = context.category_id
+        cat_id = context.resolved_category_id or context.category_id
         type_id = context.ozon_type_id
         attr_id = attribute_value.attribute_id
 
@@ -637,12 +638,20 @@ class OzonStrategy(MarketplaceStrategy):
         if (attribute_value.evidence or "").startswith("tnved_resolver:"):
             return attribute_value
 
-        cat_id = context.category_id
         type_id = context.ozon_type_id
         attr_id = attribute_value.attribute_id
 
         if type_id is None:
             return attribute_value
+
+        if context.resolved_category_id is None:
+            try:
+                live = await resolve_description_category_id(type_id)
+                if live:
+                    context.resolved_category_id = live
+            except Exception:
+                pass
+        cat_id = context.resolved_category_id or context.category_id
 
         truncated = is_truncated(cat_id, type_id, attr_id)
 
