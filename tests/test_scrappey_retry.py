@@ -60,7 +60,7 @@ def _make_ym_source() -> YandexMarketSource:
         return_value=MagicMock(),
     ):
         src = YandexMarketSource.__new__(YandexMarketSource)
-        src._scrappey_key = "fake-key"
+        src._scrapedo_token = "fake-token"
         src._search_client = MagicMock()
         src._judge = MagicMock()
         src._cache = {}
@@ -170,69 +170,66 @@ def test_ozon_retry_constants_are_sensible():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_ym_fetch_card_html_retries_on_first_timeout(caplog):
-    """First Scrappey call times out → retry fires → second succeeds."""
+async def test_ym_fetch_card_html_returns_content_on_success(caplog):
+    """Single Scrape.do call succeeds -> HTML content returned (no retry: max_attempts=1)."""
     import logging
-    import app.services.enrichment.sources.yandex_market_source as ym_mod
+    from app.services.providers.scrapfly_client import ScrapflyResult
 
     src = _make_ym_source()
     big_html = "y" * 50_000
 
     call_count = 0
 
-    async def _fake_fetch_page(url, timeout=30.0):
+    async def _fake_fetch_page(url, *, render=True, super_proxy=True, timeout=95.0):
         nonlocal call_count
         call_count += 1
-        if call_count == 1:
-            await asyncio.sleep(9999)
-        return big_html
+        return ScrapflyResult(
+            success=True, content=big_html, status_code=200, credits_used=1, error=None
+        )
 
     with (
-        patch.object(ym_mod, "_SCRAPPEY_PER_ATTEMPT_TIMEOUT", 0.05),
-        patch.object(ym_mod, "_SCRAPPEY_MAX_ATTEMPTS", 2),
         caplog.at_level(logging.INFO, logger="app.services.enrichment.sources.yandex_market_source"),
         patch(
-            "app.services.enrichment.sources.yandex_market_source._scrappey_fetch_page",
+            "app.services.enrichment.sources.yandex_market_source._scrapedo_fetch_page",
             side_effect=_fake_fetch_page,
         ),
     ):
         result = await src._fetch_card_html("https://market.yandex.ru/product/123456")
 
     assert result == big_html
-    assert call_count == 2, f"Expected 2 calls (1 timeout + 1 retry), got {call_count}"
+    assert call_count == 1, f"Expected 1 call (single attempt, no retry), got {call_count}"
     all_messages = " ".join(r.message for r in caplog.records)
-    assert "scrappey-retry" in all_messages, (
-        f"Expected scrappey-retry log, got: {all_messages!r}"
+    assert "scrapedo-retry" not in all_messages, (
+        f"Single-attempt design must not retry, got: {all_messages!r}"
     )
 
 
 @pytest.mark.asyncio
-async def test_ym_fetch_card_html_returns_none_after_max_attempts(caplog):
-    """Both attempts time out → None returned, all-failed-empty logged."""
+async def test_ym_fetch_card_html_returns_none_on_timeout(caplog):
+    """The single Scrape.do attempt times out -> None returned, all-failed-empty logged."""
     import logging
     import app.services.enrichment.sources.yandex_market_source as ym_mod
 
     src = _make_ym_source()
     call_count = 0
 
-    async def _always_hang(url, timeout=30.0):
+    async def _always_hang(url, *, render=True, super_proxy=True, timeout=95.0):
         nonlocal call_count
         call_count += 1
         await asyncio.sleep(9999)
 
     with (
         patch.object(ym_mod, "_SCRAPPEY_PER_ATTEMPT_TIMEOUT", 0.05),
-        patch.object(ym_mod, "_SCRAPPEY_MAX_ATTEMPTS", 2),
         caplog.at_level(logging.WARNING, logger="app.services.enrichment.sources.yandex_market_source"),
         patch(
-            "app.services.enrichment.sources.yandex_market_source._scrappey_fetch_page",
+            "app.services.enrichment.sources.yandex_market_source._scrapedo_fetch_page",
             side_effect=_always_hang,
         ),
     ):
         result = await src._fetch_card_html("https://market.yandex.ru/product/123456")
 
     assert result is None
-    assert call_count == 2
+    assert call_count == 1
     assert any("all-failed-empty" in r.message for r in caplog.records), (
         "Expected all-failed-empty log line"
     )
@@ -244,8 +241,8 @@ async def test_ym_fetch_card_html_returns_none_after_max_attempts(caplog):
 
 def test_ym_retry_constants_are_sensible():
     """YM per-attempt timeout and max attempts must fit inside total cap."""
-    assert _YM_PER_ATTEMPT_TIMEOUT == 30.0
-    assert _YM_MAX_ATTEMPTS == 2
+    assert _YM_PER_ATTEMPT_TIMEOUT == 95.0
+    assert _YM_MAX_ATTEMPTS == 1
     worst_case = _YM_MAX_ATTEMPTS * _YM_PER_ATTEMPT_TIMEOUT + 2.0
     from app.services.enrichment.sources.yandex_market_source import _YM_TOTAL_TIMEOUT
     assert worst_case < _YM_TOTAL_TIMEOUT, (
