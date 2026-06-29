@@ -101,3 +101,6 @@ scripts/qdrant.tar.gz
 
 # Runtime domain availability cache (generated on startup, not repo data)
 .domain_health.json
+
+# OAuth client secret (never commit)
+client_secret_*.json
