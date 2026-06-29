@@ -417,7 +417,7 @@ def _make_strategy_with_force_list(force_ids: set[int]) -> MarketplaceStrategy:
         def name(self) -> str:
             return "stub"
 
-        def force_websearch_targets(self, targets) -> set[int]:
+        def force_websearch_targets(self, targets, context=None) -> set[int]:
             return force_ids
 
     return _StubStrategy()

@@ -13,7 +13,6 @@ from app.services.enrichment.base import (
 from app.services.enrichment.strategies.dictionaries.ozon_loader import (
     get_ozon_characteristics_for_type,
     get_ozon_characteristics_for_category,
-    get_ozon_category_name,
     get_attr_value_options,
     get_attr_value_pairs,
     get_attr_value_options_any_type,
@@ -159,7 +158,7 @@ class OzonStrategy(MarketplaceStrategy):
     def name(self) -> str:
         return "ozon"
 
-    def force_websearch_targets(self, targets: list[TargetAttribute]) -> set[int]:
+    def force_websearch_targets(self, targets: list[TargetAttribute], context: Optional["ExtractionContext"] = None) -> set[int]:
         """Force WebSearch для kinds где сайты производителей/ритейлеров точнее LLM-знаний.
 
         Универсальные правила (работают для всех 9227 категорий Ozon):
@@ -170,8 +169,12 @@ class OzonStrategy(MarketplaceStrategy):
         """
         # Kinds для которых web-поиск обычно точнее LLM-знаний
         force_kinds = {"dimensions", "numeric"}
+        cat = (getattr(context, "resolved_category_id", None) if getattr(context, "resolved_category_id", None) is not None else getattr(context, "category_id", None)) if context else None
+        curated: set[int] = set(CATEGORY_DEFAULTS.get(cat, {})) if cat is not None else set()
         ids: set[int] = set()
         for t in targets:
+            if t.id in curated:
+                continue
             k = classify_target(t)
             if k in force_kinds:
                 ids.add(t.id)
@@ -406,7 +409,7 @@ class OzonStrategy(MarketplaceStrategy):
         # Структура: {attr_id: (value_text, value_id_or_None)}.
         # Если value_id задан — пишем напрямую (минимум одна гарантия резолва);
         # иначе вызываем resolve_value_ids чтобы найти id через ozon_loader.
-        cat_defaults = CATEGORY_DEFAULTS.get(context.category_id, {})
+        cat_defaults = CATEGORY_DEFAULTS.get(getattr(context, "resolved_category_id", None) if getattr(context, "resolved_category_id", None) is not None else context.category_id, {})
         for attr_id, default_payload in cat_defaults.items():
             if attr_id not in target_ids or attr_id in existing_ids:
                 continue
@@ -429,7 +432,7 @@ class OzonStrategy(MarketplaceStrategy):
         # (B) Conditional defaults — зависимые от другого атрибута / названия товара.
         # Пример: для блока питания форм-фактор ATX подразумевает стандартизированные
         # габариты 150×140×86 мм; если sources не извлекли длину/ширину/высоту, ставим.
-        cond_rules = CATEGORY_CONDITIONAL_DEFAULTS.get(context.category_id, [])
+        cond_rules = CATEGORY_CONDITIONAL_DEFAULTS.get(getattr(context, "resolved_category_id", None) if getattr(context, "resolved_category_id", None) is not None else context.category_id, [])
         if cond_rules:
             # Собираем «поисковую строку» — значения form_factor атрибутов + product_name.
             # form_factor определяем по semantic_type у target — это работает для всех

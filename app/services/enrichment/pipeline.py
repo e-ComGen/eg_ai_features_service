@@ -4136,7 +4136,7 @@ class PipelineOrchestrator:
         #              → always run WebSearch, regardless of routing / prior fill
         #  - optional_ws: remaining targets that classifier routed to WEB_SEARCH
         #                 → CostPredictor decides as before
-        force_attr_ids = self._strategy.force_websearch_targets(targets)
+        force_attr_ids = self._strategy.force_websearch_targets(targets, context)
         ws_applicable = self._sources[Source.WEB_SEARCH].is_applicable
 
         # Force targets: all targets in the force list (not just unfilled ones — we want

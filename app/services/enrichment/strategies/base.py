@@ -139,6 +139,7 @@ class MarketplaceStrategy(ABC):
     def force_websearch_targets(
         self,
         targets: list[TargetAttribute],
+        context: Optional["ExtractionContext"] = None,
     ) -> set[int]:
         """Return attribute IDs to force-route through WebSearch regardless of CostPredictor.
 
