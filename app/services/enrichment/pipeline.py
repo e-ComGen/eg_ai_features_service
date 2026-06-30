@@ -4391,6 +4391,51 @@ class PipelineOrchestrator:
             )
         ]
 
+    def _track_a_corroboration_filter(
+        self,
+        all_values: list[AttributeValue],
+        targets: list[TargetAttribute],
+    ) -> list[AttributeValue]:
+        """Finishing re-gate: deterministic Track-A corroboration filter ($0, no LLM).
+
+        Called once at the start of _finalize_async after all Finishing stages.
+        Drops objective-spec fills from guess sources (LLM_KNOWLEDGE, WEB_SEARCH,
+        COMPETITOR_RAG) that lack authoritative corroboration.
+        Mirror of Stage 4.9 Track A, but runs on the FINAL all_values
+        (authoritative_fills maximally populated).
+        """
+        _ADVERSARIAL_SOURCES = {Source.LLM_KNOWLEDGE, Source.WEB_SEARCH, Source.COMPETITOR_RAG}
+
+        # Build authoritative fills set
+        authoritative_fills: set[tuple[int, str]] = set()
+        for v in all_values:
+            if v.source in _AUTHORITATIVE_SOURCES:
+                norm = _normalize_for_corroboration(v.value)
+                authoritative_fills.add((v.attribute_id, norm))
+
+        # Build target lookup
+        target_by_id = {t.id: t for t in targets}
+
+        # Filter values
+        result: list[AttributeValue] = []
+        for v in all_values:
+            if v.source in _ADVERSARIAL_SOURCES:
+                target = target_by_id.get(v.attribute_id)
+                if target is not None and _is_objective_spec_attr(target):
+                    if not (v.evidence or "").startswith("safe_enum:verbatim_gate"):
+                        norm_val = _normalize_for_corroboration(v.value)
+                        if (v.attribute_id, norm_val) not in authoritative_fills:
+                            logger.info(
+                                "[Pipeline] spec-corroboration DROP (finishing re-gate): "
+                                "attr=%s value=%r source=%s norm=%r "
+                                "— empty>wrong for objective-spec attr",
+                                v.attribute_id, v.value, v.source.value, norm_val,
+                            )
+                            continue
+            result.append(v)
+
+        return result
+
     async def _finalize_async(
         self,
         all_values: list[AttributeValue],
@@ -4415,6 +4460,12 @@ class PipelineOrchestrator:
         value_id ДО этого этапа (в _finalize и llm_resolve_tail), поэтому их
         корректно-резолвнутые значения НЕ затрагиваются.
         """
+        # Finishing re-gate (Track A): drop objective-spec fills from guess sources
+        # that have no authoritative corroboration. Runs BEFORE all other finalization
+        # so that Finishing-hallucinated values don't reach post_process/resolve.
+        # Mirrors Stage 4.9 Track A but at the final all_values (most authoritative).
+        all_values = self._track_a_corroboration_filter(all_values, targets)
+
         # Hard-drop: confidence <= 0.0 is always a zero-signal fill — drop globally
         # before any merge. Catches Vision «ABS пластик» conf=0.0 / evidence=«No material
         # listed» and any other source that emits a value it itself has no confidence in.
