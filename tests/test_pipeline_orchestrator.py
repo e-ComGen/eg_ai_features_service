@@ -258,11 +258,20 @@ async def test_websearch_runs_when_cost_predictor_approves():
 
 @pytest.mark.asyncio
 async def test_merger_picks_highest_confidence_per_attribute():
-    """_merge keeps the value with the highest confidence for each attribute_id."""
+    """_merge picks the winner by SOURCE_PRIORITY (source authority), not confidence.
+
+    Grounding-arbitration Round 1, FIX-1 (docs/MANIFEST_grounding_arbitration.md,
+    INV-1): confidence is no longer the merge arbiter. DESCRIPTION (SOURCE_PRIORITY
+    4) always beats LLM_KNOWLEDGE (SOURCE_PRIORITY 1) regardless of which side
+    self-reports higher confidence — this test previously encoded the OLD
+    confidence-primary contract (LLM_KNOWLEDGE 0.95 beating DESCRIPTION 0.50);
+    it is updated here to the new authority-primary contract.
+    """
     targets = [_make_target(1)]
     routing = {1: [Source.LLM_KNOWLEDGE, Source.WEB_SEARCH]}
 
-    # Description gives low confidence, knowledge gives higher
+    # Description gives low confidence, knowledge gives higher — but DESCRIPTION
+    # still wins because it is the higher-authority source.
     desc_values = [_make_value(1, Source.DESCRIPTION, confidence=0.50)]
     know_values = [_make_value(1, Source.LLM_KNOWLEDGE, confidence=0.95)]
 
@@ -276,12 +285,15 @@ async def test_merger_picks_highest_confidence_per_attribute():
     result = await orch.enrich(ctx, targets)
 
     assert len(result) == 1
-    assert result[0].source == Source.LLM_KNOWLEDGE
-    # Both sources independently produced the same value ('red') for attr 1, so the
-    # consensus bonus in _merge applies: 0.95 + 0.10 capped at 0.97. LLM_KNOWLEDGE
-    # still wins over DESCRIPTION (0.50). The cross-source-agreement boost is the
-    # intended merge behavior (see _merge docstring).
-    assert result[0].confidence == 0.97
+    assert result[0].source == Source.DESCRIPTION
+    # Target name defaults to "Цвет" (color) — the PRE-EXISTING (unrelated to
+    # this manifest) color-source guard drops the LLM_KNOWLEDGE "red" guess
+    # BEFORE _merge runs (guess-sources may not assert a colorway), so only
+    # DESCRIPTION survives to the merge step: no cross-source-agreement partner
+    # remains, hence no consensus boost — confidence stays its original 0.50.
+    # DESCRIPTION would win on SOURCE_PRIORITY (4 > 1) either way, confidence
+    # is irrelevant to who wins (see _merge docstring).
+    assert result[0].confidence == 0.50
 
 
 @pytest.mark.asyncio

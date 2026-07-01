@@ -2866,35 +2866,74 @@ def _apply_komplektatsiya_from_text(
     return out
 
 
+# ---------------------------------------------------------------------------
+# FIX-2 (grounding-arbitration Round 1, docs/MANIFEST_grounding_arbitration.md):
+# LLM_KNOWLEDGE last-resort abstain. NARROW rule: the ONLY abstain trigger is a
+# LLM_KNOWLEDGE value that is the SOLE proposer of an is_collection (multi-select)
+# attribute -> abstain (leave the field empty). A lone LLM guess must never
+# sole-fill a multi-select field. SAFE_ENUM_FILL is EXCLUDED (its own Gate A/B
+# handle grounding); scalar LLM_KNOWLEDGE sole-fills are KEPT (coverage). The
+# rule does NOT inspect evidence content/length.
+# ---------------------------------------------------------------------------
+def _abstain_ungrounded_guesses(all_values: list[AttributeValue]) -> list[AttributeValue]:
+    """Abstain a LLM_KNOWLEDGE value iff it is the SOLE proposer of a collection attr.
+
+    Drop v IF AND ONLY IF ALL of:
+      1. v.source == Source.LLM_KNOWLEDGE   (SAFE_ENUM_FILL is EXCLUDED — never abstained here),
+      2. v.is_collection is True   (multi-select attribute),
+      3. v is the ONLY value for its attribute_id across all_values (no other value, from any
+         source including a second LLM_KNOWLEDGE, shares that attribute_id).
+    Everything else is KEPT: scalar LLM sole-fills (coverage), SAFE_ENUM_FILL values,
+    and any collection LLM value that shares its attribute_id with another value (not sole).
+    Evidence content/length is irrelevant. Returns a NEW list (input not mutated).
+    """
+    count: dict[int, int] = {}
+    for v in all_values:
+        count[v.attribute_id] = count.get(v.attribute_id, 0) + 1
+
+    result: list[AttributeValue] = []
+    for v in all_values:
+        if (
+            v.source == Source.LLM_KNOWLEDGE
+            and v.is_collection
+            and count[v.attribute_id] == 1
+        ):
+            logger.info(
+                "FIX-2 abstain (lone-collection-llm-guess): attribute_id=%s source=%s",
+                v.attribute_id, v.source,
+            )
+            continue
+        result.append(v)
+    return result
+
+
 def _merge_winner(
     challenger: AttributeValue, incumbent: AttributeValue
 ) -> AttributeValue:
     """Выбирает победителя для одного attribute_id между двумя кандидатами.
 
-    Спец-правило ТОЛЬКО для пары карточка-vs-инференс: карточный источник
-    удерживает атрибут, если card_conf >= other_conf - _CARD_PROTECTION_BAND.
-    Для всех прочих пар — обычное правило: highest-conf, tie-break по SOURCE_PRIORITY.
-    Поведение симметрично (order-independent).
+    Первичный критерий: SOURCE_PRIORITY (выше приоритет — побеждает).
+    При равенстве приоритета: побеждает тот, у кого длиннее evidence (len(v.evidence or "")).
+    Если evidence одинаковой длины — побеждает incumbent (стабильность).
+    Confidence не используется для принятия решения.
     """
-    # Card-protection band: только карточка-vs-инференс
-    card, inference = None, None
-    if challenger.source in _AUTHORITATIVE_OVERRIDE_SOURCES and incumbent.source in _INFERENCE_SOURCES:
-        card, inference = challenger, incumbent
-    elif incumbent.source in _AUTHORITATIVE_OVERRIDE_SOURCES and challenger.source in _INFERENCE_SOURCES:
-        card, inference = incumbent, challenger
-    if card is not None:
-        if card.confidence >= inference.confidence - _CARD_PROTECTION_BAND:
-            return card
-        return inference
+    # Primary key: SOURCE_PRIORITY
+    challenger_prio = SOURCE_PRIORITY[challenger.source]
+    incumbent_prio = SOURCE_PRIORITY[incumbent.source]
+    if challenger_prio > incumbent_prio:
+        return challenger
+    if incumbent_prio > challenger_prio:
+        return incumbent
 
-    # Обычное правило для всех прочих пар (без изменений).
-    if challenger.confidence > incumbent.confidence:
+    # Tie within same priority: longer evidence wins
+    challenger_ev_len = len(challenger.evidence or "")
+    incumbent_ev_len = len(incumbent.evidence or "")
+    if challenger_ev_len > incumbent_ev_len:
         return challenger
-    if (
-        challenger.confidence == incumbent.confidence
-        and SOURCE_PRIORITY[challenger.source] > SOURCE_PRIORITY[incumbent.source]
-    ):
-        return challenger
+    if incumbent_ev_len > challenger_ev_len:
+        return incumbent
+
+    # Everything equal: keep incumbent (stable)
     return incumbent
 
 
@@ -3571,6 +3610,110 @@ async def _backfill_allowed_values_from_api(
             "(cat=%s type=%s)", filled, context.category_id, type_id,
         )
     return out
+
+
+def _drop_ungrounded_hard_facts(
+    values: list["AttributeValue"],
+    source_text: str,
+    targets: "list[TargetAttribute] | None" = None,
+) -> list["AttributeValue"]:
+    """Deterministic post-filter: drop LLM-hallucinated hard-fact attributes.
+
+    Applies to every INFERENCE source (llm_knowledge, description-inference,
+    finishing, safe_enum — i.e. anything NOT in _TRUSTED_RETRIEVAL) whose
+    attribute name falls into a hard-fact class (COUNTRY, PERIOD, SPEC,
+    COMPOSITION) and whose salient value token is NOT grounded in source_text
+    (product name + brand + seller description).
+
+    COUNTRY class is always dropped from inference sources (the product
+    name/brand never contains country-of-origin as a salient token).
+
+    Idempotent. Never adds or modifies values — only removes.
+    TN_VED (attr_id 22232) is always exempt.
+    """
+    _TNVED_ATTR_ID = 22232
+
+    # Trusted RETRIEVAL sources actually fetched the value from somewhere real
+    # (web/brand-API/competitor-card/photo) → exempt from the hard-fact grounding
+    # check. Everything else (llm_knowledge, description-inference, finishing,
+    # safe_enum) is INFERENCE → a hard fact it produces must be grounded in the
+    # source text or it is a hallucination.
+    _TRUSTED_RETRIEVAL = {
+        "web_search", "icecat", "pdf_datasheet", "ozon_card", "wb_card",
+        "competitor_rag", "lamoda", "yandex_market", "web_marketplace",
+        "ugc", "vision",
+    }
+
+    _COUNTRY_PAT = re.compile(r"стран|изготовител|производител", re.IGNORECASE)
+    _PERIOD_PAT = re.compile(r"срок\s+годност|срок\s+служб|гарант", re.IGNORECASE)
+    _COMPOSITION_PAT = re.compile(r"состав|содержание|материал", re.IGNORECASE)
+    _SPEC_PAT = re.compile(
+        r"процессор|чипсет|видеопроцессор|ёмкост|мач|мощност|вт\b|"
+        r"\bIP\b|степень\s+защит|bluetooth|wi.?fi|wifi|оборот|всасыван|паскал|"
+        r"разрешение\s+камер|питани|напряжени|"
+        r"вилка|обод|покрышк|тип\s+пронаци",
+        re.IGNORECASE,
+    )
+
+    name_by_id: dict[int, str] = {}
+    if targets:
+        for t in targets:
+            name_by_id[t.id] = t.name
+
+    src_norm = re.sub(r"\s+", " ", source_text.lower()).strip()
+
+    def _is_hard_class(attr_name: str) -> str | None:
+        n = attr_name or ""
+        if _COUNTRY_PAT.search(n):
+            return "COUNTRY"
+        if _PERIOD_PAT.search(n):
+            return "PERIOD"
+        if _COMPOSITION_PAT.search(n):
+            return "COMPOSITION"
+        if _SPEC_PAT.search(n):
+            return "SPEC"
+        return None
+
+    def _salient_token(value: object) -> str:
+        s = str(value).strip()
+        m = re.search(r"\d[\d.,\s]*[а-яёa-zA-Z]+", s, re.IGNORECASE)
+        if m:
+            return re.sub(r"[\s,.]", "", m.group(0).lower())
+        return re.sub(r"\s+", " ", s.lower()).strip()
+
+    def _grounded(value: object, src: str) -> bool:
+        token = _salient_token(value)
+        if not token or len(token) < 2:
+            return False
+        src_cmp = re.sub(r"[\s,.]", "", src.lower())
+        token_cmp = re.sub(r"[\s,.]", "", token)
+        return token_cmp in src_cmp
+
+    kept: list["AttributeValue"] = []
+    for v in values:
+        if v.attribute_id == _TNVED_ATTR_ID:
+            kept.append(v)
+            continue
+
+        if v.source.value in _TRUSTED_RETRIEVAL:
+            kept.append(v)
+            continue
+
+        attr_name = name_by_id.get(v.attribute_id, v.semantic_type or "")
+        hard_cls = _is_hard_class(attr_name)
+
+        if hard_cls is None:
+            kept.append(v)
+            continue
+
+        if hard_cls == "COUNTRY":
+            continue  # always drop country-of-origin from LLM_KNOWLEDGE
+
+        if _grounded(v.value, src_norm):
+            kept.append(v)
+        # else: drop — hallucinated hard fact
+
+    return kept
 
 
 class PipelineOrchestrator:
@@ -4299,6 +4442,14 @@ class PipelineOrchestrator:
         # Stage 5: Finishing pass — focused re-extraction for empty required attributes
         all_values += await self._run_finishing(context, targets, all_values)
 
+        # Stage 5.1: Deterministic post-filter — drop ungrounded hard facts from
+        # ALL inference sources (llm_knowledge, description, finishing, safe_enum).
+        # Runs after finishing so it catches every inference value. Idempotent, no-LLM.
+        _source_text = " ".join(
+            p for p in (context.product_name, context.brand, context.product_description) if p
+        ).strip()
+        all_values = _drop_ungrounded_hard_facts(all_values, _source_text, targets)
+
         # Stage 5.5: Аннотация generation — generative step, not extraction.
         # Runs AFTER all sources and finishing so it can use the full set of filled attrs.
         all_values += await self._generate_annotation(context, targets, all_values)
@@ -4349,17 +4500,33 @@ class PipelineOrchestrator:
 
         chars_block = "\n".join(char_lines) if char_lines else "  (нет данных)"
 
+        # Ground the product TYPE explicitly (separate from the free-form
+        # characteristics block) so the LLM can't pick it up from an unrelated
+        # field like "Комплектация" (e.g. a "Тип: дрель" product whose
+        # "Комплектация" mentions "шуруповёрт" as an accessory).
+        type_target_id = next(
+            (t.id for t in targets if t.name.strip().lower() in ("тип", "тип*")),
+            None,
+        )
+        type_value = ""
+        if type_target_id is not None:
+            type_av = filled_by_id.get(type_target_id)
+            if type_av is not None and not isinstance(type_av.value, list):
+                type_value = str(type_av.value).strip()
+        type_line = f"Тип: {type_value}\n" if type_value else ""
+
         class _AnnotationResponse(BaseModel):
             annotation: str = Field(..., description="Маркетинговое описание товара 2-4 предложения")
 
         system_prompt = (
             "Ты маркетолог. Составь маркетинговое описание товара 2-4 предложения "
             "на основе предоставленных характеристик. Текст должен быть живым, "
-            "продающим, без перечислений через запятую. Только текст описания, без заголовков."
+            "продающим, без перечислений через запятую. Только текст описания, без заголовков. НЕ указывай числовые или категориальные характеристики (число скоростей/передач, мощность, обороты, напряжение, габариты и т.п.), которых НЕТ в предоставленных характеристиках. Не придумывай и не дополняй спецификации из общих знаний — описывай ТОЛЬКО подтверждённые данные. Тип товара указывай строго как в характеристиках, не подменяй категорию. Категорию и тип товара бери СТРОГО из поля «Тип» (если оно дано) или из названия товара; игнорируй упоминания типа/категории в других полях (например в «Комплектации»)."
         )
         user_text = (
             f"Товар: {context.product_name}\n"
             f"Бренд: {context.brand or 'неизвестен'}\n"
+            f"{type_line}"
             f"Категория: {' / '.join(context.category_path) or 'н/д'}\n\n"
             f"Характеристики:\n{chars_block}\n\n"
             f"Составь маркетинговое описание товара 2-4 предложения."
@@ -4404,7 +4571,10 @@ class PipelineOrchestrator:
         Mirror of Stage 4.9 Track A, but runs on the FINAL all_values
         (authoritative_fills maximally populated).
         """
-        _ADVERSARIAL_SOURCES = {Source.LLM_KNOWLEDGE, Source.WEB_SEARCH, Source.COMPETITOR_RAG}
+        # web_search excluded by user policy ("web_search enabled"): a web_search spec
+        # reaching finishing already passed Stage 4.9 Gate A (grounded in the real fetched
+        # page), so the finishing re-gate must not drop it for lack of corroboration.
+        _ADVERSARIAL_SOURCES = {Source.LLM_KNOWLEDGE, Source.COMPETITOR_RAG}
 
         # Build authoritative fills set
         authoritative_fills: set[tuple[int, str]] = set()
@@ -5999,7 +6169,14 @@ class PipelineOrchestrator:
         # ── Track A: DETERMINISTIC corroboration for objective-spec attrs ────────
         for v in spec_pending:
             norm_val = _normalize_for_corroboration(v.value)
-            corroborated = (v.attribute_id, norm_val) in authoritative_fills
+            # web_search fills reaching here already passed Gate A (grounded in the real
+            # fetched page) — user policy "web_search enabled" trusts them on their own,
+            # with no authoritative corroboration required. llm_knowledge / competitor_rag
+            # still need corroboration (their evidence is not a real page snippet).
+            corroborated = (
+                v.source == Source.WEB_SEARCH
+                or (v.attribute_id, norm_val) in authoritative_fills
+            )
             if corroborated:
                 logger.info(
                     "[Pipeline] spec-corroboration PASS: attr=%s value=%r source=%s "
@@ -6454,6 +6631,9 @@ class PipelineOrchestrator:
         +0.10 (cap 0.97). Cross-source agreement = сильный сигнал
         достоверности (LLM сказал, web search подтвердил, etc).
         """
+        # FIX-2 (grounding-arbitration Round 1): drop sole ungrounded
+        # guess-source proposals BEFORE consensus/merge.
+        all_values = _abstain_ungrounded_guesses(all_values)
         # Step 1: count unique sources per (attribute_id, normalized element).
         # Для коллекций ключуем ПОЭЛЕМЕНТНО (а не по str(list)), чтобы consensus
         # и дедуп работали по отдельным элементам, а не по строке всего списка.
