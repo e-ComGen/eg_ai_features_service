@@ -3616,6 +3616,7 @@ def _drop_ungrounded_hard_facts(
     values: list["AttributeValue"],
     source_text: str,
     targets: "list[TargetAttribute] | None" = None,
+    product_model_text: str = "",
 ) -> list["AttributeValue"]:
     """Deterministic post-filter: drop LLM-hallucinated hard-fact attributes.
 
@@ -3689,10 +3690,67 @@ def _drop_ungrounded_hard_facts(
         token_cmp = re.sub(r"[\s,.]", "", token)
         return token_cmp in src_cmp
 
+    from urllib.parse import urlparse
+
+    # Precompute cross-host corroboration map for COUNTRY web_search values
+    _country_host_map: dict[tuple[int, str], set[str]] = {}
+    for v in values:
+        attr_name_probe = name_by_id.get(v.attribute_id, v.semantic_type or "")
+        if v.source.value == "web_search" and _is_hard_class(attr_name_probe) == "COUNTRY":
+            token = _salient_token(v.value)
+            if not token or len(token) < 2:
+                continue
+            evidence = v.evidence or ""
+            m = re.match(r"^\[([^\]]+)\]", evidence)
+            if m:
+                url_str = m.group(1)
+                parsed = urlparse(url_str)
+                host = parsed.netloc if parsed.netloc else url_str
+            else:
+                host = "unknown"
+            key = (v.attribute_id, token)
+            if key not in _country_host_map:
+                _country_host_map[key] = set()
+            _country_host_map[key].add(host)
+
+    def _country_web_search_grounded(
+        v: "AttributeValue",
+        host_map: dict[tuple[int, str], set[str]],
+        model_text: str,
+    ) -> bool:
+        token = _salient_token(v.value)
+        if not token or len(token) < 2:
+            return False
+        key = (v.attribute_id, token)
+        hosts = host_map.get(key, set())
+        real_hosts = {h for h in hosts if h != "unknown"}
+        if len(real_hosts) >= 2:
+            return True
+        if model_text:
+            words = re.findall(r"[а-яёА-ЯЁa-zA-Z0-9]{3,}", model_text.lower())
+            if words:
+                evidence_lower = (v.evidence or "").lower().replace("ё", "е")
+                for w in words:
+                    if w.replace("ё", "е") in evidence_lower:
+                        return True
+        return False
+
     kept: list["AttributeValue"] = []
     for v in values:
         if v.attribute_id == _TNVED_ATTR_ID:
             kept.append(v)
+            continue
+
+        attr_name_probe = name_by_id.get(v.attribute_id, v.semantic_type or "")
+        if v.source.value == "web_search" and _is_hard_class(attr_name_probe) == "COUNTRY":
+            if _country_web_search_grounded(v, _country_host_map, product_model_text):
+                kept.append(v)
+            else:
+                logger.info(
+                    "[Pipeline] FIX-3 COUNTRY web_search ABSTAIN (no cross-host corroboration "
+                    "or model-adjacency): attr=%s value=%r evidence=%r",
+                    v.attribute_id, v.value, (v.evidence or "")[:120],
+                )
             continue
 
         if v.source.value in _TRUSTED_RETRIEVAL:
@@ -3714,6 +3772,129 @@ def _drop_ungrounded_hard_facts(
         # else: drop — hallucinated hard fact
 
     return kept
+
+
+
+_CROSS_FIELD_RULES = ("concrete_bore_implies_impact_mode", "komplektatsiya_chuck_matches_tip_patrona")
+
+_CONCRETE_BORE_PAT = re.compile(r"диаметр.*бетон|бетон.*диаметр", re.IGNORECASE)
+_OPERATING_MODES_PAT = re.compile(r"режим\w*\s*работ", re.IGNORECASE)
+_IMPACT_MODE_PAT = re.compile(r"удар", re.IGNORECASE)
+_KOMPLEKTATSIYA_PAT = re.compile(r"комплектаци", re.IGNORECASE)
+_CHUCK_TYPE_TARGET_PAT = re.compile(r"тип\s*патрон", re.IGNORECASE)
+_CHUCK_TYPE_VALUE_PATTERNS = (
+    ("ключевой", re.compile(r"ключев\w*\s*патрон|патрон\w*\s*ключев", re.IGNORECASE)),
+    ("быстрозажимной", re.compile(r"быстрозажимн\w*\s*патрон|патрон\w*\s*быстрозажимн", re.IGNORECASE)),
+)
+
+def _reconcile_cross_field_contradictions(
+    merged: list[AttributeValue],
+    targets: list[TargetAttribute],
+) -> list[AttributeValue]:
+    """Кросс-атрибутная валидация после слияния: исправление известных противоречий."""
+    by_id: dict[int, AttributeValue] = {av.attribute_id: av for av in merged}
+
+    def _find_target_id(pattern: re.Pattern) -> int | None:
+        """Найти id целевого атрибута по regex на name."""
+        for t in targets:
+            if pattern.search(t.name or ""):
+                return t.id
+        return None
+
+    out: dict[int, AttributeValue] = dict(by_id)
+    dropped_ids: set[int] = set()
+
+    # RULE A — concrete_bore_implies_impact_mode
+    bore_id = _find_target_id(_CONCRETE_BORE_PAT)
+    if bore_id is not None:
+        bore_av = out.get(bore_id)
+        if bore_av is not None and bore_av.value:
+            modes_id = _find_target_id(_OPERATING_MODES_PAT)
+            if modes_id is not None:
+                modes_av = out.get(modes_id)
+                if modes_av is not None and modes_av.value:
+                    # Проверяем, есть ли уже удар в режимах работы
+                    if isinstance(modes_av.value, list):
+                        modes_text = " ".join(str(x) for x in modes_av.value)
+                    else:
+                        modes_text = str(modes_av.value)
+                    if not _IMPACT_MODE_PAT.search(modes_text):
+                        bore_is_guess = (bore_av.source == Source.LLM_KNOWLEDGE)
+                        if not bore_is_guess:
+                            # Добавляем режим удара
+                            if isinstance(modes_av.value, list):
+                                new_value = list(modes_av.value) + ["Сверление с ударом"]
+                            else:
+                                new_value = [modes_av.value, "Сверление с ударом"]
+                            corrected = modes_av.model_copy(update={
+                                "value": new_value,
+                                "evidence": ((modes_av.evidence or "") + " | FIX-4 concrete_bore_implies_impact_mode: added удар mode (supported by concrete-Ø evidence)").strip(" |")
+                            })
+                            out[modes_id] = corrected
+                            logger.info(
+                                "[Pipeline] FIX-4 concrete_bore_implies_impact_mode: added удар mode to Режимы работы (attr=%s), supported by concrete-Ø attr=%s value=%r",
+                                modes_id, bore_id, bore_av.value
+                            )
+                        else:
+                            # LLM-догадка — удаляем неполные режимы работы
+                            dropped_ids.add(modes_id)
+                            logger.info(
+                                "[Pipeline] FIX-4 concrete_bore_implies_impact_mode: dropped inconsistent partial Режимы работы (attr=%s, value=%r) — concrete-Ø evidence is LLM_KNOWLEDGE guess, too weak to correct",
+                                modes_id, modes_av.value
+                            )
+
+    # RULE B — komplektatsiya_chuck_matches_tip_patrona
+    komp_id = _find_target_id(_KOMPLEKTATSIYA_PAT)
+    if komp_id is not None:
+        komp_av = out.get(komp_id)
+        if komp_av is not None and komp_av.value:
+            komp_text = str(komp_av.value).lower().replace("ё", "е")
+            matched_labels = []
+            for label, pat in _CHUCK_TYPE_VALUE_PATTERNS:
+                if pat.search(komp_text):
+                    matched_labels.append(label)
+            if len(matched_labels) == 1:
+                named_type = matched_labels[0]
+                chuck_id = _find_target_id(_CHUCK_TYPE_TARGET_PAT)
+                if chuck_id is not None:
+                    chuck_av = out.get(chuck_id)
+                    if chuck_av is not None:
+                        chuck_text = str(chuck_av.value).lower().replace("ё", "е")
+                        stem = named_type[:-2].lower()
+                        if stem not in chuck_text:
+                            if SOURCE_PRIORITY.get(komp_av.source, 0) < SOURCE_PRIORITY.get(chuck_av.source, 0):
+                                # Тип патрона лучше обоснован (выше SOURCE_PRIORITY) -- не перезаписываем
+                                # менее авторитетным свободным текстом Комплектации (архитектурное
+                                # правило FIX-4: побеждает сильнее обоснованное поле).
+                                logger.info(
+                                    "[Pipeline] FIX-4 komplektatsiya_chuck_matches_tip_patrona: SKIP correction -- "
+                                    "Тип патрона (attr=%s, source=%s, priority=%s) outranks Комплектация (attr=%s, source=%s, "
+                                    "priority=%s)", chuck_id, chuck_av.source.value, SOURCE_PRIORITY.get(chuck_av.source, 0), komp_id,
+                                    komp_av.source.value, SOURCE_PRIORITY.get(komp_av.source, 0),
+                                )
+                            else:
+                                corrected = chuck_av.model_copy(update={
+                                    "value": named_type,
+                                    "evidence": ((chuck_av.evidence or "") + f" | FIX-4 komplektatsiya_chuck_matches_tip_patrona: corrected to '{named_type}' per Комплектация").strip(" |")
+                                })
+                                out[chuck_id] = corrected
+                                logger.info(
+                                    "[Pipeline] FIX-4 komplektatsiya_chuck_matches_tip_patrona: corrected Тип патрона (attr=%s) %r -> %r per Комплектация (attr=%s)",
+                                    chuck_id, chuck_av.value, named_type, komp_id
+                                )
+            elif len(matched_labels) > 1:
+                logger.info(
+                    "[Pipeline] FIX-4 komplektatsiya_chuck_matches_tip_patrona: ambiguous chuck mention in Комплектация (attr=%s) — skipping reconciliation",
+                    komp_id
+                )
+
+    # Финальная сборка результата в исходном порядке
+    result: list[AttributeValue] = []
+    for v in merged:
+        if v.attribute_id in dropped_ids:
+            continue
+        result.append(out.get(v.attribute_id, v))
+    return result
 
 
 class PipelineOrchestrator:
@@ -4448,7 +4629,11 @@ class PipelineOrchestrator:
         _source_text = " ".join(
             p for p in (context.product_name, context.brand, context.product_description) if p
         ).strip()
-        all_values = _drop_ungrounded_hard_facts(all_values, _source_text, targets)
+        # FIX-3: product model text (name minus leading brand) for COUNTRY-class
+        # model-adjacency grounding -- the model designator, NOT the brand, must
+        # co-occur with a web_search country claim (brand-home-country leak fix).
+        _product_model_text = _strip_leading_brand(context.product_name, context.brand or "")
+        all_values = _drop_ungrounded_hard_facts(all_values, _source_text, targets, _product_model_text)
 
         # Stage 5.5: Аннотация generation — generative step, not extraction.
         # Runs AFTER all sources and finishing so it can use the full set of filled attrs.
@@ -5403,6 +5588,12 @@ class PipelineOrchestrator:
         # и заполнился, а не был вытеснен высоко-conf палитрой. [[honest_gap_composition]]
         all_values = _drop_multivalue_color_premerge(all_values, targets)
         merged = self._merge(all_values)
+
+        # FIX-4: deterministic cross-field validator, post-merge, pre-finalize.
+        # Reconciles known cross-attribute contradictions (concrete-Oe vs Rezhimy
+        # raboty; Komplektatsiya-named chuck vs Tip patrona) -- see
+        # docs/MANIFEST_grounding_arbitration.md FIX-4.
+        merged = _reconcile_cross_field_contradictions(merged, targets)
 
         # Brand-from-name POST-merge: имя товара авторитетно для бренда. Заполняет
         # пустой «Бренд» / перезаписывает мусорный (чужой allowed-enum) ровно-одним
