@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # the deployment opts in. Latency is further bounded by:
 #   WB_CARD_MAX_FETCHED (card.json fetch cap), WB_CARD_INJECT_IMAGES=false
 #   (suppress the Vision trigger), and RICH_SOURCE_TIMEOUT_S (hard per-source cap).
-_RICH_SOURCES_ENABLED = os.getenv("PIPELINE_RICH_SOURCES", "false").strip().lower() in (
+_RICH_SOURCES_ENABLED = os.getenv("PIPELINE_RICH_SOURCES", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
 _RICH_SOURCE_TIMEOUT_S = float(os.getenv("RICH_SOURCE_TIMEOUT_S", "25"))
@@ -97,9 +97,15 @@ class PipelineAdapter:
                 "[PipelineAdapter] rich sources ENABLED (WbCard+IceCat, timeout=%.0fs)",
                 _RICH_SOURCE_TIMEOUT_S,
             )
+        # OzonCardSource is ALWAYS constructed (not behind the rich-sources flag):
+        # it self-gates on SCRAPPEY_KEY (is_applicable/extract return [] without it),
+        # so it is a safe no-op on dev and always-on where the key is configured.
+        from app.services.enrichment.sources.ozon_card_source import OzonCardSource
+        self._ozon_card = _TimeoutSource(OzonCardSource(), _RICH_SOURCE_TIMEOUT_S, "OzonCard")
         self._orch = orchestrator or PipelineOrchestrator(
             wb_card_source=self._wb_card,
             icecat_source=self._icecat,
+            ozon_card_source=self._ozon_card,
         )
 
     async def run(
@@ -184,6 +190,7 @@ class PipelineAdapter:
                 strategy=strategy,
                 wb_card_source=self._wb_card,
                 icecat_source=self._icecat,
+                ozon_card_source=self._ozon_card,
             )
         else:
             orch = self._orch

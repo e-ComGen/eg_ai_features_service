@@ -470,6 +470,38 @@ def _unwrap_array_repr(value: str) -> list[str]:
     return parts if parts else [value]
 
 
+def _strip_unit_suffix(value: str) -> Optional[str]:
+    """Strip trailing pure-noise unit suffix: '2712×1220 pixels' -> '2712×1220'.
+
+    Whitelist ONLY pure measurement-noise suffixes (pixels/px/точек/...).
+    Returns None if nothing was stripped (helper stays inert on legitimate
+    dictionary units like мм/см/В/Ah, which are never in the whitelist).
+    """
+    import re
+    suffixes = r"(?:pixels|pixel|px|точек|пикселей|пикс)"
+    pattern = re.compile(r"\s+" + suffixes + r"\b\s*$", re.IGNORECASE)
+    match = pattern.search(value)
+    if match:
+        stripped = value[: match.start()].strip()
+        if stripped and stripped != value:
+            return stripped
+    return None
+
+
+def _digits_compatible(query: str, candidate: str) -> bool:
+    """True iff query/candidate digit-groups match (or query has none).
+
+    Non-numeric queries (no digits at all) return True unconditionally so the
+    guard never blocks semantic matches on text attributes (colors, etc.).
+    """
+    import re
+    query_digits = re.findall(r"\d+", query)
+    if not query_digits:
+        return True
+    candidate_digits = re.findall(r"\d+", candidate)
+    return sorted(query_digits) == sorted(candidate_digits)
+
+
 def _strip_parens(value: str) -> str:
     """Strip trailing parenthetical: 'OCP (защита от перегрузки)' → 'OCP'."""
     import re
@@ -653,7 +685,10 @@ def resolve_value_id(
       3. Strip trailing parentheses content.
       4. Rapidfuzz WRatio ≥ 85.
       5. Если value — list repr ([...]), try each item then aggregate.
-      6. Semantic match via MatcherService (fallback).
+      6. Strip pure-noise unit suffix (pixels/px/точек/...) and retry 1-4.
+      7. Semantic match via MatcherService (fallback), guarded so it never
+         returns a candidate whose digit groups differ from the query's
+         (FIX-8b, INV-9).
     """
     chars = get_ozon_characteristics_for_type(cat_id, type_id)
     char = next((c for c in chars if c.get("id") == attribute_id), None)
@@ -676,6 +711,13 @@ def resolve_value_id(
             if vid is not None:
                 return vid
 
+    # FIX-8a: strip pure-noise measurement suffix and retry exact/fuzzy match.
+    stripped = _strip_unit_suffix(value)
+    if stripped is not None and stripped != value:
+        vid = _try_match_one_value(stripped, values_list)
+        if vid is not None:
+            return vid
+
     # Semantic match via MatcherService (если sentence_transformers доступен)
     try:
         matcher = _get_matcher()
@@ -684,9 +726,18 @@ def resolve_value_id(
         options = [str(e.get("value", "")) for e in values_list]
         matched = matcher.find_best_match(str(value), options)
         if matched is not None:
-            for entry in values_list:
-                if str(entry.get("value", "")) == matched:
-                    return entry.get("id")
+            # FIX-8b: numeric semantic guard (INV-9) -- semantics never swap
+            # digits. Non-numeric queries (no \d) pass through unguarded.
+            if not _digits_compatible(str(value), matched):
+                logger.info(
+                    "[ozon_loader] FIX-8b semantic abstain: query=%r matched=%r (digit mismatch)",
+                    value,
+                    matched,
+                )
+            else:
+                for entry in values_list:
+                    if str(entry.get("value", "")) == matched:
+                        return entry.get("id")
     except Exception as exc:
         logger.warning("resolve_value_id matcher fallback failed: %s", exc)
     return None

@@ -3793,9 +3793,20 @@ _SDS_CHUCK_PAT = re.compile(r"\bsds\b", re.IGNORECASE)
 _DRILL_TYPE_PAT = re.compile(r"дрел\w*", re.IGNORECASE)
 _ROTARY_HAMMER_PAT = re.compile(r"перфоратор\w*|отбойн\w*\s*молот\w*", re.IGNORECASE)
 
+# FIX-7: variant_token_guard -- product_name is authoritative for its own
+# variant (diagonal size, line generation); a resolved value that contradicts
+# a variant-discriminator explicitly present in product_name is a leaked
+# neighbor-variant value -- abstain (drop). See docs/MANIFEST_variant_token_guard.md.
+_DISPLAY_SIZE_TARGET_PAT = re.compile(r"диагональ.*дюйм", re.IGNORECASE)
+_LINE_GEN_TARGET_PAT = re.compile(r"^линейка\b|линейка\s+(?:мобильных|устройств|товаров)", re.IGNORECASE)
+_LINE_GEN_VALUE_PAT = re.compile(r"(?P<line>.+?)\s*(?P<gen>\d{1,3})\s*$")
+_NAME_SIZE_NUM_PAT = re.compile(r"\d+")
+_DIAGONAL_VALUE_LEADING_INT_PAT = re.compile(r"^\s*(\d+)(?![.,]\d)")
+
 def _reconcile_cross_field_contradictions(
     merged: list[AttributeValue],
     targets: list[TargetAttribute],
+    product_name: str = "",
 ) -> list[AttributeValue]:
     """Кросс-атрибутная валидация после слияния: исправление известных противоречий."""
     by_id: dict[int, AttributeValue] = {av.attribute_id: av for av in merged}
@@ -3945,6 +3956,56 @@ def _reconcile_cross_field_contradictions(
                             "[Pipeline] FIX-5 drill_type_forbids_sds_chuck: dropped SDS-Plus Тип патрона (attr=%s, value=%r) for plain Дрель -- no reliable Комплектация replacement evidence",
                             chuck_id, chuck_av.value
                         )
+
+    # RULE-G1 -- variant_token_display_size_guard
+    display_size_target_id = _find_target_id(_DISPLAY_SIZE_TARGET_PAT)
+    if display_size_target_id is not None:
+        name_sizes: set[int] = set()
+        if product_name:
+            for num_str in _NAME_SIZE_NUM_PAT.findall(product_name):
+                try:
+                    num = int(num_str)
+                    if 17 <= num <= 120:
+                        name_sizes.add(num)
+                except ValueError:
+                    continue
+        if name_sizes:
+            av = out.get(display_size_target_id)
+            if av is not None and av.value:
+                value_str = str(av.value)
+                m = _DIAGONAL_VALUE_LEADING_INT_PAT.search(value_str)
+                if m:
+                    v_int = int(m.group(1))
+                    if v_int not in name_sizes:
+                        dropped_ids.add(display_size_target_id)
+                        logger.info(
+                            "[Pipeline] FIX-7 RULE-G1 dropped attr=%s value=%r (name=%r, name_sizes=%s)",
+                            display_size_target_id, value_str, product_name, sorted(name_sizes)
+                        )
+
+    # RULE-G2 -- variant_token_line_generation_guard
+    line_gen_target_id = _find_target_id(_LINE_GEN_TARGET_PAT)
+    if line_gen_target_id is not None:
+        av = out.get(line_gen_target_id)
+        if av is not None and av.value:
+            value_str = str(av.value)
+            m = _LINE_GEN_VALUE_PAT.search(value_str)
+            if m:
+                L = m.group("line").strip().lower().replace("ё", "е")
+                N = int(m.group("gen"))
+                if product_name:
+                    norm_name = product_name.lower().replace("ё", "е")
+                    escaped_L = re.escape(L)
+                    gen_pattern = re.compile(escaped_L + r"\s+(\d{1,3})")
+                    gen_match = gen_pattern.search(norm_name)
+                    if gen_match:
+                        M = int(gen_match.group(1))
+                        if M != N:
+                            dropped_ids.add(line_gen_target_id)
+                            logger.info(
+                                "[Pipeline] FIX-7 RULE-G2 dropped attr=%s value=%r (line=%r name_gen=%s value_gen=%s, product_name=%r)",
+                                line_gen_target_id, value_str, L, M, N, product_name
+                            )
 
     # Финальная сборка результата в исходном порядке
     result: list[AttributeValue] = []
@@ -5793,7 +5854,7 @@ class PipelineOrchestrator:
         # Reconciles known cross-attribute contradictions (concrete-Oe vs Rezhimy
         # raboty; Komplektatsiya-named chuck vs Tip patrona) -- see
         # docs/MANIFEST_grounding_arbitration.md FIX-4.
-        merged = _reconcile_cross_field_contradictions(merged, targets)
+        merged = _reconcile_cross_field_contradictions(merged, targets, context.product_name or "")
 
         # Brand-from-name POST-merge: имя товара авторитетно для бренда. Заполняет
         # пустой «Бренд» / перезаписывает мусорный (чужой allowed-enum) ровно-одним
