@@ -80,8 +80,12 @@ async def scrapedo_fetch(
         "render": "true" if render else "false",
         "super": "true" if super_proxy else "false",
         "geoCode": geo,
-        "customWait": str(wait_ms),
     }
+    # customWait is rejected by some sites (e.g. dns-shop) under render mode with a
+    # misleading "CustomWait can work with Render=True" 400 — send it only when >0 so
+    # the on-400 retry below can drop it and still pierce the site.
+    if wait_ms:
+        params["customWait"] = str(wait_ms)
     query_string = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
     request_url = f"{_SCRAPEDO_ENDPOINT}?{query_string}"
 
@@ -129,6 +133,14 @@ async def scrapedo_fetch(
 
         # Non-transient 4xx — hard fail, no retry.
         if r.status_code >= 400:
+            # Some sites reject customWait under render mode ("CustomWait can work
+            # with Render=True" 400) — retry ONCE without customWait (render+super
+            # alone pierces dns-shop: verified 200/73KB vs 400 with customWait).
+            if r.status_code == 400 and wait_ms and "customwait" in r.text.lower():
+                logger.info("[Scrape.do] customWait 400 for %s — retrying without customWait",
+                            url[:80])
+                return await scrapedo_fetch(url, render=render, super_proxy=super_proxy,
+                                            geo=geo, wait_ms=0, timeout=timeout)
             logger.warning("[Scrape.do] HTTP %s for %s — body[:300]=%s",
                            r.status_code, url[:80], r.text[:300])
             return ScrapflyResult(success=False, content=None, status_code=r.status_code,

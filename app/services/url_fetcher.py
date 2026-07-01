@@ -345,6 +345,34 @@ async def _try_scrappey_fallback(
     """
     global _scrappey_call_count
 
+    # ── scrape.do is the PRIMARY anti-bot tier (Scrappey retired 2026-06-14).
+    # web_search / url_fetcher pierce RU anti-bot via scrape.do — the SAME working
+    # proxy the Yandex.Market / Lamoda card sources use. Runs before the (disabled)
+    # Scrappey path so a blocked organic page still resolves.
+    if os.environ.get("SCRAPEDO_TOKEN"):
+        try:
+            from app.services.providers.scrapedo_client import scrapedo_fetch
+            _sd = await scrapedo_fetch(url, render=True, super_proxy=True, geo="ru")
+            # Trust scrapedo's own success gate (HTTP 200 AND len >= 50k) — same as
+            # the YM / Lamoda card sources. Do NOT re-run _looks_like_block here: it is
+            # a substring marker scan tuned for raw httpx bodies and false-positives on
+            # full JS-rendered RU-retail pages (a real 390KB citilink page trips it).
+            if _sd.success and _sd.content:
+                logger.info(
+                    "scrape.do fallback OK for %r (%d chars, reason: %s)",
+                    url, len(_sd.content), reason,
+                )
+                return httpx.Response(
+                    status_code=200, text=_sd.content,
+                    request=httpx.Request("GET", url),
+                )
+            logger.info(
+                "scrape.do fallback no content for %r (success=%s) — trying Scrappey tier",
+                url, _sd.success,
+            )
+        except Exception as _sd_exc:
+            logger.warning("scrape.do fallback error for %r: %s", url, _sd_exc)
+
     if not _eligible_for_scrappey(url, force=force):
         return None
 
