@@ -3783,9 +3783,15 @@ _IMPACT_MODE_PAT = re.compile(r"удар", re.IGNORECASE)
 _KOMPLEKTATSIYA_PAT = re.compile(r"комплектаци", re.IGNORECASE)
 _CHUCK_TYPE_TARGET_PAT = re.compile(r"тип\s*патрон", re.IGNORECASE)
 _CHUCK_TYPE_VALUE_PATTERNS = (
-    ("ключевой", re.compile(r"ключев\w*\s*патрон|патрон\w*\s*ключев", re.IGNORECASE)),
+    ("ключевой", re.compile(r"ключев\w*\s*патрон|патрон\w*\s*ключев|патрон\w*\s*ключ\b", re.IGNORECASE)),
     ("быстрозажимной", re.compile(r"быстрозажимн\w*\s*патрон|патрон\w*\s*быстрозажимн", re.IGNORECASE)),
 )
+
+# FIX-5: drill_type_forbids_sds_chuck -- SDS-Plus is a rotary-hammer chuck,
+# never valid on a plain "Дрель".
+_SDS_CHUCK_PAT = re.compile(r"\bsds\b", re.IGNORECASE)
+_DRILL_TYPE_PAT = re.compile(r"дрел\w*", re.IGNORECASE)
+_ROTARY_HAMMER_PAT = re.compile(r"перфоратор\w*|отбойн\w*\s*молот\w*", re.IGNORECASE)
 
 def _reconcile_cross_field_contradictions(
     merged: list[AttributeValue],
@@ -3888,6 +3894,58 @@ def _reconcile_cross_field_contradictions(
                     komp_id
                 )
 
+    # RULE C — drill_type_forbids_sds_chuck
+    chuck_id = _find_target_id(_CHUCK_TYPE_TARGET_PAT)
+    if chuck_id is not None:
+        chuck_av = out.get(chuck_id)
+        if chuck_av is not None and chuck_av.value:
+            chuck_text = str(chuck_av.value)
+            if _SDS_CHUCK_PAT.search(chuck_text):
+                type_id = next(
+                    (t.id for t in targets if t.name.strip().lower() in ("тип", "тип*")),
+                    None,
+                )
+                type_av = out.get(type_id) if type_id is not None else None
+                type_text = str(type_av.value) if type_av is not None and type_av.value else ""
+                if (
+                    type_id is not None
+                    and type_text
+                    and _DRILL_TYPE_PAT.search(type_text)
+                    and not _ROTARY_HAMMER_PAT.search(type_text)
+                ):
+                    # Confirmed plain "Дрель" -- SDS-Plus is domain-impossible here,
+                    # regardless of SOURCE_PRIORITY (this is a physical-impossibility
+                    # correction, not a which-source-do-we-trust dispute like RULE B).
+                    komp_id = _find_target_id(_KOMPLEKTATSIYA_PAT)
+                    komp_av = out.get(komp_id) if komp_id is not None else None
+                    replacement_found = False
+                    if komp_av is not None and komp_av.value:
+                        komp_text_c = str(komp_av.value).lower().replace("ё", "е")
+                        matched_labels_c = [
+                            label for label, pat in _CHUCK_TYPE_VALUE_PATTERNS
+                            if pat.search(komp_text_c)
+                        ]
+                        if len(matched_labels_c) == 1:
+                            named_type_c = matched_labels_c[0]
+                            stem_c = named_type_c[:-2].lower()
+                            if stem_c not in chuck_text.lower():
+                                corrected_c = chuck_av.model_copy(update={
+                                    "value": named_type_c,
+                                    "evidence": ((chuck_av.evidence or "") + f" | FIX-5 drill_type_forbids_sds_chuck: corrected SDS-Plus (invalid for plain Дрель) to '{named_type_c}' per Комплектация").strip(" |")
+                                })
+                                out[chuck_id] = corrected_c
+                                logger.info(
+                                    "[Pipeline] FIX-5 drill_type_forbids_sds_chuck: corrected Тип патрона (attr=%s) %r -> %r for plain Дрель (SDS-Plus invalid), per Комплектация (attr=%s)",
+                                    chuck_id, chuck_av.value, named_type_c, komp_id
+                                )
+                                replacement_found = True
+                    if not replacement_found:
+                        dropped_ids.add(chuck_id)
+                        logger.info(
+                            "[Pipeline] FIX-5 drill_type_forbids_sds_chuck: dropped SDS-Plus Тип патрона (attr=%s, value=%r) for plain Дрель -- no reliable Комплектация replacement evidence",
+                            chuck_id, chuck_av.value
+                        )
+
     # Финальная сборка результата в исходном порядке
     result: list[AttributeValue] = []
     for v in merged:
@@ -3895,6 +3953,132 @@ def _reconcile_cross_field_contradictions(
             continue
         result.append(out.get(v.attribute_id, v))
     return result
+
+
+# ---------------------------------------------------------------------------
+# FIX-6: annotation numeric grounding (INV-7) -- deterministic, non-LLM.
+# See docs/MANIFEST_grounding_arbitration.md Round 3 FIX-6.
+# ---------------------------------------------------------------------------
+_ANNOTATION_UNIT_ALIASES: dict[str, tuple[str, float]] = {
+    "кг": ("g", 1000.0), "kg": ("g", 1000.0),
+    "г": ("g", 1.0), "гр": ("g", 1.0), "g": ("g", 1.0),
+    "мм": ("mm", 1.0), "mm": ("mm", 1.0),
+    "см": ("mm", 10.0), "cm": ("mm", 10.0),
+    "м": ("mm", 1000.0), "m": ("mm", 1000.0),
+    "нм": ("nm_torque", 1.0), "н*м": ("nm_torque", 1.0), "n*m": ("nm_torque", 1.0),
+    "вт": ("w", 1.0), "w": ("w", 1.0),
+    "квт": ("w", 1000.0), "kw": ("w", 1000.0),
+    "в": ("v", 1.0), "v": ("v", 1.0),
+    "а": ("a", 1.0), "a": ("a", 1.0),
+    "уд/мин": ("impacts_per_min", 1.0),
+    "об/мин": ("rpm", 1.0),
+    "л": ("l", 1.0), "мл": ("l", 0.001),
+    "дж": ("j", 1.0),
+    "мач": ("mah", 1.0), "mah": ("mah", 1.0),
+    "%": ("pct", 1.0),
+}
+
+# longest/most-specific unit tokens first so alternation doesn't shortcut
+# on a short prefix (e.g. "мм" before bare "м", "уд/мин" before a bare letter).
+_ANNOTATION_NUMBER_UNIT_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*(уд/мин|об/мин|квт|kw|мач|mah|н\*м|n\*m|нм|мм|mm|см|cm|кг|kg|гр|вт|w|"
+    r"дж|мл|г|g|м|m|в|v|а|a|л|%)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_annotation_unit(raw_num: str, raw_unit: str) -> tuple[str, float] | None:
+    """Normalize a (number-string, unit-string) pair to (canonical_unit, value).
+
+    Returns None if the unit token isn't in the known alias table.
+    """
+    try:
+        num = float(raw_num.replace(",", "."))
+    except (ValueError, TypeError):
+        return None
+    alias = _ANNOTATION_UNIT_ALIASES.get(raw_unit.lower())
+    if alias is None:
+        return None
+    canonical_unit, multiplier = alias
+    return (canonical_unit, num * multiplier)
+
+
+def _extract_field_numeric_grounding(
+    filled_by_id: dict[int, AttributeValue],
+    target_names: dict[int, str],
+) -> set[tuple[str, float]]:
+    """Set of (canonical_unit, canonical_value) pairs backed by real filled
+    fields -- from either the field's own value text (if it embeds a unit,
+    e.g. "48000 уд/мин") or a bare numeric value plus a unit parsed from the
+    TARGET NAME suffix via extract_unit (e.g. name "Вес, г", value "1800").
+    """
+    grounded: set[tuple[str, float]] = set()
+    for attr_id, av in filled_by_id.items():
+        if isinstance(av.value, list):
+            continue
+        value_text = str(av.value)
+        embedded_matches = list(_ANNOTATION_NUMBER_UNIT_RE.finditer(value_text))
+        if embedded_matches:
+            for m in embedded_matches:
+                norm = _normalize_annotation_unit(m.group(1), m.group(2))
+                if norm is not None:
+                    grounded.add(norm)
+            continue
+        unit = extract_unit(target_names.get(attr_id, ""))
+        if unit is None:
+            continue
+        try:
+            num = float(value_text.replace(",", ".").strip())
+        except (ValueError, TypeError):
+            continue
+        norm = _normalize_annotation_unit(str(num), unit)
+        if norm is not None:
+            grounded.add(norm)
+    return grounded
+
+
+def _check_annotation_numeric_grounding(
+    annotation_text: str,
+    filled_by_id: dict[int, AttributeValue],
+    target_names: dict[int, str],
+) -> tuple[str, list[str]]:
+    """FIX-6(b) / INV-7: strip any number+unit claim in the generated
+    annotation that isn't backed (after unit normalization) by an actual
+    filled field. Returns (possibly-stripped text, violation descriptions).
+    Sentence-level strip -- the whole offending sentence is removed, not
+    just the token.
+    """
+    grounded = _extract_field_numeric_grounding(filled_by_id, target_names)
+
+    bad_spans: list[tuple[int, int]] = []
+    violations: list[str] = []
+    for m in _ANNOTATION_NUMBER_UNIT_RE.finditer(annotation_text):
+        norm = _normalize_annotation_unit(m.group(1), m.group(2))
+        if norm is None:
+            continue
+        if norm not in grounded:
+            violations.append(f"'{m.group(0)}' -- no filled field backs this value+unit")
+            bad_spans.append((m.start(), m.end()))
+
+    if not bad_spans:
+        return annotation_text, violations
+
+    sentence_spans: list[tuple[int, int]] = []
+    prev_end = 0
+    for m in re.finditer(r"[.!?]+(?!\d)\s*", annotation_text):
+        sentence_spans.append((prev_end, m.end()))
+        prev_end = m.end()
+    if prev_end < len(annotation_text):
+        sentence_spans.append((prev_end, len(annotation_text)))
+
+    kept_parts: list[str] = []
+    for s_start, s_end in sentence_spans:
+        overlaps_bad = any(b_start < s_end and b_end > s_start for b_start, b_end in bad_spans)
+        if not overlaps_bad:
+            kept_parts.append(annotation_text[s_start:s_end])
+
+    cleaned = "".join(kept_parts).strip()
+    return cleaned, violations
 
 
 class PipelineOrchestrator:
@@ -4706,7 +4890,8 @@ class PipelineOrchestrator:
         system_prompt = (
             "Ты маркетолог. Составь маркетинговое описание товара 2-4 предложения "
             "на основе предоставленных характеристик. Текст должен быть живым, "
-            "продающим, без перечислений через запятую. Только текст описания, без заголовков. НЕ указывай числовые или категориальные характеристики (число скоростей/передач, мощность, обороты, напряжение, габариты и т.п.), которых НЕТ в предоставленных характеристиках. Не придумывай и не дополняй спецификации из общих знаний — описывай ТОЛЬКО подтверждённые данные. Тип товара указывай строго как в характеристиках, не подменяй категорию. Категорию и тип товара бери СТРОГО из поля «Тип» (если оно дано) или из названия товара; игнорируй упоминания типа/категории в других полях (например в «Комплектации»)."
+            "продающим, без перечислений через запятую. Только текст описания, без заголовков. НЕ указывай числовые или категориальные характеристики (число скоростей/передач, мощность, обороты, напряжение, габариты и т.п.), которых НЕТ в предоставленных характеристиках. Не придумывай и не дополняй спецификации из общих знаний — описывай ТОЛЬКО подтверждённые данные. Тип товара указывай строго как в характеристиках, не подменяй категорию. Категорию и тип товара бери СТРОГО из поля «Тип» (если оно дано) или из названия товара; игнорируй упоминания типа/категории в других полях (например в «Комплектации»). "
+            "Категорически запрещено выдумывать или выводить числовые значения, которых нет дословно среди предоставленных характеристик. Запрещено пересчитывать одну величину в другую (например, превращать «ударов в минуту» в крутящий момент в Нм или менять любые другие единицы измерения). Если характеристика (крутящий момент, мощность, напряжение и т.п.) отсутствует в предоставленных данных — опиши её качественно в прозе или вообще не упоминай, но никогда не вычисляй и не угадывай для неё число."
         )
         user_text = (
             f"Товар: {context.product_name}\n"
@@ -4731,14 +4916,29 @@ class PipelineOrchestrator:
         if parsed is None or not parsed.annotation.strip():
             return []
 
+        annotation_text = parsed.annotation.strip()
+        annotation_text, violations = _check_annotation_numeric_grounding(
+            annotation_text, filled_by_id, target_names
+        )
+        if violations:
+            logger.warning(
+                "[Pipeline] FIX-6 annotation numeric grounding: stripped %d violation(s): %s",
+                len(violations), violations,
+            )
+        if not annotation_text.strip():
+            return []
+
         context.llm_calls_so_far += 1
+        evidence = "generated from collected attributes"
+        if violations:
+            evidence += f" | FIX-6 stripped {len(violations)} ungrounded numeric claim(s)"
         return [
             AttributeValue(
                 attribute_id=annotation_target.id,
-                value=parsed.annotation.strip(),
+                value=annotation_text,
                 confidence=0.9,
                 source=Source.LLM_KNOWLEDGE,
-                evidence="generated from collected attributes",
+                evidence=evidence,
                 is_collection=False,
             )
         ]

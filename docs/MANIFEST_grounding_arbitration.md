@@ -117,3 +117,38 @@ invent expected values.
 - The retrieval-fallback model tier (FIX-2 extension) — pending the model research; wired only on a
   separate go.
 - Any change to web_search transport (Serper/scrape.do) — already working.
+
+## 7. Round 3 — FIX-5 (chuck cross-field) + FIX-6 (annotation numeric grounding)
+Live e2e (post FIX-1..4 deploy) exposed two adjacent hallucination classes the structural fixes do
+not cover:
+- DeWalt DWD024 «Тип патрона»=«SDS-Plus» — WRONG (DWD024 is a keyed 13mm chuck; «Комплектация» names
+  «патронный ключ»; SDS-Plus belongs to rotary hammers, not a plain «Дрель»). RULE-B missed it: it
+  only matched «ключевой патрон»/«быстрозажимной», not the «патронный ключ» (chuck-KEY tool) evidence.
+- Makita HP1630 annotation invented «крутящий момент 48 Нм» — it took «48000 уд/мин» and misrendered
+  it as torque. Free-text `_generate_annotation` confuses fields/units.
+
+**FIX-5 — extend `_reconcile_cross_field_contradictions` (RULE-B):**
+- «Комплектация» containing «патронный ключ» (chuck-key tool) ⇒ «Тип патрона» MUST be «Ключевой».
+- TYPE consistency: for product type «Дрель» (plain drill), «Тип патрона»=«SDS-Plus» (or any
+  rotary-hammer chuck) is INVALID → correct to the комплектация/description-implied type, or abstain.
+
+**FIX-6 — annotation numeric grounding (`_generate_annotation`):**
+- Prompt hardening: NEVER introduce a numeric value or unit not present VERBATIM in the provided
+  characteristics; NEVER convert/compute/re-unit a number; if a spec isn't in the fields, describe
+  qualitatively or omit.
+- Deterministic post-check: extract every «number+unit» token from the generated annotation; each MUST
+  match a filled field's (value, unit) AFTER normalising equivalent units/format (1,8 кг ≡ 1800 г;
+  comma/dot; кг↔г, мм↔mm). A number+unit not backed by a field — especially a field number re-attached
+  to a WRONG unit (48000 уд/мин → «48 Нм») → regenerate once with the violation named, else strip that
+  clause. MUST NOT false-strip a legitimate unit reformat.
+
+**INV-7:** every «number+unit» in a generated annotation corresponds to a filled field (value+unit,
+unit-normalised); otherwise stripped/regenerated.
+
+**Oracle (Round 3):**
+- O4: «Тип патрона»=«SDS-Plus» + type=«Дрель» + «Комплектация» names «патронный ключ» → corrected to
+  «Ключевой» (or dropped); never SDS-Plus for a plain drill.
+- O5: annotation contains «48 Нм» but no field has 48 Нм torque (fields have «48000 уд/мин») → the
+  «48 Нм» claim removed/regenerated; post-check flags it.
+- O5b (regression, no false-strip): annotation says «вес 1,8 кг», field «Вес»=1800 г → KEPT unchanged
+  (unit-equivalent, legitimate reformat).
