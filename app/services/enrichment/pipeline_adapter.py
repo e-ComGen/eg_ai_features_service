@@ -43,6 +43,12 @@ _RICH_SOURCES_ENABLED = os.getenv("PIPELINE_RICH_SOURCES", "true").strip().lower
     "1", "true", "yes", "on",
 )
 _RICH_SOURCE_TIMEOUT_S = float(os.getenv("RICH_SOURCE_TIMEOUT_S", "25"))
+# WbCardSource is separately gate-able: on the live path it consistently exceeds
+# the per-source timeout (Serper + N basket fetches) and contributes 0 fills, so
+# it can be disabled independently while keeping IceCat/Ozon cards on.
+_WB_CARD_ENABLED = os.getenv("PIPELINE_WB_CARD_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 
 class _TimeoutSource:
@@ -89,17 +95,20 @@ class PipelineAdapter:
         self._wb_card = None
         self._icecat = None
         if _RICH_SOURCES_ENABLED:
-            from app.services.enrichment.sources.wb_card_source import WbCardSource
             from app.services.enrichment.sources.icecat_source import IceCatSource
-            self._wb_card = _TimeoutSource(WbCardSource(), _RICH_SOURCE_TIMEOUT_S, "WbCard")
             self._icecat = _TimeoutSource(IceCatSource(), _RICH_SOURCE_TIMEOUT_S, "IceCat")
+            if _WB_CARD_ENABLED:
+                from app.services.enrichment.sources.wb_card_source import WbCardSource
+                self._wb_card = _TimeoutSource(WbCardSource(), _RICH_SOURCE_TIMEOUT_S, "WbCard")
             logger.info(
-                "[PipelineAdapter] rich sources ENABLED (WbCard+IceCat, timeout=%.0fs)",
+                "[PipelineAdapter] rich sources ENABLED (IceCat%s, timeout=%.0fs)",
+                "+WbCard" if _WB_CARD_ENABLED else " only; WbCard DISABLED",
                 _RICH_SOURCE_TIMEOUT_S,
             )
         # OzonCardSource is ALWAYS constructed (not behind the rich-sources flag):
-        # it self-gates on SCRAPPEY_KEY (is_applicable/extract return [] without it),
-        # so it is a safe no-op on dev and always-on where the key is configured.
+        # it self-gates on SCRAPEDO_TOKEN (FIX-10: scrape.do replaced the retired
+        # Scrappey transport; is_applicable/extract return [] without it),
+        # so it is a safe no-op on dev and always-on where the token is configured.
         from app.services.enrichment.sources.ozon_card_source import OzonCardSource
         self._ozon_card = _TimeoutSource(OzonCardSource(), _RICH_SOURCE_TIMEOUT_S, "OzonCard")
         self._orch = orchestrator or PipelineOrchestrator(

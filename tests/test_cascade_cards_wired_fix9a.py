@@ -16,7 +16,7 @@ import pytest
 
 import app.services.enrichment.pipeline_adapter as pipeline_adapter_module
 
-_ENV_VARS = ("PIPELINE_RICH_SOURCES", "SCRAPPEY_KEY", "SERPER_KEY")
+_ENV_VARS = ("PIPELINE_RICH_SOURCES", "SCRAPPEY_KEY", "SCRAPEDO_TOKEN", "SERPER_KEY")
 
 
 @pytest.fixture(autouse=True)
@@ -44,19 +44,27 @@ def test_o1_scrappey_key_ozon_card_wired(monkeypatch):
 
 
 def test_o2_no_keys_constructs_without_error(monkeypatch):
-    """O2: no SCRAPPEY_KEY/SERPER_KEY -> PipelineAdapter() constructs with no
-    error; cards stay []-no-op (self-gated inside OzonCardSource)."""
+    """O2: no SCRAPEDO_TOKEN/SERPER_KEY -> PipelineAdapter() constructs with no
+    error; cards stay []-no-op (self-gated inside OzonCardSource).
+
+    FIX-10: the self-gate token moved from SCRAPPEY_KEY (retired Scrappey
+    transport) to SCRAPEDO_TOKEN (scrape.do) -- see
+    docs/MANIFEST_ozon_card_scrapedo.md. SCRAPPEY_KEY is still deleted here
+    too for good measure (it's an unrelated legacy var that must not leak
+    into the OzonCardSource internal state either way).
+    """
     monkeypatch.delenv("SCRAPPEY_KEY", raising=False)
+    monkeypatch.delenv("SCRAPEDO_TOKEN", raising=False)
     monkeypatch.delenv("SERPER_KEY", raising=False)
     mod = importlib.reload(pipeline_adapter_module)
 
     adapter = mod.PipelineAdapter()  # must not raise
 
     # OzonCardSource is now constructed unconditionally (always-on wiring),
-    # but self-gates: no key -> its own is_applicable()/extract() are [].
+    # but self-gates: no token -> its own is_applicable()/extract() are [].
     assert adapter._ozon_card is not None
     inner = adapter._ozon_card._inner
-    assert inner._scrappey_key is None
+    assert inner._scrapedo_token is None
 
 
 def test_o3_rich_sources_default_true(monkeypatch):

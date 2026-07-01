@@ -1,19 +1,19 @@
 """OzonCardSource — копирует характеристики из живой Ozon-карточки похожего товара.
 
-Использует ПУБЛИЧНЫЕ HTML-страницы Ozon через Scrappey.com proxy (TRUE PAYG,
+Использует ПУБЛИЧНЫЕ HTML-страницы Ozon через scrape.do proxy (TRUE PAYG,
 ~$0.0002-0.001/page). Composer-api.bx заблокирован DataDome даже через
 премиум-прокси; HTML-страницы Ozon содержат полный widget state в SSR.
 
 Алгоритм:
   1. Skip-guard: если already_filled покрывает ≥80% targets → return [].
-  2. Search step: GET https://www.ozon.ru/search/?text=<name> через Scrappey
+  2. Search step: GET https://www.ozon.ru/search/?text=<name> через scrape.do
      → regex по `<a href="/product/<slug>-<pid>/">` → list of tiles.
   3. Match step: rapidfuzz (partial_ratio + token_sort_ratio) vs product_name:
      - ≥85 → "exact": full card, copy ALL.
      - 70-84 → "brand_line": full card, только safe attrs.
      - <70 → skip.
-  4. Detail step: GET https://www.ozon.ru/product/<slug>/features/ через Scrappey
-     → regex `<div id="state-webCharacteristics-..." data-state='<JSON>'>`
+  4. Detail step: GET https://www.ozon.ru/product/<slug>/features/ через scrape.do
+     → regex `<div id="state-webCharacteristics-..." data-state='<JSON>'>` (или data-state="<HTML-escaped JSON>")`
      → распарсить characteristics[].short / .long / .full → [{name, value}].
   5. Mapping по русским именам через get_ozon_characteristics_for_type
      (lowercase + substring + fuzzy WRatio≥88).
@@ -22,28 +22,27 @@
   8. Evidence: f"ozon:{title[:50]} | match={score}".
   9. In-process LRU cache по (brand, normalized_model), max 256.
 
-Scrappey cost: 1 credit / запрос → 2 credits / товар (search + features).
-Free trial: 150 credits = 75 товаров. PAYG top-ups доступны без подписки.
+Cost: 1 scrape.do-запрос / шаг (search + features) — 2 запроса/товар.
 
 Anti-block:
-  - SCRAPPEY_KEY читаем из env, можно передать в __init__.
+  - SCRAPEDO_TOKEN читаем из env (см. app/services/providers/scrapedo_client.py),
+    можно передать backward-compat kwarg scrappey_key в __init__ (игнорируется —
+    он больше не источник токена).
   - DataDome detection: incidentId в первых 1500 символах → []
-  - HTTP 4xx из Scrappey → warn + [].
-  - Timeout 180s (Scrappey full browser bypass занимает 8-20s).
+  - HTTP 4xx / короткое тело / DataDome → scrape.do сам вернёт success=False → []
+  - Таймаут: до 120s на попытку (scrape.do render+residential-proxy),
+    до 3 внутренних ретраев на транзиентных 429/5xx.
 """
 from __future__ import annotations
 
 import asyncio
+import html as _html
 import json
 import logging
 import os
 import re
-import ssl
-import uuid
 from collections import OrderedDict
 from typing import Any, Optional, Union
-
-import httpx
 
 from app.services.enrichment.base import (
     AttributeSource,
@@ -59,6 +58,7 @@ from app.services.enrichment.strategies.dictionaries.ozon_loader import (
     get_ozon_characteristics_for_type,
     resolve_value_id,
 )
+from app.services.providers.scrapedo_client import scrapedo_fetch
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +68,6 @@ logger = logging.getLogger(__name__)
 
 _OZON_SEARCH_URL = "https://www.ozon.ru/search/"
 _OZON_PRODUCT_BASE = "https://www.ozon.ru/product/"
-_SCRAPPEY_ENDPOINT = "https://publisher.scrappey.com/api/v1"
 _MAX_SEARCH_TILES = 8
 # Score the top-N parsed SSR tiles and pick the HIGHEST-scoring one (best-of-N),
 # instead of relying on the single top tile. Ozon's SSR tile ORDERING jitters
@@ -78,73 +77,14 @@ _MAX_SEARCH_TILES = 8
 # small buffer above the typical jitter window (the exact card has been observed
 # ranking up to ~6th) while staying cheap (scoring is pure-CPU rapidfuzz, no I/O).
 _MATCH_TOP_N = 8
-_HTTP_TIMEOUT = 30.0   # httpx-level fallback cap (belt-and-suspenders).
-                       # The real per-call limit is _SCRAPPEY_PER_ATTEMPT_TIMEOUT via
-                       # asyncio.wait_for, so 30s keeps both layers consistent.
 
-# Fail-fast retry constants for Scrappey proxy calls.
-# Rationale for the 45s total cap (down from 80s):
-#   In the last eval, Ozon Scrappey consistently hung to the FULL old timeout and it
-#   was the Serper-snippet fallback (not the Scrappey card) that actually recovered the
-#   data. So the old 80s budget was being wasted waiting for a dead proxy path before
-#   reaching the fallback that works. Cutting to 45s means we fail to Serper ~35s faster
-#   with essentially no quality loss — the fallback quality is identical to what the eval
-#   was actually delivering.
-# Budget breakdown: 18s × 2 attempts = 36s Scrappey + 2s backoff = 38s worst-case
-#   Scrappey path, leaving 7s margin before the 45s total fires. Serper has its own 15s
-#   timeout and is called AFTER the total fires, so it runs outside this budget — the
-#   total cap only gates the Scrappey path itself.
-_SCRAPPEY_PER_ATTEMPT_TIMEOUT = 18.0  # asyncio.wait_for per Scrappey call (was 30s)
-_SCRAPPEY_MAX_ATTEMPTS = 2            # 1 attempt + 1 retry on timeout/empty-block
-
-_OZON_CARD_TOTAL_TIMEOUT = 45.0  # Hard cap on the entire _do_extract (Scrappey path).
-                                  # 2×18s Scrappey + 2s backoff = 38s worst-case, fits
-                                  # well under 45s cap. On timeout, falls through to the
-                                  # Serper-snippet fallback which is what the eval showed
-                                  # actually recovers the data when Scrappey hangs.
-
-# ── Scrappey антибот-тюнинг (data-driven, env-управляемый) ──────────────────
-# Раньше слался ГОЛЫЙ {"cmd":"request.get","url":...} — это base. Думали, что datacenter
-# без гео = причина «висит до таймаута»; добавили рычаги. ИЗМЕРИЛИ ВСЕ (measure_scrappey_ozon.py,
-# 23.06, n=6) — datacenter-base ЛУЧШИЙ из всех:
-#   A datacenter (база):              4/6 (66%), 13 кр, 191с  ← лучший
-#   B residential-RU (proxyCountry):  2/6 (33%), 16 кр, 258с  — хуже+медленнее (RU-residential
-#                                                               латентнее, режется 18s-капом)
-#   C residential-RU + browser:       0/6 (0%),  16 кр, 311с  — browser возвращает пост-JS DOM,
-#                                                               SSR-парсер _parse_search_tiles_html
-#                                                               его не разбирает → no_tiles
-# Вывод: НИ ОДИН рычаг не бьёт datacenter-базу; browser вообще ломает парсинг. ВСЕ дефолт-OFF
-# (база = проверенный datacenter). Knobs оставлены, но без иллюзий — гео/browser = дуды.
-#   • OZON_SCRAPPEY_PROXY_COUNTRY — гео (напр. "Russia"). ""→datacenter (дефолт, 66%).
-#   • OZON_SCRAPPEY_REQUEST_TYPE — "browser" (полный рендер+антибот) / "request". ""→не шлём.
-#   • OZON_SCRAPPEY_PROXY — кастомный residential URL (http/socks). ""→Scrappey-дефолт.
-#   • OZON_SCRAPPEY_SESSION_REUSE — общая session на search+features. Дефолт OFF.
-# [[reference_ozon_dict_attr_contract]] [[feedback_scraper_service_choice]]
-_SCRAPPEY_PROXY_COUNTRY = os.getenv("OZON_SCRAPPEY_PROXY_COUNTRY", "").strip()
-_SCRAPPEY_REQUEST_TYPE = os.getenv("OZON_SCRAPPEY_REQUEST_TYPE", "").strip()
-_SCRAPPEY_PROXY = os.getenv("OZON_SCRAPPEY_PROXY", "").strip()
-_SCRAPPEY_SESSION_REUSE = os.getenv(
-    "OZON_SCRAPPEY_SESSION_REUSE", "0"
-).strip().lower() not in ("0", "false", "no", "off", "")
-
-
-def _build_scrappey_payload(target_url: str, session: Optional[str] = None) -> dict:
-    """Собрать Scrappey-payload с антибот-рычагами (proxyCountry/proxy/requestType/session).
-
-    База — legacy cmd-формат (publisher.scrappey.com/api/v1 его принимает); поверх
-    кладём top-level параметры, которые v1 honor-ит вместе с cmd. Пустые env → ключ
-    опускаем (Scrappey берёт свой дефолт). proxyCountry=Russia критичен для Ozon.
-    """
-    payload: dict[str, Any] = {"cmd": "request.get", "url": target_url}
-    if _SCRAPPEY_PROXY_COUNTRY:
-        payload["proxyCountry"] = _SCRAPPEY_PROXY_COUNTRY
-    if _SCRAPPEY_PROXY:
-        payload["proxy"] = _SCRAPPEY_PROXY
-    if _SCRAPPEY_REQUEST_TYPE:
-        payload["requestType"] = _SCRAPPEY_REQUEST_TYPE
-    if session:
-        payload["session"] = session
-    return payload
+# Hard cap on the entire _do_extract (scrape.do path). Scrape.do render+residential-proxy is
+# slower per call than the old (retired) proxy (~15-60s typical, up to 120s worst-case per
+# scrapedo_fetch call incl. its own internal retries) and _do_extract can issue up to ~2-3
+# sequential scrapedo_fetch calls (search + retry-search + features, or 1 call when Serper-first
+# finds the card directly). 200s gives a realistic budget for that; on timeout, falls through to
+# the Serper-snippet fallback (unchanged).
+_OZON_CARD_TOTAL_TIMEOUT = 200.0
 
 
 # Regex для парсинга
@@ -153,7 +93,8 @@ _PRODUCT_LINK_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _FEATURES_STATE_RE = re.compile(
-    r'<div\s+id="state-webCharacteristics-[^"]+"\s+data-state=\'([^\']+)\'',
+    r'<div\s+id="state-webCharacteristics-[^"]+"\s+data-state='
+    r'(?:\'([^\']+)\'|"([^"]+)")',
     re.DOTALL,
 )
 # Product photos на /features/ странице — `<img src="https://ir.ozone.ru/s3/multimedia-X/wcY/...jpg">`.
@@ -212,7 +153,7 @@ def _split_multivalue(raw: str) -> list[str]:
     return out or [raw.strip()]
 
 # Serper-snippet fallback confidence.
-# Срабатывает ТОЛЬКО когда Scrappey-путь вернул 0 характеристик (Scrappey мёртв
+# Срабатывает ТОЛЬКО когда scrape.do-путь вернул 0 характеристик (карточка не найдена
 # или отдал пустоту). Сниппет частичный (3-6 полей из карточки), поэтому conf
 # ниже brand_line, НО ≥ 0.80 — достаточно, чтобы fill попал в filled_so_far и
 # merger его засчитал, если более уверенный источник не нашёл значение.
@@ -232,7 +173,7 @@ _SERPER_ARTICUL_RE = re.compile(r"(?:артикул|sku)\D{0,3}(\d{5,})", re.IGN
 
 # Serper-assisted card-finding: когда внутренний поиск Ozon флачит (no_tiles/low_match),
 # найти точный URL товара через Google (он индексирует ozon.ru надёжнее, чем держится
-# их антибот-search), затем Scrappey тащит ТОЛЬКО /features/ найденного URL. Цель —
+# их антибот-search), затем scrape.do тащит ТОЛЬКО /features/ найденного URL. Цель —
 # поднять 66%-потолок за счёт search/match-промахов (не антибот). Гард: Serper-карточка
 # проходит ТОТ ЖЕ match-скоринг, что и Ozon-tile → чужой бренд/тип отсекается.
 # Дефолт ON (только ДОБАВЛЯет fallback при провале основного пути; гард не пускает мусор).
@@ -241,7 +182,7 @@ _OZON_SERPER_CARD_FINDING = os.getenv(
 ).strip().lower() not in ("0", "false", "no", "off", "")
 
 # Serper-FIRST: дёргать Serper-card-finding ПЕРВЫМ, до внутреннего поиска Ozon.
-# Внутренний поиск Ozon — самая флаковая/троттлимая часть (2 Scrappey-вызова с ретраями
+# Внутренний поиск Ozon — самая флаковая/троттлимая часть (2 scrape.do-вызова с ретраями
 # на блокируемой search-странице). Если Google и так надёжно находит URL — идём сразу
 # на /features/ (1 фетч вместо search+features) → ВДВОЕ меньше запросов к Ozon → меньше
 # троттла, быстрее, дешевле. Ozon-поиск остаётся фоллбэком (когда Google не индексирует
@@ -258,11 +199,8 @@ _BRAND_LINE_THRESHOLD = 65.0  # v17 had 75.0 — слишком жёстко, у
                               # 65 — компромисс: brand_line whitelist всё равно ограничивает
                               # копирование model-specific attrs.
 
-# Retry: HTML < этого размера или 0 tiles → retry (Ozon **рандомно** отдаёт
-# обрезанную SPA-страницу 10KB без SSR data; та же query 2-3 попытки спустя
-# возвращает полные 480+KB SSR). Эмпирически 3 попыток достаточно.
-_MIN_VALID_HTML_LEN = 50_000
-_MAX_RETRIES = 3
+# (Retry-on-short-HTML logic removed: scrape.do/scrapedo_fetch already enforces
+# a minimum body length and retries transient failures internally.)
 
 # Skip-guard
 _SKIP_FILL_RATIO = 0.80
@@ -673,6 +611,38 @@ def _extract_model_tokens(s: str) -> set:
     return {t.lower() for t in tokens if len(t) >= 3}
 
 
+def _common_prefix_len(a: str, b: str) -> int:
+    """Возвращает длину общего префикса двух строк."""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def _category_present_in_title(cat_leaf_low: str, title_low: str) -> bool:
+    r"""FIX-12: stem/prefix-aware проверка присутствия категории в заголовке карточки.
+
+    Таксономия CS-Cart (category_leaf) часто в другой словоформе/числе, чем заголовок
+    карточки Ozon («Смартфоны» vs «Смартфон POCO...», «Дрели ударные» vs «Дрель ударная...»).
+    Буквальная подстрока это не ловит; вместо этого сравниваем общий префикс токенов.
+
+    Токенизация по [\s\-–—/]+, токены длиной >= 4 символа. Категория
+    считается присутствующей, если хоть один токен категории делит общий префикс
+    >= 4 симв. с каким-либо токеном title (смартфоны↔смартфон, дрели↔дрель, куртки↔куртка).
+    Чистая функция: без I/O, без внешних зависимостей. Пустые строки → False.
+    """
+    if not cat_leaf_low or not title_low:
+        return False
+    cat_tokens = [t for t in re.split(r"[\s\-–—/]+", cat_leaf_low.lower()) if len(t) >= 4]
+    title_tokens = [t for t in re.split(r"[\s\-–—/]+", title_low.lower()) if len(t) >= 4]
+    for ct in cat_tokens:
+        for tt in title_tokens:
+            if _common_prefix_len(ct, tt) >= 4:
+                return True
+    return False
+
+
 # Чисто-алфавитный токен (латиница ИЛИ кириллица), без цифр, длиной ≥ 4.
 # Словесные модели не имеют цифр: Resolve, Ultraboost, Sauvage, Triclimate.
 _ALPHA_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яёЁ]{4,}")
@@ -937,10 +907,10 @@ def _is_datadome_block(content: str) -> bool:
 
 
 class OzonCardSource(AttributeSource):
-    """Копия характеристик с live Ozon-карточки похожего товара через Scrappey.
+    """Копия характеристик с live Ozon-карточки похожего товара через scrape.do.
 
     Cost: 2 credits/product (search + features), 0 на failed.
-    Latency: 10-40s end-to-end (8-20s per Scrappey call).
+    Latency: 15-60s end-to-end typical (scrape.do render+super_proxy per call).
     """
 
     def __init__(
@@ -952,16 +922,16 @@ class OzonCardSource(AttributeSource):
         ozon_api_base: Optional[str] = None,
         **kwargs: Any,
     ):
+        _ = scrappey_key
         _ = scrapfly_key
         _ = apify_token
         _ = ozon_api_base
         _ = kwargs
 
-        self._scrappey_key = scrappey_key or os.environ.get("SCRAPPEY_KEY")
-        if not self._scrappey_key:
+        self._scrapedo_token = os.environ.get("SCRAPEDO_TOKEN")
+        if not self._scrapedo_token:
             logger.warning(
-                "[OzonCard] SCRAPPEY_KEY не задан (ни параметром, ни в env) — "
-                "extract() всегда вернёт []."
+                "[OzonCard] SCRAPEDO_TOKEN не задан — extract() всегда вернёт []."
             )
 
         self._judge = OzonCardJudge()
@@ -974,9 +944,9 @@ class OzonCardSource(AttributeSource):
         return Source.OZON_CARD
 
     def is_applicable(self, context: ExtractionContext, target: TargetAttribute) -> bool:
-        """Применим если product_name есть и не пустой, и SCRAPPEY_KEY доступен."""
+        """Применим если product_name есть и не пустой, и SCRAPEDO_TOKEN доступен."""
         return bool(
-            self._scrappey_key
+            self._scrapedo_token
             and context.product_name
             and len(context.product_name.strip()) >= 5
         )
@@ -987,7 +957,7 @@ class OzonCardSource(AttributeSource):
         targets: list[TargetAttribute],
         already_filled: Optional[list[AttributeValue]] = None,
     ) -> list[AttributeValue]:
-        if not targets or not context.product_name or not self._scrappey_key:
+        if not targets or not context.product_name or not self._scrapedo_token:
             return []
 
         already_filled = already_filled or []
@@ -1017,10 +987,9 @@ class OzonCardSource(AttributeSource):
             return self._filter_for_targets(self._cache[cache_key], targets)
 
         # Network calls — bounded by hard total timeout to prevent stalls.
-        # Per-attempt Scrappey timeout (_SCRAPPEY_PER_ATTEMPT_TIMEOUT=30s) + retry
-        # keeps worst-case Scrappey path to ~62s, leaving room for Serper fallback
-        # within the 80s cap. If the total cap still fires (extreme degradation), fall
-        # through to the Serper-snippet fallback instead of surrendering the product.
+        # scrape.do (with its own internal retry) is bounded by _OZON_CARD_TOTAL_TIMEOUT
+        # (200s). If the total cap still fires (extreme degradation), fall through to
+        # the Serper-snippet fallback instead of surrendering the product.
         try:
             all_values = await asyncio.wait_for(
                 self._do_extract(context, targets),
@@ -1028,13 +997,13 @@ class OzonCardSource(AttributeSource):
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "[OzonCard] total timeout (%.0fs) for '%s' — Scrappey path failed; "
+                "[OzonCard] total timeout (%.0fs) for '%s' — scrape.do path failed; "
                 "trying serper-fallback",
                 _OZON_CARD_TOTAL_TIMEOUT,
                 context.product_name[:60],
             )
-            # Serper fallback does not touch Scrappey and has its own 15s timeout
-            # — safe to call even after the Scrappey path timed out.
+            # Serper fallback does not touch scrape.do and has its own 15s timeout
+            # — safe to call even after the scrape.do path timed out.
             snippet_values = await self._serper_snippet_fallback(context, targets)
             logger.info(
                 "[OzonCard] serper-fallback-used after total-timeout: %d values for '%s'",
@@ -1059,159 +1028,42 @@ class OzonCardSource(AttributeSource):
         return self._judge
 
     # ------------------------------------------------------------------
-    # Network orchestration via Scrappey
+    # Network orchestration via scrape.do
     # ------------------------------------------------------------------
 
-    async def _scrappey_fetch(
-        self,
-        client: httpx.AsyncClient,
-        target_url: str,
-        min_len: int = _MIN_VALID_HTML_LEN,
-        session: Optional[str] = None,
+    async def _fetch_page(
+        self, client: Any, target_url: str, session: Optional[str] = None
     ) -> Optional[str]:
-        """POST к Scrappey с retry, возвращает HTML response от target_url.
+        """Один scrape.do вызов (render+super_proxy, geo=ru) с собственным retry внутри scrapedo_fetch.
 
-        Ozon иногда отдаёт обрезанную SPA-страницу (10KB без SSR data),
-        особенно при долгих запросах. Retry 1 раз если content слишком короткий.
+        scrapedo_fetch сам ретраит транзиентные 429/5xx (backoff 2/4/8s) и сам
+        проверяет минимальную длину тела — здесь никакого дополнительного
+        retry-обёртывания не нужно. HTML SSR-парсинг ниже по файлу не меняется.
 
-        Fail-fast per-attempt timeout (_SCRAPPEY_PER_ATTEMPT_TIMEOUT): a hung
-        Scrappey proxy call is capped at 30s per attempt. On asyncio.TimeoutError
-        we retry once (total _SCRAPPEY_MAX_ATTEMPTS=2). This prevents a single
-        proxy hang from consuming the whole 80s budget and surrendering the product.
-
-        Возвращает None если все попытки fail.
+        Возвращает HTML-контент страницы или None при неудаче.
+        Параметры client и session принимаются для backward-compat с существующими
+        call-sites/тестами, но игнорируются — scrape.do использует свой внутренний
+        httpx-клиент и не поддерживает session-reuse в этой интеграции.
         """
-        _RETRY_DELAYS = (2.0, 2.0, 4.0)  # backoff seconds для попыток 1, 2, 3
-        timeout_attempts = 0  # track how many times we hit asyncio.TimeoutError
-
-        for attempt in range(_MAX_RETRIES + 1):
-            try:
-                content = await asyncio.wait_for(
-                    self._scrappey_fetch_once(client, target_url, session),
-                    timeout=_SCRAPPEY_PER_ATTEMPT_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                timeout_attempts += 1
-                logger.warning(
-                    "[OzonCard] scrappey-attempt-%d-timeout (%.0fs) for %s",
-                    attempt + 1, _SCRAPPEY_PER_ATTEMPT_TIMEOUT, target_url[:80],
-                )
-                if timeout_attempts < _SCRAPPEY_MAX_ATTEMPTS:
-                    logger.info(
-                        "[OzonCard] scrappey-retry attempt %d/%d for %s",
-                        timeout_attempts + 1, _SCRAPPEY_MAX_ATTEMPTS, target_url[:80],
-                    )
-                    await asyncio.sleep(2.0)
-                    continue
-                logger.warning(
-                    "[OzonCard] all-scrappey-attempts-timed-out (%d/%d) for %s — giving up",
-                    timeout_attempts, _SCRAPPEY_MAX_ATTEMPTS, target_url[:80],
-                )
-                return None
-            if content is None:
-                # Hard fail (network/SSL, HTTP4xx, DataDome) — retry с backoff
-                if attempt < _MAX_RETRIES:
-                    delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
-                    logger.info(
-                        "[OzonCard] retry #%d (hard fail, backoff %.0fs) %s",
-                        attempt + 1, delay, target_url[:80],
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                return None
-            if len(content) < min_len:
-                # Soft fail — короткий HTML, бывает = пустая SPA. Retry.
-                if attempt < _MAX_RETRIES:
-                    delay = _RETRY_DELAYS[min(attempt, len(_RETRY_DELAYS) - 1)]
-                    logger.info(
-                        "[OzonCard] retry #%d (short %d chars, backoff %.0fs) %s",
-                        attempt + 1, len(content), delay, target_url[:80],
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                logger.info(
-                    "[OzonCard] final HTML still too short (%d chars) for %s",
-                    len(content), target_url[:80],
-                )
-                return None
-            return content
+        _ = client
+        _ = session
+        res = await scrapedo_fetch(target_url, render=True, super_proxy=True, geo="ru")
+        if res.success and res.content and not _is_datadome_block(res.content):
+            logger.info(
+                "[OzonCard] scrape.do success (%d chars, credits=%s) for %s",
+                len(res.content), res.credits_used, target_url[:80],
+            )
+            return res.content
+        logger.info(
+            "[OzonCard] scrape.do failed (success=%s, err=%s) for %s",
+            res.success, res.error, target_url[:80],
+        )
         return None
-
-    async def _scrappey_fetch_once(
-        self,
-        client: httpx.AsyncClient,
-        target_url: str,
-        session: Optional[str] = None,
-    ) -> Optional[str]:
-        """Один POST к Scrappey, без retry."""
-        payload = _build_scrappey_payload(target_url, session)
-        try:
-            r = await client.post(
-                _SCRAPPEY_ENDPOINT,
-                params={"key": self._scrappey_key},
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-        except (
-            ssl.SSLError,
-            httpx.ConnectError,
-            httpx.RemoteProtocolError,
-            httpx.TransportError,
-            httpx.TimeoutException,
-            httpx.HTTPError,
-        ) as exc:
-            logger.info("[OzonCard] Scrappey network/SSL err (transient): %s", exc)
-            # Возвращаем специальный sentinel чтобы _scrappey_fetch сделал retry
-            # с backoff. None означает hard-fail (см. _scrappey_fetch).
-            # Используем тот же None — caller уже retry-ует на None.
-            return None
-
-        if r.status_code >= 400:
-            logger.warning(
-                "[OzonCard] Scrappey HTTP %s for %s — skip (body[:200]=%s)",
-                r.status_code, target_url[:80], r.text[:200],
-            )
-            return None
-
-        try:
-            envelope = r.json()
-        except (ValueError, json.JSONDecodeError):
-            logger.info("[OzonCard] Scrappey returned non-json envelope")
-            return None
-
-        solution = envelope.get("solution") or {}
-        upstream_status = solution.get("statusCode")
-        content = solution.get("response") or ""
-
-        if not content:
-            logger.info(
-                "[OzonCard] Scrappey empty content (upstream=%s) for %s",
-                upstream_status, target_url[:80],
-            )
-            return None
-
-        # Scrappey omits statusCode (None) for some sites but still returns real
-        # HTML (verified=True). Only reject explicit non-200 upstream codes.
-        if upstream_status is not None and upstream_status != 200:
-            logger.info(
-                "[OzonCard] upstream HTTP %s for %s — likely block",
-                upstream_status, target_url[:80],
-            )
-            return None
-
-        if _is_datadome_block(content):
-            logger.info(
-                "[OzonCard] DataDome challenge in response for %s",
-                target_url[:80],
-            )
-            return None
-
-        return content
 
     async def _fetch_card_raw(
         self,
         context: ExtractionContext,
-        client: httpx.AsyncClient,
+        client: Any = None,
     ) -> dict:
         """Внутренний helper: search → match → /features/ → сырые характеристики.
 
@@ -1231,13 +1083,13 @@ class OzonCardSource(AttributeSource):
         if fallback_query and fallback_query != primary_query:
             queries_to_try.append(fallback_query)
 
-        # Общая Scrappey-session на оба вызова (search+features): прогретая антибот-кука
-        # переиспользуется, не проходим Qrator заново каждым запросом. Дефолт OFF
-        # (_SCRAPPEY_SESSION_REUSE) — включается под измерительный прогон.
-        session = uuid.uuid4().hex if _SCRAPPEY_SESSION_REUSE else None
+        # scrape.do не использует session-reuse в этой интеграции — параметр оставлен
+        # для сигнатур-совместимости нижестоящих вызовов _fetch_page/_try_serper_card,
+        # всегда None.
+        session = None
 
         # Serper-FIRST: пробуем Google-card ДО флакового внутреннего поиска Ozon.
-        # Успех → 1 Scrappey-фетч (/features/) вместо search+features → меньше троттла.
+        # Успех → 1 scrape.do-фетч (/features/) вместо search+features → меньше троттла.
         # serper_tried гасит повторный Serper-вызов в фоллбэках ниже.
         serper_tried = False
         if _OZON_SERPER_FIRST and _OZON_SERPER_CARD_FINDING:
@@ -1254,7 +1106,7 @@ class OzonCardSource(AttributeSource):
                 "[OzonCard] search query: '%s' (was: '%s')",
                 q, full_name[:80],
             )
-            html = await self._scrappey_fetch(client, f"{_OZON_SEARCH_URL}?text={q}", session=session)
+            html = await self._fetch_page(client, f"{_OZON_SEARCH_URL}?text={q}", session=session)
             if html is None:
                 continue
             parsed = self._parse_search_tiles_html(html)
@@ -1296,7 +1148,7 @@ class OzonCardSource(AttributeSource):
         # re-score; keep the better of the two attempts. The hard total timeout
         # (_OZON_CARD_TOTAL_TIMEOUT) still bounds the whole _do_extract.
         if (top_tile is None or mode == "skip") and query is not None:
-            retry_html = await self._scrappey_fetch(client, f"{_OZON_SEARCH_URL}?text={query}", session=session)
+            retry_html = await self._fetch_page(client, f"{_OZON_SEARCH_URL}?text={query}", session=session)
             if retry_html is not None:
                 retry_tiles = self._parse_search_tiles_html(retry_html)
                 if retry_tiles:
@@ -1363,7 +1215,7 @@ class OzonCardSource(AttributeSource):
 
         # ---- FEATURES (HTML SSR) ----
         features_url = f"{_OZON_PRODUCT_BASE}{slug}-{pid}/features/"
-        features_html = await self._scrappey_fetch(client, features_url, session=session)
+        features_html = await self._fetch_page(client, features_url, session=session)
         if features_html is None:
             return {
                 "query": used_query,
@@ -1424,11 +1276,7 @@ class OzonCardSource(AttributeSource):
           }
         """
         try:
-            async with httpx.AsyncClient(
-                timeout=_HTTP_TIMEOUT,
-                follow_redirects=True,
-            ) as client:
-                raw = await self._fetch_card_raw(context, client)
+            raw = await self._fetch_card_raw(context, None)
         except Exception as exc:
             return {
                 "query": "",
@@ -1462,51 +1310,47 @@ class OzonCardSource(AttributeSource):
         targets: list[TargetAttribute],
     ) -> list[AttributeValue]:
         """Полный flow: search HTML → match → /features/ HTML → map → AVs."""
-        async with httpx.AsyncClient(
-            timeout=_HTTP_TIMEOUT,
-            follow_redirects=True,
-        ) as client:
-            raw = await self._fetch_card_raw(context, client)
+        raw = await self._fetch_card_raw(context, None)
 
-            if raw["stage"] != "ok":
-                # Scrappey недоступен/пуст (no_tiles / fetch_fail / parse_empty / low_match).
-                # БЕСПЛАТНАЯ подстраховка: Serper-сниппет Ozon-страницы. Не трогает
-                # Scrappey-путь — срабатывает ТОЛЬКО на его нулевом результате.
-                logger.info(
-                    "[OzonCard] Scrappey-путь дал stage=%s (0 chars) → snippet-fallback",
-                    raw["stage"],
-                )
-                return await self._serper_snippet_fallback(context, targets)
-
-            chars = raw["raw_chars"]
-            top_score = raw["match_score"] or 0.0
-            mode = raw["match_class"]
-            title = raw.get("card_title") or ""
-
-            # ---- IMAGES (для downstream VisionSource) ----
-            # Mutating context.image_urls — pipeline передаёт context по ссылке
-            # между stages, поэтому Stage 3 (VisionSource) увидит эти фотки
-            # на товарах где OzonCard нашёл tile. Vision дополнит «визуальные»
-            # attrs (цвет, RGB-подсветка, форм-фактор) которые сложно достать
-            # из текста характеристик.
-            new_image_urls = raw["image_urls"]
-            if new_image_urls:
-                existing = set(context.image_urls or [])
-                added = [u for u in new_image_urls if u not in existing]
-                if added:
-                    context.image_urls = list(context.image_urls or []) + added
-                    logger.info(
-                        "[OzonCard] +%d image URLs для VisionSource",
-                        len(added),
-                    )
-
-            # ---- MAP & EMIT ----
-            return self._map_characteristics(
-                chars, targets, context, mode, title, top_score,
+        if raw["stage"] != "ok":
+            # scrape.do недоступен/пуст (no_tiles / fetch_fail / parse_empty / low_match).
+            # БЕСПЛАТНАЯ подстраховка: Serper-сниппет Ozon-страницы. Не трогает
+            # scrape.do-путь — срабатывает ТОЛЬКО на его нулевом результате.
+            logger.info(
+                "[OzonCard] scrape.do-путь дал stage=%s (0 chars) → snippet-fallback",
+                raw["stage"],
             )
+            return await self._serper_snippet_fallback(context, targets)
+
+        chars = raw["raw_chars"]
+        top_score = raw["match_score"] or 0.0
+        mode = raw["match_class"]
+        title = raw.get("card_title") or ""
+
+        # ---- IMAGES (для downstream VisionSource) ----
+        # Mutating context.image_urls — pipeline передаёт context по ссылке
+        # между stages, поэтому Stage 3 (VisionSource) увидит эти фотки
+        # на товарах где OzonCard нашёл tile. Vision дополнит «визуальные»
+        # attrs (цвет, RGB-подсветка, форм-фактор) которые сложно достать
+        # из текста характеристик.
+        new_image_urls = raw["image_urls"]
+        if new_image_urls:
+            existing = set(context.image_urls or [])
+            added = [u for u in new_image_urls if u not in existing]
+            if added:
+                context.image_urls = list(context.image_urls or []) + added
+                logger.info(
+                    "[OzonCard] +%d image URLs для VisionSource",
+                    len(added),
+                )
+
+        # ---- MAP & EMIT ----
+        return self._map_characteristics(
+            chars, targets, context, mode, title, top_score,
+        )
 
     # ------------------------------------------------------------------
-    # HTML parsing (Scrappey HTML pages)
+    # HTML parsing (scrape.do HTML pages)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -1571,7 +1415,9 @@ class OzonCardSource(AttributeSource):
         """Извлекает характеристики из /features/ HTML.
 
         Ozon рендерит каждый widget с `<div id="state-webCharacteristics-..."
-        data-state='<JSON>'>`. JSON структура:
+        data-state='<JSON>'>` (старая разметка, одинарная кавычка) ИЛИ
+        `data-state="<HTML-escaped JSON>"` (новая разметка, двойная кавычка ---
+        `html.unescape()` применяется перед `json.loads`). JSON структура:
           {"link":"...","characteristics":[
               {"short":[{key,name,values:[{text,id}]}],
                "long":[...], "full":[...]}
@@ -1582,7 +1428,12 @@ class OzonCardSource(AttributeSource):
         """
         out: list[dict] = []
         seen: set[str] = set()
-        for raw in _FEATURES_STATE_RE.findall(html):
+        for match in _FEATURES_STATE_RE.finditer(html):
+            raw = (
+                match.group(1)
+                if match.group(1) is not None
+                else _html.unescape(match.group(2))
+            )
             try:
                 data = json.loads(raw)
             except (ValueError, json.JSONDecodeError):
@@ -1728,11 +1579,11 @@ class OzonCardSource(AttributeSource):
     async def _try_serper_card(
         self,
         context: ExtractionContext,
-        client: httpx.AsyncClient,
+        client: Any = None,
         session: Optional[str] = None,
     ) -> Optional[dict]:
         """Serper-assisted card-finding: URL товара через Google (в обход флакового
-        поиска Ozon) → Scrappey-фетч /features/ → parse полной карточки.
+        поиска Ozon) → scrape.do-фетч /features/ → parse полной карточки.
 
         Гард: Serper-карточка проходит ТОТ ЖЕ _pick_best_match/_classify_match скоринг,
         что и Ozon-tile — чужой бренд/тип/модель уходит ниже порога → отвергаем (пусто
@@ -1777,7 +1628,7 @@ class OzonCardSource(AttributeSource):
             "card_title": title,
         }
         features_url = f"{_OZON_PRODUCT_BASE}{slug}-{pid}/features/"
-        features_html = await self._scrappey_fetch(client, features_url, session=session)
+        features_html = await self._fetch_page(client, features_url, session=session)
         if features_html is None:
             return {**base, "raw_chars": [], "image_urls": [], "stage": "fetch_fail"}
 
@@ -1795,7 +1646,7 @@ class OzonCardSource(AttributeSource):
         targets: list[TargetAttribute],
     ) -> list[AttributeValue]:
         """БЕСПЛАТНАЯ подстраховка: достать ключевые характеристики из
-        Serper-сниппета Ozon-страницы, когда Scrappey мёртв/пуст.
+        Serper-сниппета Ozon-страницы, когда scrape.do мёртв/пуст.
 
         Поток:
           1. Serper-запрос «<product_name> ozon» → из organic вытащить ссылку
@@ -1970,7 +1821,8 @@ class OzonCardSource(AttributeSource):
             # Пример: query «Куртка The North Face» + tile «Шорты The North Face» →
             #   cat_leaf_low «куртка» не входит в «шорты the north face» → штраф.
             # Для электроники с артикулом (q_models непустое) штраф не срабатывает.
-            if cat_leaf_low and not q_models and cat_leaf_low not in title.lower():
+            if (cat_leaf_low and not q_models
+                    and not _category_present_in_title(cat_leaf_low, title.lower())):
                 score -= _TYPE_MISMATCH_PENALTY
             # Гендер-штраф: имя товара несёт явный пол И заголовок карточки несёт
             # ПРОТИВОРЕЧАЩИЙ пол (мужской vs женский) → карточка не того гендера
