@@ -871,6 +871,34 @@ def _brand_conflict(query_brand: Optional[str], query_name: str, card_title: str
     return bool(conflicting)
 
 
+# ---------------------------------------------------------------------------
+# Model-conflict guard (FIX-15, sibling of _brand_conflict) -- tier-0 authored
+# ---------------------------------------------------------------------------
+
+_VARIANT_MODIFIERS = {"pro", "max", "plus", "ultra", "lite", "mini", "neo", "note", "air", "se", "fe", "prime"}
+_MODEL_CONFLICT_PENALTY = 60.0
+
+def _conflict_codes(s: str) -> set[str]:
+    """Извлекает токены, содержащие одновременно буквы и цифры — потенциальные коды моделей."""
+    tokens = re.findall(r'[A-Za-z0-9]+', (s or "").lower())
+    return {t for t in tokens if any(c.isalpha() for c in t) and any(c.isdigit() for c in t)}
+
+def _variant_mods(s: str) -> set[str]:
+    """Возвращает пересечение токенов строки с известными модификаторами моделей (pro, max и т.д.)."""
+    tokens = set(re.findall(r'[A-Za-z0-9]+', (s or "").lower()))
+    return tokens & _VARIANT_MODIFIERS
+
+def _model_conflict(query: str, title: str) -> bool:
+    """Проверяет конфликт моделей: разные коды или одинаковый код с разными модификаторами."""
+    qc = _conflict_codes(query)
+    tc = _conflict_codes(title)
+    if qc and tc and (qc - tc) and (tc - qc):
+        return True
+    if (qc & tc) and _variant_mods(query) != _variant_mods(title):
+        return True
+    return False
+
+
 def _normalize_model(product_name: str, brand: Optional[str]) -> str:
     """Убирает generic-префиксы и бренд, lowercase, для cache key."""
     result = product_name.strip()
@@ -1834,6 +1862,9 @@ class OzonCardSource(AttributeSource):
             # чужого бренда. Крупный штраф (60) гарантирует уход ниже порога.
             if _brand_conflict(query_brand, query_name or query, title):
                 score -= _BRAND_MISMATCH_PENALTY
+            # FIX-15: model-conflict guard (sibling-of-same-brand)
+            if _model_conflict(query, title):
+                score -= _MODEL_CONFLICT_PENALTY
             # Per-tile score logging under existing instrumentation — makes the
             # best-of-top-N selection (chosen tile + its score) visible run-to-run,
             # so SSR ordering jitter can be confirmed/diagnosed.
