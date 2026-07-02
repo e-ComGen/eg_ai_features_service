@@ -42,9 +42,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
+import urllib.parse
 from collections import OrderedDict
 from typing import Any, Optional, Union
 
@@ -84,7 +86,7 @@ from app.services.enrichment.strategies.dictionaries.unit_normalizer import (
     normalize_value as _normalize_unit_value,
 )
 from app.services.enrichment.size_normalizer import extract_wb_sizes
-from app.services.providers.factory import get_web_search_client
+from app.services.providers.scrapedo_client import scrapedo_fetch
 from app.services.enrichment.sources.donor_gate import DonorMatchGate
 
 logger = logging.getLogger(__name__)
@@ -249,17 +251,31 @@ _BASKET_THRESHOLDS: list[tuple[int, str]] = [
     (3053, "18"),
     (3473, "19"),
     (3793, "20"),
+    (4050, "21"),
+    (4306, "22"),
+    (4563, "23"),
+    (4820, "24"),
+    (5076, "25"),
+    (5333, "26"),
+    (5590, "27"),
+    (5846, "28"),
+    (6103, "29"),
+    (6359, "30"),
+    (6616, "31"),
+    (6873, "32"),
+    (7129, "33"),
+    (7386, "34"),
+    (7643, "35"),
+    (7899, "36"),
+    (8156, "37"),
 ]
-# vol >= 3794 → basket-21. Полный список NN для brute-force перебора на 404.
-_BASKET_DEFAULT = "21"
-_ALL_BASKET_NN: list[str] = [f"{n:02d}" for n in range(1, 22)]  # 01..21
-
-# Regex для извлечения nm_id из ссылки на карточку WB.
-# Покрывает .ru/.ge/.am/.by зеркала и относительные ссылки.
-_NM_ID_RE = re.compile(
-    r"(?:wildberries\.\w+/catalog/|/catalog/)(\d{6,12})/detail\.aspx",
-    re.IGNORECASE,
-)
+# vol > 8156 → fallback basket-37 (последний живой якорь, проба 2026-07-02:
+# nm_id 815621985/823775519/823776306, vol 8156, все на basket-37). Полный
+# список NN для brute-force перебора на 404 расширен до 01..40 (каталог
+# растёт быстрее таблицы — range покрывает корректность, таблица только
+# сокращает латентность primary-попытки).
+_BASKET_DEFAULT = "37"
+_ALL_BASKET_NN: list[str] = [f"{n:02d}" for n in range(1, 41)]  # 01..40
 
 # Chrome User-Agent для CDN GET (CDN не банит, но без UA иногда 403).
 _CHROME_UA = (
@@ -268,8 +284,7 @@ _CHROME_UA = (
 )
 
 _HTTP_TIMEOUT = 15.0
-_SERPER_NUM_RESULTS = 10
-_MAX_CANDIDATES = 10  # топ-N уникальных nm_id из Serper (многие дадут 404)
+_MAX_CANDIDATES = 10  # топ-N уникальных nm_id из scrape.do search.wb.ru (многие дадут 404)
 
 # Ретрай Serper-поиска. Serper флакает при concurrency (троттлинг, пустые
 # ответы): один и тот же запрос то даёт 10 nm_id, то 0. Если поиск вернул 0
@@ -552,6 +567,31 @@ def _basket_nn_from_table(nm_id: int) -> str:
     return _BASKET_DEFAULT
 
 
+def _parse_wb_search_json(content: str) -> Optional[dict]:
+    """Робастный парсинг JSON-ответа search.wb.ru: чистый JSON либо JSON внутри HTML-обёртки.
+
+    Сначала пробует прямой ``json.loads``. Если содержимое обёрнуто (HTML/
+    мусор вокруг JSON-тела), вырезает подстроку от первого ``{`` до
+    последнего ``}`` и пробует распарсить её. Возвращает ``None``, если оба
+    варианта не удались (или content пуст / без JSON-тела вообще).
+    """
+    if not content:
+        return None
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+
+    start = content.find("{")
+    end = content.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        return json.loads(content[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
 def _build_wb_article_query(article: str, brand: Optional[str]) -> str:
     """Строит Serper-запрос, ПРИВЯЗАННЫЙ к артикулу производителя.
 
@@ -717,26 +757,15 @@ class WbCardSource(AttributeSource):
         web_search_client: Any = None,
         **kwargs: Any,
     ):
-        _ = kwargs  # backward-compat (старые коды передавали scrappey_key и т.п.)
+        """Инициализация WbCardSource.
 
-        # Serper-клиент для поиска nm_id. Лениво создаём через factory, если не
-        # передан явно. Если SERPER_API_KEY не задан — factory кинет/вернёт None,
-        # extract() тогда всегда вернёт [].
-        self._search_client = web_search_client
-        if self._search_client is None:
-            try:
-                self._search_client = get_web_search_client()
-            except Exception as exc:  # SERPER_API_KEY не задан и т.п.
-                logger.warning(
-                    "[WbCard] web search client недоступен (%s) — extract() вернёт [].",
-                    exc,
-                )
-                self._search_client = None
-        if self._search_client is None:
-            logger.warning(
-                "[WbCard] SERPER не сконфигурирован (PROVIDER_WEB_SEARCH != 'serper' "
-                "или нет ключа) — extract() всегда вернёт []."
-            )
+        Поиск nm_id теперь идёт через stateless модульную функцию
+        ``scrapedo_fetch`` (scrape.do + search.wb.ru) — экземпляр больше не
+        хранит search-клиент. ``web_search_client``/``**kwargs`` — легаси-
+        параметры обратной совместимости (старые вызовы/тесты передавали
+        Serper-клиент или scrappey_key) — принимаются и игнорируются.
+        """
+        _ = web_search_client, kwargs  # backward-compat, транспорт теперь stateless
 
         self._judge = WbCardJudge()
         # LRU cache: (brand_lower, model_lower) → list[AttributeValue]
@@ -749,10 +778,9 @@ class WbCardSource(AttributeSource):
         return Source.WB_CARD
 
     def is_applicable(self, context: ExtractionContext, target: TargetAttribute) -> bool:
-        """Применим если product_name достаточный и search-клиент доступен."""
+        """Применим если product_name достаточный (поиск — stateless scrape.do)."""
         return bool(
-            self._search_client
-            and context.product_name
+            context.product_name
             and len(context.product_name.strip()) >= 5
         )
 
@@ -762,7 +790,7 @@ class WbCardSource(AttributeSource):
         targets: list[TargetAttribute],
         already_filled: Optional[list[AttributeValue]] = None,
     ) -> list[AttributeValue]:
-        if not targets or not context.product_name or not self._search_client:
+        if not targets or not context.product_name:
             return []
 
         already_filled = already_filled or []
@@ -1087,72 +1115,71 @@ class WbCardSource(AttributeSource):
         return []
 
     async def _search_once(self, query: str) -> list[int]:
-        """Одна Serper-попытка → список уникальных nm_id (top-N).
+        """Одна попытка поиска nm_id через scrape.do + search.wb.ru.
 
-        Запрос ``site:wildberries.ru <query> detail.aspx`` даёт ~100% прямых
-        ссылок на карточки WB. Раньше использовался ``inurl:catalog
-        detail.aspx`` — Google игнорит ``inurl:`` НЕДЕТЕРМИНИРОВАННО (~40-50%
-        запросов возвращали общую выдачу без WB-ссылок → 0 nm_id). ``site:``
-        стабилен. Предпочитаем домен wildberries.ru, зеркала — fallback.
+        Запрос уходит напрямую в поисковый API search.wb.ru (БЕЗ site:/
+        detail.aspx Serper-операторов — query подаётся чистый, как строит
+        query-builder, с тип-словом). Транспорт — scrape.do (residential RU
+        proxy): прямой запрос с серверного IP ловит 429, через scrape.do
+        отдаёт до 100 товаров/10 кредитов (проба 2026-07-02). Ответ
+        парсится робастно (``_parse_wb_search_json``): либо чистый JSON,
+        либо JSON внутри HTML-обёртки. nm_id берутся из
+        ``data["products"][].id``, сохраняя порядок (search.wb.ru уже
+        сортирует по popular), дедуп, обрезка до _MAX_CANDIDATES.
+
+        Любой сбой/пустой результат (нет токена, транспортная ошибка,
+        нераспарсенный JSON, 0 products) → graceful ``[]`` (никогда не
+        поднимает исключение; выше по стеку это fallback для `_search`,
+        не падение).
         """
-        serper_query = f"site:wildberries.ru {query} detail.aspx".strip()
-        try:
-            results = await self._search_client.search(
-                serper_query, num_results=_SERPER_NUM_RESULTS
-            )
-        except Exception as exc:
-            # Non-transport 4xx (400 «Not enough credits»/401/403) — непреходящая:
-            # пробрасываем как _EgPermanentSearchError, чтобы _search не жёг
-            # бэкофф-ретраи. Прочие (429/5xx/таймаут/коннект) → транзиентные,
-            # деградируем к [] и _search ретраит как раньше.
-            if _eg_is_permanent_4xx(exc):
-                raise _EgPermanentSearchError(str(exc)) from exc
-            # Инструментация: транзиентная ошибка (429/5xx/таймаут/коннект).
-            # Логируем HTTP-статус (если есть) для per-attempt-видимости флака.
-            _resp = getattr(exc, "response", None)
-            _status = getattr(_resp, "status_code", None)
+        encoded_query = urllib.parse.quote(query)
+        url = (
+            "https://search.wb.ru/exactmatch/ru/common/v5/search"
+            f"?appType=1&curr=rub&dest=-1257786&query={encoded_query}"
+            "&resultset=catalog&sort=popular&spp=30"
+        )
+        res = await scrapedo_fetch(url, render=False, super_proxy=True, geo="ru")
+        if not res.success or not res.content:
             logger.info(
-                "[WbCard] Serper attempt: q='%s' http=%s err=%s (transient)",
-                serper_query[:120],
-                _status if _status is not None else "n/a",
-                exc,
+                "[WbCard] scrape.do search: q='%s' success=%s status=%s credits=%s err=%s",
+                query[:120], res.success, res.status_code, res.credits_used, res.error,
             )
             return []
 
-        organic = getattr(results, "organic_results", None) or []
-        # Инструментация (PERMANENT, production-safe): на УСПЕШНОЙ Serper-попытке
-        # ответ — HTTP 200 (serper_client.raise_for_status уже прошёл; иначе сюда
-        # не дошли бы). Логируем per-attempt query + http=200 + organic-count ДО
-        # извлечения nm_id, чтобы zero-флак (200, но 0 organic) был виден в проде
-        # отдельно от «200, organic есть, но 0 nm_id». Дёшево, без PII, без prints.
-        logger.info(
-            "[WbCard] Serper attempt: q='%s' http=200 organic=%d",
-            serper_query[:120], len(organic),
-        )
+        data = _parse_wb_search_json(res.content)
+        if data is None:
+            logger.info(
+                "[WbCard] scrape.do search: q='%s' JSON parse failed", query[:120],
+            )
+            return []
 
-        # Собираем (nm_id, prefer_ru) в порядке появления, дедуп.
-        ordered_main: list[int] = []   # с wildberries.ru
-        ordered_mirror: list[int] = []  # зеркала / относительные
+        products = data.get("products") or []
+        if not isinstance(products, list):
+            products = []
+
         seen: set[int] = set()
-        for item in organic:
-            link = getattr(item, "link", "") or ""
-            m = _NM_ID_RE.search(link)
-            if not m:
+        nm_ids: list[int] = []
+        for p in products:
+            if not isinstance(p, dict):
+                continue
+            raw_id = p.get("id")
+            if raw_id is None:
                 continue
             try:
-                nm_id = int(m.group(1))
-            except (ValueError, TypeError):
+                nm_id = int(raw_id)
+            except (TypeError, ValueError):
                 continue
             if nm_id in seen:
                 continue
             seen.add(nm_id)
-            if "wildberries.ru" in link.lower():
-                ordered_main.append(nm_id)
-            else:
-                ordered_mirror.append(nm_id)
+            nm_ids.append(nm_id)
+            if len(nm_ids) >= _MAX_CANDIDATES:
+                break
 
-        nm_ids = (ordered_main + ordered_mirror)[:_MAX_CANDIDATES]
-        logger.info("[WbCard] Serper → %d уникальных nm_id: %s", len(nm_ids), nm_ids)
+        logger.info(
+            "[WbCard] scrape.do search: q='%s' status=%s credits=%s products=%d -> %d nm_id: %s",
+            query[:120], res.status_code, res.credits_used, len(products), len(nm_ids), nm_ids,
+        )
         return nm_ids
 
     async def _fetch_card(

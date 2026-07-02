@@ -11,8 +11,9 @@ Covers:
            chars bypass the fallback entirely.
 """
 
+import urllib.parse
+
 import numpy as np
-import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -28,6 +29,19 @@ from app.services.enrichment.sources.wb_card_source import (
     _BRAND_LINE_THRESHOLD,
 )
 
+import app.services.enrichment.sources.wb_card_source as mod
+
+
+class FakeScrapflyResult:
+    """Mock stand-in for ScrapflyResult (scrapedo_fetch return value)."""
+
+    def __init__(self, success, content, status_code=200, credits_used=10, error=None):
+        self.success = success
+        self.content = content
+        self.status_code = status_code
+        self.credits_used = credits_used
+        self.error = error
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -35,14 +49,6 @@ from app.services.enrichment.sources.wb_card_source import (
 
 def _make_source(search_client) -> WbCardSource:
     return WbCardSource(web_search_client=search_client)
-
-
-def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
-    request = httpx.Request("POST", "https://google.serper.dev/search")
-    response = httpx.Response(status_code, request=request, text="Not enough credits")
-    return httpx.HTTPStatusError(
-        f"{status_code} error", request=request, response=response
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -122,186 +128,152 @@ def test_regression_declinable_type_word_unchanged(name, leaf, expected_lemma):
 
 
 # ---------------------------------------------------------------------------
-# BUG 2 — permanent 4xx fails fast; transient errors still retry
+# FIX-13-WB: search transport swapped Serper -> scrape.do + search.wb.ru.
+# Permanent-4xx-fail-fast (Serper-specific: _EgPermanentSearchError raised from
+# HTTPStatusError) is DROPPED here — scrapedo_fetch never raises, it always
+# returns a ScrapflyResult(success=False, ...) on any transport failure, so
+# _search's retry-on-empty loop (unchanged) is the only layer left. The old
+# test_permanent_400/401/403_* and test_permanent_4xx_no_retry_even_with_zero_layer
+# tested a capability that no longer exists at this layer and are removed.
+# test_transient_timeout/503/429_still_retries collapse into ONE test below
+# (test_scrapedo_persistent_failure_still_retries) since scrape.do abstracts
+# the underlying HTTP status away from the caller.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.asyncio
-async def test_permanent_400_fails_fast_single_attempt():
-    """Serper HTTP 400 (no credits) → exactly ONE search call, no backoff/retry."""
-    client = MagicMock()
-    client.search = AsyncMock(side_effect=_http_status_error(400))
-    src = _make_source(client)
-
-    result = await src._search("Худи Nike detail.aspx")
-
-    assert result == []
-    assert client.search.await_count == 1, (
-        f"permanent 4xx must NOT retry; got {client.search.await_count} attempts"
-    )
-
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [401, 403])
-async def test_permanent_4xx_variants_fail_fast(status):
-    client = MagicMock()
-    client.search = AsyncMock(side_effect=_http_status_error(status))
-    src = _make_source(client)
-
-    assert await src._search("q") == []
-    assert client.search.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_transient_timeout_still_retries():
-    """A transient timeout exhausts all attempts (retry behavior preserved)."""
-    client = MagicMock()
-    client.search = AsyncMock(side_effect=httpx.TimeoutException("read timeout"))
-    src = _make_source(client)
-
-    # Patch sleep so the test doesn't actually wait on the backoff.
-    import app.services.enrichment.sources.wb_card_source as mod
-    orig_sleep = mod.asyncio.sleep
-    mod.asyncio.sleep = AsyncMock()
+async def test_inv13a_search_once_returns_ordered_deduped_nm_ids():
+    """INV-13a: mocked scrapedo_fetch (search.wb.ru JSON) -> ordered, deduped top-N nm_id."""
+    orig = mod.scrapedo_fetch
+    mod.scrapedo_fetch = AsyncMock(return_value=FakeScrapflyResult(
+        success=True,
+        content='{"products":[{"id":815621985},{"id":823775519},'
+                '{"id":815621985},{"id":823776306}]}',
+    ))
     try:
-        result = await src._search("q")
+        src = mod.WbCardSource()
+        result = await src._search_once("poco x6 5g")
+        assert result == [815621985, 823775519, 823776306], (
+            f"expected ordered dedup top-N; got {result}"
+        )
+        assert mod.scrapedo_fetch.await_count == 1
     finally:
-        mod.asyncio.sleep = orig_sleep
-
-    assert result == []
-    assert client.search.await_count == _SERPER_MAX_ATTEMPTS, (
-        "transient error must still retry up to _SERPER_MAX_ATTEMPTS"
-    )
+        mod.scrapedo_fetch = orig
 
 
 @pytest.mark.asyncio
-async def test_transient_503_still_retries():
-    """HTTP 503 (server error) is transient → retried, not failed fast."""
-    client = MagicMock()
-    client.search = AsyncMock(side_effect=_http_status_error(503))
-    src = _make_source(client)
-
-    import app.services.enrichment.sources.wb_card_source as mod
-    orig_sleep = mod.asyncio.sleep
-    mod.asyncio.sleep = AsyncMock()
+async def test_inv13b_search_once_parses_json_wrapped_in_html():
+    """INV-13b: JSON wrapped in an HTML envelope is still robustly extracted."""
+    orig = mod.scrapedo_fetch
+    mod.scrapedo_fetch = AsyncMock(return_value=FakeScrapflyResult(
+        success=True,
+        content='<html><body>junk {"products":[{"id":999888777}]} trailing</body></html>',
+    ))
     try:
-        result = await src._search("q")
+        src = mod.WbCardSource()
+        result = await src._search_once("test query")
+        assert result == [999888777]
     finally:
-        mod.asyncio.sleep = orig_sleep
-
-    assert result == []
-    assert client.search.await_count == _SERPER_MAX_ATTEMPTS
+        mod.scrapedo_fetch = orig
 
 
-class _FakeResults:
-    """Minimal stand-in for SerperResults (source reads .organic_results)."""
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scrapedo_result", [
+    FakeScrapflyResult(success=False, content=None, status_code=None,
+                        credits_used=0, error="not configured"),
+    FakeScrapflyResult(success=True, content=""),
+])
+async def test_inv13c_search_once_scrapedo_failure_returns_empty(scrapedo_result):
+    """INV-13c: scrapedo_fetch fail (success=False) or empty content -> [] (no exception)."""
+    orig = mod.scrapedo_fetch
+    mod.scrapedo_fetch = AsyncMock(return_value=scrapedo_result)
+    try:
+        src = mod.WbCardSource()
+        result = await src._search_once("test")
+        assert result == []
+    finally:
+        mod.scrapedo_fetch = orig
 
-    def __init__(self, organic):
-        self.organic_results = organic
 
+@pytest.mark.asyncio
+async def test_inv13d_fetch_card_finds_basket_37():
+    """INV-13d: extended _ALL_BASKET_NN (01..40) brute-forces to basket-37 (was capped at 21)."""
+    src = mod.WbCardSource()
+    client = AsyncMock()
+    nm_id = 100000000  # vol=1000 -> primary_nn from table is NOT "37" (proves brute-force)
+    assert mod._basket_nn_from_table(nm_id) != "37"
 
-class _FakeOrganic:
-    """Minimal stand-in for OrganicResult (source reads .link)."""
+    async def fake_try_basket(client, nn, nm_id):
+        return {"nm_id": nm_id} if nn == "37" else None
 
-    def __init__(self, link):
-        self.link = link
+    with patch.object(src, "_try_basket", side_effect=fake_try_basket):
+        result = await src._fetch_card(client, nm_id)
+    assert result == {"nm_id": nm_id}
 
 
 @pytest.mark.asyncio
 async def test_zero_result_retries_then_succeeds():
-    """Empty-200 on attempt 1 (0 organic → 0 nm_id) → retry → attempt 2 returns nm_ids.
-
-    This is the core zero-result retry layer: Serper flakes under concurrency and
-    returns 0 organic on the first try, then the SAME query returns real WB cards
-    on the next. The source must retry-on-zero and surface the recovered nm_ids.
-    """
-    nike_hoodie_link = (
-        "https://www.wildberries.ru/catalog/123456789/detail.aspx"
-    )
-    client = MagicMock()
-    client.search = AsyncMock(side_effect=[
-        _FakeResults([]),                            # attempt 1: zero flake
-        _FakeResults([_FakeOrganic(nike_hoodie_link)]),  # attempt 2: recovered
-    ])
-    src = _make_source(client)
-
-    import app.services.enrichment.sources.wb_card_source as mod
+    """0 products (attempt 1) -> retry -> attempt 2 returns nm_ids (retry-on-zero preserved)."""
+    orig_fetch = mod.scrapedo_fetch
     orig_sleep = mod.asyncio.sleep
-    mod.asyncio.sleep = AsyncMock()  # skip real backoff
+    mock_fetch = AsyncMock(side_effect=[
+        FakeScrapflyResult(success=True, content='{"products":[]}'),
+        FakeScrapflyResult(success=True, content='{"products":[{"id":123456789}]}'),
+    ])
+    mod.scrapedo_fetch = mock_fetch
+    mod.asyncio.sleep = AsyncMock()
     try:
-        result = await src._search("Худи Nike")
+        src = mod.WbCardSource()
+        result = await src._search("poco x6 5g")
     finally:
+        mod.scrapedo_fetch = orig_fetch
         mod.asyncio.sleep = orig_sleep
 
-    assert result == [123456789], (
-        f"retry-on-zero must recover nm_ids on attempt 2; got {result}"
-    )
-    assert client.search.await_count == 2, (
-        f"expected exactly 2 attempts (1 zero + 1 success); "
-        f"got {client.search.await_count}"
-    )
+    assert result == [123456789]
+    assert mock_fetch.await_count == 2
 
 
 @pytest.mark.asyncio
 async def test_zero_result_exhausts_attempts_then_empty():
-    """Persistently zero (0 organic every attempt) → all attempts used → []."""
-    client = MagicMock()
-    client.search = AsyncMock(return_value=_FakeResults([]))
-    src = _make_source(client)
-
-    import app.services.enrichment.sources.wb_card_source as mod
+    """Persistently 0 products -> all _SERPER_MAX_ATTEMPTS used -> []."""
+    orig_fetch = mod.scrapedo_fetch
     orig_sleep = mod.asyncio.sleep
+    mock_fetch = AsyncMock(return_value=FakeScrapflyResult(
+        success=True, content='{"products":[]}',
+    ))
+    mod.scrapedo_fetch = mock_fetch
     mod.asyncio.sleep = AsyncMock()
     try:
+        src = mod.WbCardSource()
         result = await src._search("q")
     finally:
+        mod.scrapedo_fetch = orig_fetch
         mod.asyncio.sleep = orig_sleep
 
     assert result == []
-    assert client.search.await_count == _SERPER_MAX_ATTEMPTS, (
-        "a genuine zero must retry up to _SERPER_MAX_ATTEMPTS"
-    )
+    assert mock_fetch.await_count == _SERPER_MAX_ATTEMPTS
 
 
 @pytest.mark.asyncio
-async def test_permanent_4xx_no_retry_even_with_zero_layer():
-    """4xx fail-fast is preserved on top of the zero-retry layer (single attempt)."""
-    client = MagicMock()
-    client.search = AsyncMock(side_effect=_http_status_error(400))
-    src = _make_source(client)
-
-    import app.services.enrichment.sources.wb_card_source as mod
+async def test_scrapedo_persistent_failure_still_retries():
+    """Persistent scrape.do transport failure (success=False) still exhausts retries, no crash."""
+    orig_fetch = mod.scrapedo_fetch
     orig_sleep = mod.asyncio.sleep
-    fake_sleep = AsyncMock()
-    mod.asyncio.sleep = fake_sleep
-    try:
-        result = await src._search("q")
-    finally:
-        mod.asyncio.sleep = orig_sleep
-
-    assert result == []
-    assert client.search.await_count == 1, (
-        "permanent 4xx must fail fast even with the zero-retry layer present"
-    )
-    fake_sleep.assert_not_awaited()  # no backoff burned on permanent 4xx
-
-
-@pytest.mark.asyncio
-async def test_transient_429_still_retries():
-    """HTTP 429 (rate limit) is transient → retried (excluded from permanent gate)."""
-    client = MagicMock()
-    client.search = AsyncMock(side_effect=_http_status_error(429))
-    src = _make_source(client)
-
-    import app.services.enrichment.sources.wb_card_source as mod
-    orig_sleep = mod.asyncio.sleep
+    mock_fetch = AsyncMock(return_value=FakeScrapflyResult(
+        success=False, content=None, status_code=502, credits_used=0,
+        error="Scrape.do HTTP 502",
+    ))
+    mod.scrapedo_fetch = mock_fetch
     mod.asyncio.sleep = AsyncMock()
     try:
+        src = mod.WbCardSource()
         result = await src._search("q")
     finally:
+        mod.scrapedo_fetch = orig_fetch
         mod.asyncio.sleep = orig_sleep
 
     assert result == []
-    assert client.search.await_count == _SERPER_MAX_ATTEMPTS
+    assert mock_fetch.await_count == _SERPER_MAX_ATTEMPTS
 
 
 # ---------------------------------------------------------------------------
@@ -370,53 +342,43 @@ def _fake_card(nm_id: int, subj_name: str = "Куртки", imt_name: str = "Nik
     }
 
 
-class _FakeSearchResults:
-    def __init__(self, organic):
-        self.organic_results = organic
-
-
-class _FakeSearchOrganic:
-    def __init__(self, link):
-        self.link = link
-
-
-def _wb_link(nm_id: int) -> str:
-    return f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx"
+def _query_param(url: str) -> str:
+    """Extract+decode the `query` param from a search.wb.ru URL (test helper)."""
+    parsed = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+    return parsed.get("query", [""])[0]
 
 
 @pytest.mark.asyncio
 async def test_article_path_taken_when_article_present():
-    """When context.article is set, the first Serper call uses article query.
+    """When context.article is set, the first scrape.do call uses article query.
 
     Verifies the article-anchored path fires BEFORE the title-based path
     and that the resulting AttributeValues are returned.
     """
     nm_id = 123456789
+    orig_fetch = mod.scrapedo_fetch
+    mod.scrapedo_fetch = AsyncMock(return_value=FakeScrapflyResult(
+        success=True, content='{"products":[{"id":123456789}]}',
+    ))
+    try:
+        src = mod.WbCardSource()
+        card = _fake_card(nm_id)
+        ctx = _make_context(article="501-0065")
+        target = _make_target()
 
-    search_client = MagicMock()
-    search_client.search = AsyncMock(
-        return_value=_FakeSearchResults([_FakeSearchOrganic(_wb_link(nm_id))])
-    )
-    src = _make_source(search_client)
+        async def fake_fetch(client, fetched_nm_id):
+            return card if fetched_nm_id == nm_id else None
 
-    card = _fake_card(nm_id)
-    ctx = _make_context(article="501-0065")
-    target = _make_target()
+        with patch.object(src, "_fetch_card", side_effect=fake_fetch):
+            result = await src._do_extract(ctx, [target])
 
-    # Patch _fetch_card to return our fake card for nm_id=123456789, else None.
-    async def fake_fetch(client, fetched_nm_id):
-        return card if fetched_nm_id == nm_id else None
-
-    with patch.object(src, "_fetch_card", side_effect=fake_fetch):
-        result = await src._do_extract(ctx, [target])
-
-    # The article query was fired (first search call must contain the article).
-    first_call_query = search_client.search.call_args_list[0][0][0]
-    assert '"501-0065"' in first_call_query, (
-        f"First Serper query should be article-anchored; got: {first_call_query!r}"
-    )
-    # At least one AttributeValue returned (card had Цвет).
-    assert result, "Expected non-empty result from article-path card"
+        first_call_url = mod.scrapedo_fetch.call_args_list[0][0][0]
+        assert '"501-0065"' in _query_param(first_call_url), (
+            f"First scrape.do query should be article-anchored; got: {first_call_url!r}"
+        )
+        assert result, "Expected non-empty result from article-path card"
+    finally:
+        mod.scrapedo_fetch = orig_fetch
 
 
 @pytest.mark.asyncio
@@ -426,35 +388,32 @@ async def test_no_article_uses_title_search_only():
     The search query must NOT contain a double-quoted article token.
     """
     nm_id = 987654321
-
-    search_client = MagicMock()
-    search_client.search = AsyncMock(
-        return_value=_FakeSearchResults([_FakeSearchOrganic(_wb_link(nm_id))])
-    )
-    src = _make_source(search_client)
-
-    card = _fake_card(nm_id)
-    ctx = _make_context(article=None)
-    target = _make_target()
-
-    async def fake_fetch(client, fetched_nm_id):
-        return card if fetched_nm_id == nm_id else None
-
-    import app.services.enrichment.sources.wb_card_source as mod
+    orig_fetch = mod.scrapedo_fetch
     orig_sleep = mod.asyncio.sleep
+    mod.scrapedo_fetch = AsyncMock(return_value=FakeScrapflyResult(
+        success=True, content='{"products":[{"id":987654321}]}',
+    ))
     mod.asyncio.sleep = AsyncMock()
     try:
+        src = mod.WbCardSource()
+        card = _fake_card(nm_id)
+        ctx = _make_context(article=None)
+        target = _make_target()
+
+        async def fake_fetch(client, fetched_nm_id):
+            return card if fetched_nm_id == nm_id else None
+
         with patch.object(src, "_fetch_card", side_effect=fake_fetch):
             await src._do_extract(ctx, [target])
-    finally:
-        mod.asyncio.sleep = orig_sleep
 
-    # All search calls must be title-based (no quoted article in any query).
-    for call in search_client.search.call_args_list:
-        q = call[0][0]
-        assert '"' not in q, (
-            f"Title-search query must not contain quoted article; got: {q!r}"
-        )
+        for call in mod.scrapedo_fetch.call_args_list:
+            q = _query_param(call[0][0])
+            assert '"' not in q, (
+                f"Title-search query must not contain quoted article; got: {q!r}"
+            )
+    finally:
+        mod.scrapedo_fetch = orig_fetch
+        mod.asyncio.sleep = orig_sleep
 
 
 @pytest.mark.asyncio
@@ -465,42 +424,41 @@ async def test_article_path_falls_back_to_title_when_zero_nm_ids():
     """
     title_nm_id = 111222333
 
-    call_count = [0]
-
-    async def side_effect(query, **kwargs):
-        call_count[0] += 1
-        if '"' in query:
+    async def side_effect(url, **kwargs):
+        if '"' in _query_param(url):
             # Article query — return empty
-            return _FakeSearchResults([])
-        # Title query — return a real card link
-        return _FakeSearchResults([_FakeSearchOrganic(_wb_link(title_nm_id))])
+            return FakeScrapflyResult(success=True, content='{"products":[]}')
+        # Title query — return a real card
+        return FakeScrapflyResult(
+            success=True, content=f'{{"products":[{{"id":{title_nm_id}}}]}}',
+        )
 
-    search_client = MagicMock()
-    search_client.search = AsyncMock(side_effect=side_effect)
-    src = _make_source(search_client)
-
-    card = _fake_card(title_nm_id)
-    ctx = _make_context(article="NOTFOUND-99")
-    target = _make_target()
-
-    import app.services.enrichment.sources.wb_card_source as mod
+    orig_fetch = mod.scrapedo_fetch
     orig_sleep = mod.asyncio.sleep
+    mod.scrapedo_fetch = AsyncMock(side_effect=side_effect)
     mod.asyncio.sleep = AsyncMock()
     try:
+        src = mod.WbCardSource()
+        card = _fake_card(title_nm_id)
+        ctx = _make_context(article="NOTFOUND-99")
+        target = _make_target()
+
         async def fake_fetch(client, fetched_nm_id):
             return card if fetched_nm_id == title_nm_id else None
 
         with patch.object(src, "_fetch_card", side_effect=fake_fetch):
             result = await src._do_extract(ctx, [target])
-    finally:
-        mod.asyncio.sleep = orig_sleep
 
-    # Title search must have been tried (call_count >= 2: article attempt + title attempt).
-    assert call_count[0] >= 2, (
-        f"Expected >=2 search calls (article + title fallback); got {call_count[0]}"
-    )
-    # Result comes from the title-path card.
-    assert result, "Expected non-empty result from title-path fallback"
+        # Title search must have been tried (>=2: article attempt + title attempt).
+        assert mod.scrapedo_fetch.call_count >= 2, (
+            f"Expected >=2 search calls (article + title fallback); "
+            f"got {mod.scrapedo_fetch.call_count}"
+        )
+        # Result comes from the title-path card.
+        assert result, "Expected non-empty result from title-path fallback"
+    finally:
+        mod.scrapedo_fetch = orig_fetch
+        mod.asyncio.sleep = orig_sleep
 
 
 @pytest.mark.asyncio
@@ -513,31 +471,28 @@ async def test_article_path_rejects_wrong_type_card_and_falls_back():
     """
     wrong_nm_id = 444555666
 
-    call_count = [0]
-
-    async def side_effect(query, **kwargs):
-        call_count[0] += 1
-        if '"' in query:
-            return _FakeSearchResults([_FakeSearchOrganic(_wb_link(wrong_nm_id))])
+    async def side_effect(url, **kwargs):
+        if '"' in _query_param(url):
+            return FakeScrapflyResult(
+                success=True, content=f'{{"products":[{{"id":{wrong_nm_id}}}]}}',
+            )
         # Title fallback: no results (simplifies assertion).
-        return _FakeSearchResults([])
+        return FakeScrapflyResult(success=True, content='{"products":[]}')
 
-    search_client = MagicMock()
-    search_client.search = AsyncMock(side_effect=side_effect)
-    src = _make_source(search_client)
-
-    # Wrong type: article query returned шорты, but target is куртка.
-    wrong_card = _fake_card(
-        wrong_nm_id,
-        subj_name="Шорты",
-        imt_name="Nike Shorts",
-        options=[{"name": "Цвет", "value": "Синий"}],
-    )
-
-    import app.services.enrichment.sources.wb_card_source as mod
+    orig_fetch = mod.scrapedo_fetch
     orig_sleep = mod.asyncio.sleep
+    mod.scrapedo_fetch = AsyncMock(side_effect=side_effect)
     mod.asyncio.sleep = AsyncMock()
     try:
+        src = mod.WbCardSource()
+        # Wrong type: article query returned шорты, but target is куртка.
+        wrong_card = _fake_card(
+            wrong_nm_id,
+            subj_name="Шорты",
+            imt_name="Nike Shorts",
+            options=[{"name": "Цвет", "value": "Синий"}],
+        )
+
         async def fake_fetch(client, fetched_nm_id):
             return wrong_card if fetched_nm_id == wrong_nm_id else None
 
@@ -546,17 +501,19 @@ async def test_article_path_rejects_wrong_type_card_and_falls_back():
                 _make_context(article="ART-999"),
                 [_make_target()],
             )
-    finally:
-        mod.asyncio.sleep = orig_sleep
 
-    # The wrong card must NOT have been accepted.
-    assert result == [], (
-        "Wrong-type card from article-path must be rejected; result should be []"
-    )
-    # Fallback was attempted (at least 2 search calls: article + title).
-    assert call_count[0] >= 2, (
-        f"Expected >=2 calls (article + title fallback); got {call_count[0]}"
-    )
+        # The wrong card must NOT have been accepted.
+        assert result == [], (
+            "Wrong-type card from article-path must be rejected; result should be []"
+        )
+        # Fallback was attempted (at least 2 search calls: article + title).
+        assert mod.scrapedo_fetch.call_count >= 2, (
+            f"Expected >=2 calls (article + title fallback); "
+            f"got {mod.scrapedo_fetch.call_count}"
+        )
+    finally:
+        mod.scrapedo_fetch = orig_fetch
+        mod.asyncio.sleep = orig_sleep
 
 
 # ---------------------------------------------------------------------------
