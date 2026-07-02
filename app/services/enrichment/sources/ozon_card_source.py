@@ -59,6 +59,7 @@ from app.services.enrichment.strategies.dictionaries.ozon_loader import (
     resolve_value_id,
 )
 from app.services.providers.scrapedo_client import scrapedo_fetch
+from app.services.providers.deepseek_provider import DeepSeekProvider
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +191,24 @@ _OZON_SERPER_CARD_FINDING = os.getenv(
 _OZON_SERPER_FIRST = os.getenv(
     "OZON_SERPER_FIRST", "1"
 ).strip().lower() not in ("0", "false", "no", "off", "")
+
+# FIX-16: LLM-верификатор идентичности товара — финальный гейт после _pick_best_match.
+# DIFFERENT -> abstain (карта возвращает пусто), UNKNOWN -> fail-safe (см. _do_extract).
+# Дефолт ON. Рубильник на случай недоступности/стоимости DeepSeek.
+_OZON_CARD_LLM_IDENTITY_ENABLED: bool = os.getenv(
+    "OZON_CARD_LLM_IDENTITY_ENABLED", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
+
+# "deepseek-chat" — рабочий production-алиас DeepSeek V4-flash в этом движке
+# (см. deepseek_provider.py: прямые имена v4-flash/v4-pro сейчас 200+пустой content).
+_OZON_CARD_LLM_IDENTITY_MODEL: str = (
+    os.getenv("OZON_CARD_LLM_IDENTITY_MODEL", "deepseek-chat").strip()
+    or "deepseek-chat"
+)
+
+_OZON_CARD_LLM_IDENTITY_TIMEOUT: float = float(
+    os.getenv("OZON_CARD_LLM_IDENTITY_TIMEOUT", "20.0").strip() or "20.0"
+)
 
 # Similarity thresholds (понижены для (V2/V3/Plus/Bronze) вариаций — title часто
 # содержит "Блок питания + brand + model + V3 80 Plus Gold (MPE-XXX-...)", т.е.
@@ -899,6 +918,58 @@ def _model_conflict(query: str, title: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# LLM identity verifier (FIX-16, sibling of the deterministic guards above)
+# ---------------------------------------------------------------------------
+
+_IDENTITY_PROMPT_TEMPLATE: str = (
+    "Сверь идентичность товара. Запрос пользователя: «{query}». Заголовок карточки маркетплейса: «{title}».\n"
+    "Это ОДИН И ТОТ ЖЕ товар (та же модель/поколение/линейка) или РАЗНЫЕ товары?\n"
+    "ПО УМОЛЧАНИЮ — РАЗНЫЕ; отвечай \"same\" только если уверен, что это одна модель.\n"
+    "ИГНОРИРУЙ косметику: объём памяти (256/512 ГБ), цвет, регион, год в названии, слово «Смартфон/Дрель» —\n"
+    "это ТОТ ЖЕ товар. РАЗНЫЕ = другая модель (X6 vs M8), другое ПОКОЛЕНИЕ (iPhone 15 vs 14),\n"
+    "вариант линейки (X6 vs X6 Pro/Max/Ultra), или АКСЕССУАР vs само устройство (чехол/плёнка/зарядка).\n"
+    "Ответь СТРОГО JSON: {{\"verdict\":\"same|different\",\"distinguishing\":\"<конкретный различающий признак, или пусто>\"}}"
+)
+
+_IDENTITY_JSON_RE: "re.Pattern[str]" = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _parse_identity_verdict(raw: Optional[str]) -> tuple[str, str]:
+    """Робастный парс ответа LLM-верификатора в (verdict, distinguishing).
+
+    Всегда возвращает verdict строго "same"|"different"|"unknown" — никогда не
+    бросает исключение наружу. Любой сбой парсинга (пустой ответ, битый JSON,
+    неожиданное значение verdict) трактуется как "unknown" (fail-safe).
+    """
+    if not raw or not raw.strip():
+        return ("unknown", "")
+
+    text = raw.strip()
+    match = _IDENTITY_JSON_RE.search(text)
+    json_str = match.group(0) if match else text
+
+    try:
+        data = json.loads(json_str)
+    except (ValueError, json.JSONDecodeError):
+        return ("unknown", "")
+
+    if not isinstance(data, dict):
+        return ("unknown", "")
+
+    verdict = data.get("verdict")
+    if verdict not in ("same", "different"):
+        return ("unknown", "")
+
+    distinguishing = data.get("distinguishing")
+    if not isinstance(distinguishing, str):
+        distinguishing = ""
+    else:
+        distinguishing = distinguishing.strip()
+
+    return (verdict, distinguishing)
+
+
 def _normalize_model(product_name: str, brand: Optional[str]) -> str:
     """Убирает generic-префиксы и бренд, lowercase, для cache key."""
     result = product_name.strip()
@@ -966,6 +1037,11 @@ class OzonCardSource(AttributeSource):
 
         # LRU cache: (brand_lower, model_lower) → list[AttributeValue]
         self._cache: "OrderedDict[tuple[str, str], list[AttributeValue]]" = OrderedDict()
+
+        # FIX-16: in-process memoization of identity-verdicts within this
+        # instance's lifetime — (query, title) -> "same"|"different"|"unknown".
+        # Winner-only calls land here so an identical pair never re-hits the LLM.
+        self._identity_cache: dict[tuple[str, str], str] = {}
 
     @property
     def source_type(self) -> Source:
@@ -1332,12 +1408,148 @@ class OzonCardSource(AttributeSource):
             "found": raw["stage"] == "ok" and len(raw["raw_chars"]) > 0,
         }
 
+    async def _verify_product_identity(
+        self, query: str, candidate_title: str, extra: str = "",
+    ) -> str:
+        """FIX-16: LLM-гейт идентичности товара (финальный гейт после _pick_best_match).
+
+        Спрашивает DeepSeek "это тот же товар?" на выжившем кандидате (winner-only,
+        редкий путь — копейки). Транспорт: DIRECT DeepSeekProvider (переиспользует
+        существующий движковый клиент/ключ из .env, НЕ gateway/ocl_call — gateway
+        EMPTY-флак дал бы ложный "same").
+
+        Returns:
+            "same" | "different" | "unknown" — строго одно из трёх, НИКОГДА не
+            бросает исключение наружу. Любой сбой транспорта/парсинга/таймаута
+            fail-safe'ится в "unknown" (никогда не "same" по умолчанию).
+        """
+        query_stripped = query.strip()
+        title_stripped = candidate_title.strip()
+        if not query_stripped or not title_stripped:
+            return "unknown"
+
+        prompt = _IDENTITY_PROMPT_TEMPLATE.format(
+            query=query_stripped,
+            title=title_stripped,
+        )
+        extra_stripped = extra.strip()
+        if extra_stripped:
+            prompt += f"\n{extra_stripped}"
+
+        try:
+            provider = DeepSeekProvider()
+            resp = await asyncio.wait_for(
+                provider.complete(
+                    messages=[{"role": "user", "content": prompt}],
+                    model=_OZON_CARD_LLM_IDENTITY_MODEL,
+                    temperature=0.0,
+                    max_tokens=200,
+                    response_format={"type": "json_object"},
+                    timeout=int(_OZON_CARD_LLM_IDENTITY_TIMEOUT),
+                ),
+                timeout=_OZON_CARD_LLM_IDENTITY_TIMEOUT,
+            )
+            verdict, distinguishing = _parse_identity_verdict(resp.content)
+            logger.info(
+                "[OzonCard][FIX-16] verdict=%s query=%.80s title=%.80s dist=%s cost=%.6f",
+                verdict,
+                query_stripped,
+                title_stripped,
+                distinguishing,
+                resp.cost_usd,
+            )
+            return verdict
+        except Exception as exc:
+            logger.warning(
+                "[OzonCard][FIX-16] identity check failed query=%.80s title=%.80s exc=%s",
+                query_stripped,
+                title_stripped,
+                exc,
+            )
+            return "unknown"
+
+    async def _get_identity_verdict(self, query: str, title: str) -> str:
+        """FIX-16: мемоизированная обёртка над _verify_product_identity.
+
+        Кеш по (query, title) в рамках жизни инстанса source — идентичная пара
+        не бьёт LLM дважды (см. self._identity_cache в __init__).
+        """
+        key = (query, title)
+        if key in self._identity_cache:
+            return self._identity_cache[key]
+
+        verdict = await self._verify_product_identity(query, title)
+        self._identity_cache[key] = verdict
+        return verdict
+
+    async def _resolve_identity_gate(
+        self,
+        context: ExtractionContext,
+        mode: str,
+        title: str,
+    ) -> Optional[list[AttributeValue]]:
+        """FIX-16: identity-гейт, вынесенный из _do_extract (extract-method, CC).
+
+        Если LLM-гейт включён и mode в ("exact", "brand_line"), запрашивает
+        вердикт идентичности query vs title. Возвращает [] (пустой список),
+        если winner должен быть abstain'нут (identity=different, ИЛИ
+        identity=unknown без fail-safe accept); иначе None — extraction
+        должен продолжиться как обычно (гейт выключен / mode=skip недостижим
+        здесь / verdict=="same" / fail-safe accept для "unknown").
+
+        Args:
+            context: Контекст извлечения (для product_name).
+            mode: Класс совпадения winner-кандидата ("exact"|"brand_line").
+            title: Заголовок winner-карточки.
+
+        Returns:
+            [] если нужно abstain, None если продолжать extraction.
+        """
+        query_for_identity = (context.product_name or "").strip()
+
+        if not _OZON_CARD_LLM_IDENTITY_ENABLED or mode not in ("exact", "brand_line"):
+            return None
+
+        verdict = await self._get_identity_verdict(query_for_identity, title)
+
+        if verdict == "different":
+            logger.info(
+                "[OzonCard][FIX-16] query=%.80s title=%.80s abstain (identity=different)",
+                query_for_identity,
+                title,
+            )
+            return []
+
+        if verdict == "unknown":
+            # FAIL-SAFE: без судьи проходит ТОЛЬКО высоко-уверенное совпадение
+            # (exact + FIX-15 model_conflict==False); brand_line (двусмысленная
+            # полоса — ровно где нужен был LLM) → abstain.
+            fail_safe_ok = mode == "exact" and not _model_conflict(query_for_identity, title)
+            if not fail_safe_ok:
+                logger.info(
+                    "[OzonCard][FIX-16] query=%.80s title=%.80s abstain "
+                    "(unknown + mode=%s model_conflict=%s)",
+                    query_for_identity,
+                    title,
+                    mode,
+                    _model_conflict(query_for_identity, title),
+                )
+                return []
+            logger.info(
+                "[OzonCard][FIX-16] query=%.80s title=%.80s fail-safe accept "
+                "(unknown but exact without model-conflict)",
+                query_for_identity,
+                title,
+            )
+
+        return None
+
     async def _do_extract(
         self,
         context: ExtractionContext,
         targets: list[TargetAttribute],
     ) -> list[AttributeValue]:
-        """Полный flow: search HTML → match → /features/ HTML → map → AVs."""
+        """Полный flow: search HTML → match → /features/ HTML → identity-gate → map → AVs."""
         raw = await self._fetch_card_raw(context, None)
 
         if raw["stage"] != "ok":
@@ -1354,6 +1566,13 @@ class OzonCardSource(AttributeSource):
         top_score = raw["match_score"] or 0.0
         mode = raw["match_class"]
         title = raw.get("card_title") or ""
+
+        # ---- FIX-16: LLM identity gate (ПОСЛЕ _pick_best_match, ДО отдачи карты) ----
+        # Идёт ДО блока IMAGES, чтобы different/fail-safe abstain не успел
+        # замусорить context.image_urls чужими фотками.
+        gate_result = await self._resolve_identity_gate(context, mode, title)
+        if gate_result is not None:
+            return gate_result
 
         # ---- IMAGES (для downstream VisionSource) ----
         # Mutating context.image_urls — pipeline передаёт context по ссылке
