@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 _SCRAPEDO_ENDPOINT = "https://api.scrape.do/"
 _DEFAULT_TIMEOUT = 120.0
 _MIN_BODY_LEN = 50_000
+_MIN_JSON_BODY_LEN = 200
 
 # Transient HTTP statuses worth retrying (Scrape.do proxy rotation hiccups:
 # 502 ROTATION_FAILED "Occasional failures on premium" — explicitly retryable).
@@ -154,9 +155,10 @@ async def scrapedo_fetch(
         return ScrapflyResult(success=False, content=None, status_code=r.status_code,
                               credits_used=credits_used, error="empty body")
 
-    if len(content) < _MIN_BODY_LEN:
+    min_body_len = _MIN_BODY_LEN if render else _MIN_JSON_BODY_LEN
+    if len(content) < min_body_len:
         logger.info("[Scrape.do] body too short (%d chars, need %d) for %s",
-                    len(content), _MIN_BODY_LEN, url[:80])
+                    len(content), min_body_len, url[:80])
         return ScrapflyResult(success=False, content=None, status_code=r.status_code,
                               credits_used=credits_used,
                               error=f"body too short ({len(content)} chars)")
