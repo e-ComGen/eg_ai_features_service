@@ -20,30 +20,17 @@ All fetches are:
   - Retried on transient errors (429/5xx/timeout/connect) with exponential backoff
   - Cached on disk (SHA-256 key, only successful non-empty results)
 
-Scrappey browser-bypass fallback
----------------------------------
-When enabled (URL_FETCHER_SCRAPPEY_FALLBACK=1) the fallback fires whenever the
-plain-httpx attempt yields UNUSABLE content, i.e. any of:
+scrape.do anti-bot fallback
+---------------------------
+When plain-httpx yields UNUSABLE content, the fetch retries once through
+scrape.do (the sole anti-bot tier since Scrappey was retired 2026-06-14),
+firing on a ban status (401/403/418), an exhausted transient (429/5xx), a
+block/captcha page (_looks_like_block), a too-short 200 body
+(< FALLBACK_MIN_TEXT_LEN), or a connect-error/timeout after retries.
 
-  a. ban / anti-bot status: 401, 403, 418
-  b. transient 429/503/5xx — only AFTER all backoff retries are exhausted
-  c. a 3xx redirect that lands on a block/captcha page (detected by
-     _looks_like_block on the final body)
-  d. a 200 whose extracted body is too short (< SCRAPPEY_MIN_TEXT_LEN chars) or
-     contains anti-bot markers (_looks_like_block)
-  e. connect-error / timeout after all retries on a resolvable host
-
-Cost bounds (critical — must not explode):
-  - At most ONE Scrappey attempt per URL.
-  - Per-process cap URL_FETCHER_SCRAPPEY_MAX (default 200); logged when hit.
-  - Non-content hosts (CDNs, trackers, social) are never sent to Scrappey
-    (_is_nontext_host denylist).
-  - URL_FETCHER_SCRAPPEY_DOMAINS is kept as an optional "always-eligible" fast
-    set; the restriction that ONLY those domains could trigger Scrappey is
-    REMOVED — any host not in the denylist is now eligible.
-
-If Scrappey returns nothing or its result still looks like a block, the
-function returns None gracefully (fail-closed, never surfaces captcha pages).
+scrape.do runs only when SCRAPEDO_TOKEN is set; otherwise the fallback is a
+no-op and the fetch returns None gracefully (fail-closed, never surfaces
+captcha pages).
 """
 
 import asyncio
@@ -52,7 +39,6 @@ import json
 import logging
 import os
 import re
-import time
 from dataclasses import dataclass
 from typing import Literal, Optional
 
@@ -87,7 +73,7 @@ _TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 # Errors that indicate a hard block / missing page — do NOT retry
 _HARD_FAIL_STATUSES = {403, 404}
 # Statuses that mean "domain banned us" (WAF / anti-bot) — immediately eligible
-# for the Scrappey browser-bypass (no retry needed for these).
+# for the scrape.do anti-bot fallback (no retry needed for these).
 _BAN_STATUSES = {401, 403, 418}
 
 # ---------------------------------------------------------------------------
@@ -95,7 +81,7 @@ _BAN_STATUSES = {401, 403, 418}
 # ---------------------------------------------------------------------------
 
 # Minimum meaningful text length to consider a page usable
-SCRAPPEY_MIN_TEXT_LEN = 500
+FALLBACK_MIN_TEXT_LEN = 500
 
 # Anti-bot / block-page markers (case-insensitive substring search)
 _BLOCK_MARKERS = [
@@ -116,7 +102,7 @@ def _looks_like_block(text: str) -> bool:
     """Return True when text looks like an anti-bot / captcha wall.
 
     Checks case-insensitively against known block-page markers.  Used both to
-    decide whether to fire Scrappey and to validate its result.
+    decide whether to fire the scrape.do fallback and to validate its result.
     """
     if not text:
         return True
@@ -125,74 +111,8 @@ def _looks_like_block(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Scrappey paid fallback — cost-bound configuration
+# Non-content host denylist (CDNs / trackers / social) — never worth fetching
 # ---------------------------------------------------------------------------
-# OFF by default so production cost does not change unless explicitly enabled.
-
-# Per-process Scrappey call counter — shared across all coroutines via this
-# module-level int.  asyncio is single-threaded so no lock is needed.
-_scrappey_call_count: int = 0
-
-
-def _scrappey_fallback_enabled() -> bool:
-    return os.environ.get("URL_FETCHER_SCRAPPEY_FALLBACK", "0") == "1"
-
-
-def _scrappey_max() -> int:
-    """Per-process cap on total Scrappey fallback calls."""
-    try:
-        return int(os.environ.get("URL_FETCHER_SCRAPPEY_MAX", "200"))
-    except ValueError:
-        return 200
-
-
-def _scrappey_timeout_cap() -> float:
-    """Hard timeout cap (seconds) for a single Scrappey fallback call.
-
-    Configured via URL_FETCHER_SCRAPPEY_TIMEOUT (default 25s).
-    Rationale: the 4 known wall domains (lamoda/sportmaster/dns-shop/citilink)
-    NEVER succeed even with residential proxies, so killing them at 25s is pure
-    win; soft sites that Scrappey CAN beat usually respond well under 25s.
-
-    Note: for browser mode use _scrappey_browser_timeout_cap() instead — JS
-    rendering legitimately needs more time.
-    """
-    try:
-        return float(os.environ.get("URL_FETCHER_SCRAPPEY_TIMEOUT", "25"))
-    except ValueError:
-        return 25.0
-
-
-def _scrappey_browser_timeout_cap() -> float:
-    """Hard timeout cap (seconds) for a Scrappey browser-mode fallback call.
-
-    Configured via URL_FETCHER_SCRAPPEY_BROWSER_TIMEOUT (default 40s).
-    Browser mode spins up a full Chromium instance and executes JS (including
-    Qrator/Cloudflare JS challenges), which takes 15–35 s on typical retail
-    pages.  40 s gives a comfortable margin while still bounding runaway calls.
-    """
-    try:
-        return float(os.environ.get("URL_FETCHER_SCRAPPEY_BROWSER_TIMEOUT", "40"))
-    except ValueError:
-        return 40.0
-
-
-def _scrappey_fast_domains() -> set:
-    """Optional set of domains that are always eligible for Scrappey fallback.
-
-    Previously this was the ONLY allowlist — now it is an *optional* fast set.
-    Any host not in the denylist (_is_nontext_host) is eligible regardless.
-    Kept for backward compatibility / explicit opt-in list.
-    """
-    raw = os.environ.get(
-        "URL_FETCHER_SCRAPPEY_DOMAINS",
-        "dns-shop.ru,ozon.ru,wildberries.ru,citilink.ru",
-    )
-    return {d.strip().lower() for d in raw.split(",") if d.strip()}
-
-
-# Denylist: non-content hosts — CDNs, trackers, social, ad networks.
-# Never send these to Scrappey (no real text content to gain, wastes credits).
 _NONTEXT_HOST_PATTERNS = re.compile(
     r"""
     ^cdn[.\-]                       |   # cdn.* subdomains
@@ -230,43 +150,6 @@ def _is_nontext_host(url: str) -> bool:
     """Return True for CDN/tracker/social hosts that carry no product text."""
     host = _extract_host(url)
     return bool(_NONTEXT_HOST_PATTERNS.search(host))
-
-
-def _host_is_fast_domain(url: str) -> bool:
-    """Return True if the URL's host is in the configured fast-eligible set."""
-    host = _extract_host(url)
-    for dom in _scrappey_fast_domains():
-        if host == dom or host.endswith("." + dom):
-            return True
-    return False
-
-
-def _eligible_for_scrappey(url: str, force: bool = False) -> bool:
-    """Return True if this URL should be attempted via Scrappey fallback.
-
-    Rules:
-      1. Global flag must be ON *or* ``force=True`` (per-call override).
-      2. Per-process cap must not be exceeded.
-      3. Host must NOT be in the non-content denylist.
-      4. Any host that passes rules 1-3 is eligible (no allowlist restriction).
-
-    The ``force`` flag lets callers (e.g. the composition harvester) enable
-    Scrappey for a specific request without flipping the global env default,
-    keeping other callers' behaviour unchanged.
-    """
-    global _scrappey_call_count
-    if not force and not _scrappey_fallback_enabled():
-        return False
-    cap = _scrappey_max()
-    if _scrappey_call_count >= cap:
-        logger.warning(
-            "Scrappey per-process cap (%d) reached — not firing for %r", cap, url
-        )
-        return False
-    if _is_nontext_host(url):
-        logger.debug("Scrappey skipped for non-text host: %r", url)
-        return False
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -320,168 +203,48 @@ def _cache_write(url: str, text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Scrappey fallback (content-aware, general)
+# Anti-bot fallback (scrape.do - the sole anti-bot tier since Scrappey retired)
 # ---------------------------------------------------------------------------
 
-async def _try_scrappey_fallback(
+async def _try_antibot_fallback(
     url: str,
     reason: str,
     timeout: int,
-    force: bool = False,
 ) -> Optional[httpx.Response]:
-    """Attempt to bypass a block/unusable result via the Scrappey browser.
+    """Attempt to bypass a block/unusable result via scrape.do.
 
-    Returns a synthetic httpx.Response(200) wrapping the bypassed HTML, or
-    None if Scrappey is disabled, the cap is hit, the host is denylisted,
-    the domain is in the dead-domain store, or Scrappey itself fails /
-    returns a block page.
+    scrape.do is the PRIMARY (and only) anti-bot tier since Scrappey was retired
+    2026-06-14. It pierces RU anti-bot the same way the Yandex.Market / Lamoda
+    card sources do. Returns a synthetic httpx.Response(200) wrapping the bypassed
+    HTML, or None if scrape.do is unconfigured, fails, or returns no content.
 
-    The ``reason`` string is logged for observability (e.g. "HTTP 403",
-    "short body (120 chars)", "block marker in 200").
-
-    ``force=True`` bypasses the global ``URL_FETCHER_SCRAPPEY_FALLBACK`` env
-    flag so per-call callers (e.g. the composition harvester) can opt-in
-    without changing the global default.
+    The ``reason`` string is logged for observability (e.g. "HTTP 403").
     """
-    global _scrappey_call_count
-
-    # ── scrape.do is the PRIMARY anti-bot tier (Scrappey retired 2026-06-14).
-    # web_search / url_fetcher pierce RU anti-bot via scrape.do — the SAME working
-    # proxy the Yandex.Market / Lamoda card sources use. Runs before the (disabled)
-    # Scrappey path so a blocked organic page still resolves.
-    if os.environ.get("SCRAPEDO_TOKEN"):
-        try:
-            from app.services.providers.scrapedo_client import scrapedo_fetch
-            _sd = await scrapedo_fetch(url, render=True, super_proxy=True, geo="ru")
-            # Trust scrapedo's own success gate (HTTP 200 AND len >= 50k) — same as
-            # the YM / Lamoda card sources. Do NOT re-run _looks_like_block here: it is
-            # a substring marker scan tuned for raw httpx bodies and false-positives on
-            # full JS-rendered RU-retail pages (a real 390KB citilink page trips it).
-            if _sd.success and _sd.content:
-                logger.info(
-                    "scrape.do fallback OK for %r (%d chars, reason: %s)",
-                    url, len(_sd.content), reason,
-                )
-                return httpx.Response(
-                    status_code=200, text=_sd.content,
-                    request=httpx.Request("GET", url),
-                )
+    if not os.environ.get("SCRAPEDO_TOKEN"):
+        return None
+    try:
+        from app.services.providers.scrapedo_client import scrapedo_fetch
+        _sd = await scrapedo_fetch(url, render=True, super_proxy=True, geo="ru")
+        # Trust scrapedo's own success gate (HTTP 200 AND len >= 50k) - same as
+        # the YM / Lamoda card sources. Do NOT re-run _looks_like_block here: it is
+        # a substring marker scan tuned for raw httpx bodies and false-positives on
+        # full JS-rendered RU-retail pages (a real 390KB citilink page trips it).
+        if _sd.success and _sd.content:
             logger.info(
-                "scrape.do fallback no content for %r (success=%s) — trying Scrappey tier",
-                url, _sd.success,
+                "scrape.do fallback OK for %r (%d chars, reason: %s)",
+                url, len(_sd.content), reason,
             )
-        except Exception as _sd_exc:
-            logger.warning("scrape.do fallback error for %r: %s", url, _sd_exc)
-
-    if not _eligible_for_scrappey(url, force=force):
-        return None
-
-    # Dead-domain check: skip paid Scrappey call if this domain is known dead.
-    host = _extract_host(url)
-    try:
-        from app.services.providers.domain_health import (
-            should_skip_scrappey,
-            record_scrappey_outcome,
-        )
-        if should_skip_scrappey(host):
-            import time as _time
-            from app.services.providers import domain_health as _dh
-            _dh._load_store()
-            from app.services.providers.domain_health import _registrable_domain, _store
-            domain = _registrable_domain(host)
-            rec = _store.get(domain)
-            dead_until_ts = rec.dead_until if rec else None
-            logger.info(
-                "skip Scrappey: %s marked dead until %s",
-                host,
-                dead_until_ts,
+            return httpx.Response(
+                status_code=200, text=_sd.content,
+                request=httpx.Request("GET", url),
             )
-            return None
-    except Exception as _dh_exc:
-        logger.debug("domain_health check failed for %r: %s", host, _dh_exc)
-        # degrade gracefully — proceed with Scrappey normally
-        record_scrappey_outcome = None  # type: ignore[assignment]
-
-    logger.info(
-        "Scrappey fallback triggered for %r — reason: %s (call #%d)",
-        url, reason, _scrappey_call_count + 1,
-    )
-
-    _scrappey_call_count += 1
-
-    # Always use browser mode in the fallback: the fallback only fires after
-    # plain httpx already failed (anti-bot block / bad content), so bare
-    # Scrappey is pointless.  Browser mode (full Chromium + JS rendering) beats
-    # Qrator WAF and Cloudflare JS challenges that the bare mode cannot handle.
-    #
-    # Hard timeout cap: use the browser-mode cap (URL_FETCHER_SCRAPPEY_BROWSER_TIMEOUT,
-    # default 40s) because JS rendering legitimately needs more time than bare
-    # mode.  asyncio.wait_for enforces the cap even if the underlying httpx
-    # client stalls (e.g. stalled TLS handshake on a wall domain).
-    cap = _scrappey_browser_timeout_cap()
-
-    html: Optional[str] = None
-    scrappey_exception: Optional[Exception] = None
-    timed_out = False
-    try:
-        from app.services.providers.scrappey_client import scrappey_fetch
-        html = await asyncio.wait_for(
-            scrappey_fetch(url, timeout=cap, browser=True),
-            timeout=cap,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            "Scrappey browser fallback TIMED OUT after %.0fs for %r — recording TRANSIENT",
-            cap, url,
-        )
-        timed_out = True
-        scrappey_exception = asyncio.TimeoutError(f"Scrappey cap {cap}s exceeded")
-    except Exception as exc:
-        logger.warning("Scrappey fallback error for %r: %s", url, exc)
-        scrappey_exception = exc
-
-    # Classify outcome and record into domain-health store.
-    try:
-        from app.services.providers.domain_health import record_scrappey_outcome as _record
-        if timed_out:
-            # Timeout ≠ confirmed block: the server may just be slow right now.
-            # Record TRANSIENT so the death-counter is NOT incremented.
-            _record(host, url, "TRANSIENT")
-        elif scrappey_exception is not None:
-            # Network/SSL/timeout from scrappey_fetch itself → TRANSIENT
-            _record(host, url, "TRANSIENT")
-        elif not html:
-            # Scrappey returned None (upstream non-200, DataDome, empty) → BLOCKED
-            _record(host, url, "BLOCKED")
-        elif _looks_like_block(html):
-            # Scrappey returned a captcha shell → BLOCKED
-            _record(host, url, "BLOCKED")
-        else:
-            # Content looks real → USABLE
-            _record(host, url, "USABLE")
-    except Exception as _rec_exc:
-        logger.debug("domain_health record failed for %r: %s", host, _rec_exc)
-
-    if scrappey_exception is not None:
-        return None
-
-    if not html:
-        logger.info("Scrappey returned nothing for %r", url)
-        return None
-
-    # Fail-closed: never surface a captcha page as if it were content
-    if _looks_like_block(html):
         logger.info(
-            "Scrappey result still looks like a block page for %r — discarding", url
+            "scrape.do fallback no content for %r (success=%s)",
+            url, _sd.success,
         )
-        return None
-
-    logger.info("Scrappey fallback succeeded for %r (%d chars)", url, len(html))
-    return httpx.Response(
-        status_code=200,
-        text=html,
-        request=httpx.Request("GET", url),
-    )
+    except Exception as _sd_exc:
+        logger.warning("scrape.do fallback error for %r: %s", url, _sd_exc)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -492,26 +255,22 @@ async def _get_with_retry(
     url: str,
     timeout: int = DEFAULT_TIMEOUT,
     extra_headers: Optional[dict] = None,
-    force_scrappey: bool = False,
 ) -> Optional[httpx.Response]:
     """
     Perform an HTTP GET with retry + exponential backoff on transient errors.
 
     Transient (retried):  429, 5xx, TimeoutException, ConnectError,
                           RemoteProtocolError.
-    Ban statuses (401, 403, 418): immediately try Scrappey; no HTTP retry.
+    Ban statuses (401, 403, 418): immediately try scrape.do; no HTTP retry.
     Hard failure (skipped): 404 — return None immediately, no retry.
     Other HTTP errors:    return None after logging.
 
     After all retries are exhausted for transient errors or connect failures,
-    Scrappey is attempted as the last resort.
+    the scrape.do fallback is attempted as the last resort.
 
     Returns the Response on success, None on final failure.
     Respects Retry-After header on 429.
 
-    ``force_scrappey=True`` activates the Scrappey tier even when the global
-    ``URL_FETCHER_SCRAPPEY_FALLBACK`` env flag is OFF.  This allows per-call
-    opt-in (e.g. the composition harvester) without affecting other callers.
     """
     headers = dict(_HEADERS)
     if extra_headers:
@@ -529,14 +288,14 @@ async def _get_with_retry(
             ) as client:
                 resp = await client.get(url)
 
-            # a. Ban / anti-bot statuses — immediate Scrappey, no HTTP retry
+            # a. Ban / anti-bot statuses — immediate scrape.do, no HTTP retry
             if resp.status_code in _BAN_STATUSES:
                 logger.warning(
-                    "fetch HTTP %s for %r — anti-bot block, trying Scrappey",
+                    "fetch HTTP %s for %r — anti-bot block, trying scrape.do",
                     resp.status_code, url,
                 )
-                fb = await _try_scrappey_fallback(
-                    url, f"HTTP {resp.status_code}", timeout, force=force_scrappey
+                fb = await _try_antibot_fallback(
+                    url, f"HTTP {resp.status_code}", timeout
                 )
                 if fb is not None:
                     return fb
@@ -547,7 +306,7 @@ async def _get_with_retry(
                 logger.warning("fetch 404 for %r — not retrying", url)
                 return None
 
-            # b. Transient — retry with backoff; Scrappey only after exhaustion
+            # b. Transient — retry with backoff; scrape.do only after exhaustion
             if resp.status_code in _TRANSIENT_STATUSES:
                 wait = _retry_wait(resp, attempt)
                 logger.warning(
@@ -569,24 +328,24 @@ async def _get_with_retry(
             body = resp.text
             if _looks_like_block(body):
                 logger.warning(
-                    "fetch 200 with block marker for %r — trying Scrappey", url
+                    "fetch 200 with block marker for %r — trying scrape.do", url
                 )
-                fb = await _try_scrappey_fallback(
-                    url, "block marker in 200", timeout, force=force_scrappey
+                fb = await _try_antibot_fallback(
+                    url, "block marker in 200", timeout
                 )
                 return fb  # None is fine (fail-closed)
 
-            if len(body) < SCRAPPEY_MIN_TEXT_LEN:
+            if len(body) < FALLBACK_MIN_TEXT_LEN:
                 logger.warning(
-                    "fetch 200 too-short body (%d chars) for %r — trying Scrappey",
+                    "fetch 200 too-short body (%d chars) for %r — trying scrape.do",
                     len(body), url,
                 )
-                fb = await _try_scrappey_fallback(
-                    url, f"short body ({len(body)} chars)", timeout, force=force_scrappey
+                fb = await _try_antibot_fallback(
+                    url, f"short body ({len(body)} chars)", timeout
                 )
                 if fb is not None:
                     return fb
-                # Short body from Scrappey too — return original short resp
+                # Short body from scrape.do too — return original short resp
                 # rather than None so callers can attempt extraction.
                 return resp
 
@@ -616,11 +375,11 @@ async def _get_with_retry(
     if exhausted_transient:
         err_desc = type(last_exc).__name__ if last_exc else "unknown"
         logger.warning(
-            "fetch gave up after %d attempts for %r (%s) — trying Scrappey",
+            "fetch gave up after %d attempts for %r (%s) — trying scrape.do",
             _RETRY_ATTEMPTS, url, err_desc,
         )
-        fb = await _try_scrappey_fallback(
-            url, f"exhausted retries ({err_desc})", timeout, force=force_scrappey
+        fb = await _try_antibot_fallback(
+            url, f"exhausted retries ({err_desc})", timeout
         )
         if fb is not None:
             return fb
@@ -877,17 +636,12 @@ def _extract_ozon_props(obj: dict, parts: list[str], depth: int = 0) -> None:
 async def fetch_url_content(
     url: str,
     timeout: int = DEFAULT_TIMEOUT,
-    force_scrappey: bool = False,
 ) -> Optional[FetchResult]:
     """
     Generic HTTPS-only fetch with main-content extraction.
     Uses trafilatura if available, otherwise falls back to basic HTML stripping.
     Retries on transient errors; returns cached result on repeated calls.
 
-    ``force_scrappey=True`` enables the Scrappey proxy tier for this specific
-    call even when the global ``URL_FETCHER_SCRAPPEY_FALLBACK`` env flag is
-    OFF.  Other callers are unaffected.  Intended for the composition harvester
-    which needs Scrappey as an IP-shielding layer on open (non-walled) sites.
     """
     if not url.startswith("https://"):
         logger.warning("fetch_url_content: rejected non-HTTPS URL %r", url)
@@ -899,7 +653,7 @@ async def fetch_url_content(
         return FetchResult(url=url, content=cached, source_type="generic")
 
     try:
-        resp = await _get_with_retry(url, timeout=timeout, force_scrappey=force_scrappey)
+        resp = await _get_with_retry(url, timeout=timeout)
         if resp is None:
             return None
         html = resp.text

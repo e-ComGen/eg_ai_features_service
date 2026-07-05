@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -37,7 +37,6 @@ from app.services.enrichment.composition_extractor import (
     extract_composition,
     page_matches_brand,
 )
-from app.services.providers.domain_health import should_skip_scrappey
 from app.services.providers.serper_client import SerperClient
 
 logger = logging.getLogger(__name__)
@@ -182,12 +181,9 @@ def _order_by_pool_preference(urls: list[str]) -> list[str]:
 
 
 def _is_dead(url: str) -> bool:
-    """True if domain_health marks this domain as dead/skipped."""
-    host = _extract_host(url)
-    try:
-        return should_skip_scrappey(host)
-    except Exception:
-        return False
+    """Dead-domain memory retired with Scrappey (scrape.do is the sole tier now);
+    no per-domain skip list remains, so no domain is ever pre-skipped."""
+    return False
 
 
 # SPA app-root / hydration markers — presence with little visible text signals
@@ -399,14 +395,14 @@ async def harvest_composition(
                         html = await bf.fetch(url)
 
                 else:
-                    # Open site: httpx-direct → Scrappey (IP-shield) → BrowserFetcher.
-                    # force_scrappey=True activates the Scrappey proxy tier inside
-                    # fetch_url_content regardless of the global env flag, so our VPS
-                    # IP is only exposed to open sites as a last resort (SPA escalation
-                    # below).  Walled browser-strategy sites bypass this path entirely
-                    # and go straight to BrowserFetcher above.
+                    # Open site: httpx-direct → scrape.do (PRIMARY anti-bot tier) →
+                    # BrowserFetcher.  Scrappey was retired 2026-06-14 (publisher.scrappey.com
+                    # dead) — forcing it here only burned 25-45s per blocked link on a dead
+                    # endpoint.  Dropped force_scrappey so this path respects the global
+                    # Scrappey-off default and relies on scrape.do, which is already tried
+                    # first inside fetch_url_content.
                     from app.services.url_fetcher import fetch_url_content
-                    result = await fetch_url_content(url, force_scrappey=True)
+                    result = await fetch_url_content(url)
                     if result is not None:
                         # Use raw_html when available (preserves spec blocks)
                         html = result.raw_html or result.content

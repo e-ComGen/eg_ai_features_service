@@ -150,7 +150,7 @@ class TestDeadDomainSkip:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=True,
             ),
             patch("app.services.url_fetcher.fetch_url_content", new=mock_fetch),
@@ -179,7 +179,7 @@ class TestDeadDomainSkip:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(
@@ -232,7 +232,7 @@ class TestFirstHitStopsLoop:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(
@@ -282,7 +282,7 @@ class TestFirstHitStopsLoop:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(
@@ -328,7 +328,7 @@ class TestGracefulFallthrough:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(
@@ -370,7 +370,7 @@ class TestGracefulFallthrough:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(
@@ -430,7 +430,7 @@ class TestBrowserFetcherReuse:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(
@@ -472,7 +472,7 @@ class TestBrowserFetcherReuse:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(
@@ -519,7 +519,7 @@ class TestSerperDedup:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(
@@ -571,7 +571,7 @@ class TestRouting:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(
@@ -595,46 +595,6 @@ class TestRouting:
         assert url_fetcher_calls, "url_fetcher must be called for open site"
         assert bf_calls == [], "BrowserFetcher must NOT be called for open site"
 
-    def test_open_url_passes_force_scrappey_to_url_fetcher(self):
-        """harvest_composition must pass force_scrappey=True when fetching open sites."""
-        serper = MagicMock()
-        serper.search = AsyncMock(
-            return_value=_make_serper_results(["https://kixbox.ru/nike-tee/"])
-        )
-
-        captured_kwargs: list[dict] = []
-
-        async def mock_url_fetcher(url, **kwargs):
-            captured_kwargs.append(kwargs)
-            return None
-
-        with (
-            patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
-                return_value=False,
-            ),
-            patch(
-                "app.services.url_fetcher.fetch_url_content",
-                new=mock_url_fetcher,
-            ),
-            patch(
-                "app.services.enrichment.sources.multisite_composition._INTER_REQUEST_DELAY",
-                0,
-            ),
-        ):
-            run(
-                harvest_composition(
-                    "Nike Tee",
-                    "Nike",
-                    serper_client=serper,
-                )
-            )
-
-        assert captured_kwargs, "fetch_url_content must have been called"
-        assert captured_kwargs[0].get("force_scrappey") is True, (
-            "harvest_composition must pass force_scrappey=True for open sites"
-        )
-
     def test_browser_url_does_not_call_url_fetcher(self):
         """lamoda.ru (browser) must use BrowserFetcher, url_fetcher NOT called."""
         serper = MagicMock()
@@ -654,7 +614,7 @@ class TestRouting:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(
@@ -701,7 +661,7 @@ class TestRouting:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(
@@ -773,7 +733,7 @@ class TestSpaAutoEscalation:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(
@@ -826,7 +786,7 @@ class TestSpaAutoEscalation:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(
@@ -878,7 +838,7 @@ class TestSpaAutoEscalation:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(
@@ -933,7 +893,7 @@ class TestSpaAutoEscalation:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(
@@ -1079,7 +1039,7 @@ class TestSneakerheadInHarvestComposition:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(
@@ -1128,7 +1088,7 @@ class TestSneakerheadInHarvestComposition:
 
         with (
             patch(
-                "app.services.enrichment.sources.multisite_composition.should_skip_scrappey",
+                "app.services.enrichment.sources.multisite_composition._is_dead",
                 return_value=False,
             ),
             patch(

@@ -70,6 +70,7 @@ from app.services.enrichment.prompt_router import (
     format_target_line,
 )
 from app.services.providers.factory import get_main_manager
+from app.services.providers.scrapedo_client import scrapedo_fetch
 from app.services.providers.structured_adapter import StructuredLlmManager
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,6 @@ logger = logging.getLogger(__name__)
 # Конфигурация
 # ---------------------------------------------------------------------------
 
-_SCRAPPEY_ENDPOINT = "https://publisher.scrappey.com/api/v1"
 _OZON_PRODUCT_BASE = "https://www.ozon.ru/product/"
 _HTTP_TIMEOUT = 180.0
 
@@ -232,7 +232,8 @@ class UgcSource(AttributeSource):
         **kwargs: Any,
     ):
         _ = kwargs  # backward-compat
-        self._scrappey_key = scrappey_key or os.environ.get("SCRAPPEY_KEY")
+        _ = scrappey_key  # backward-compat заглушка, не храним
+        self._scrapedo_ok = bool(os.environ.get("SCRAPEDO_TOKEN"))
         self._llm = llm_manager or get_main_manager()
         self._judge = UgcJudge()
 
@@ -414,15 +415,13 @@ class UgcSource(AttributeSource):
     # ------------------------------------------------------------------
 
     async def _fetch_ozon_texts(self, context: ExtractionContext) -> list[str]:
-        """Скачать Ozon reviews + questions HTML через Scrappey.
+        """Скачать Ozon reviews + questions HTML через scrape.do.
 
         TODO: pid+slug discovery — пока ожидаем что они есть в context.source_urls
-        как ссылка на товар. В будущем — OzonCardSource положит pid в context
-        после своей search-фазы (другой агент работает над интеграцией).
-        Если pid нет — возвращаем [], это OK.
+        как ссылка на товар. Если pid нет — возвращаем [], это OK.
         """
-        if not self._scrappey_key:
-            logger.debug("[UGC/Ozon] нет SCRAPPEY_KEY — skip")
+        if not self._scrapedo_ok:
+            logger.debug("[UGC/Ozon] нет SCRAPEDO_TOKEN — skip")
             return []
 
         slug_pid = self._extract_ozon_slug_pid(context)
@@ -431,56 +430,32 @@ class UgcSource(AttributeSource):
         slug, pid = slug_pid
 
         texts: list[str] = []
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, follow_redirects=True) as client:
-            for endpoint in ("reviews", "questions"):
-                url = f"{_OZON_PRODUCT_BASE}{slug}-{pid}/{endpoint}/"
-                html = await self._scrappey_get(client, url)
-                if not html:
-                    continue
-                visible = _extract_visible_text(html)
-                if not visible:
-                    continue
-                # Бьём на куски по абзацам — стопить весь текст в один кусок плохо
-                # для regex-фильтра snippets.
-                chunks = re.split(r"(?:\.\s|\n|\r)+", visible)
-                texts.extend(c for c in chunks if c.strip())
-                logger.info(
-                    "[UGC/Ozon] %s → %d chunks из %d chars HTML",
-                    endpoint, len(chunks), len(html),
-                )
+        for endpoint in ("reviews", "questions"):
+            url = f"{_OZON_PRODUCT_BASE}{slug}-{pid}/{endpoint}/"
+            html = await self._scrapedo_get(url)
+            if not html:
+                continue
+            visible = _extract_visible_text(html)
+            if not visible:
+                continue
+            chunks = re.split(r"(?:\.\s|\n|\r)+", visible)
+            texts.extend(c for c in chunks if c.strip())
+            logger.info(
+                "[UGC/Ozon] %s → %d chunks из %d chars HTML",
+                endpoint, len(chunks), len(html),
+            )
         return texts
 
-    async def _scrappey_get(
-        self,
-        client: httpx.AsyncClient,
-        target_url: str,
-    ) -> Optional[str]:
-        """Один POST к Scrappey без retry — экономим credits на UGC."""
-        payload = {"cmd": "request.get", "url": target_url}
+    async def _scrapedo_get(self, target_url: str) -> Optional[str]:
+        """Один fetch через scrape.do без retry — экономим credits на UGC."""
         try:
-            r = await client.post(
-                _SCRAPPEY_ENDPOINT,
-                params={"key": self._scrappey_key},
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-        except (httpx.TimeoutException, httpx.HTTPError) as exc:
-            logger.info("[UGC/Ozon] Scrappey err: %s", exc)
+            _sd = await scrapedo_fetch(target_url, render=True, super_proxy=True, geo="ru")
+        except Exception as exc:
+            logger.info("[UGC/Ozon] scrape.do err: %s", exc)
             return None
-        if r.status_code >= 400:
-            logger.info("[UGC/Ozon] Scrappey HTTP %s", r.status_code)
-            return None
-        try:
-            envelope = r.json()
-        except (ValueError, json.JSONDecodeError):
-            return None
-        solution = envelope.get("solution") or {}
-        if solution.get("statusCode") != 200:
-            return None
-        content = solution.get("response") or ""
-        if not content or _is_datadome_block(content):
-            return None
-        return content
+        if _sd.success and _sd.content:
+            return _sd.content
+        return None
 
     @staticmethod
     def _extract_ozon_slug_pid(context: ExtractionContext) -> Optional[tuple[str, str]]:
