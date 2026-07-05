@@ -221,6 +221,12 @@ LLM_ENSEMBLE_SOLO_JUDGE: str = os.getenv("LLM_ENSEMBLE_SOLO_JUDGE", "main")
 # Phase 3: external web-search grounding (the only thing that catches category-plausible-but-
 # product-wrong values). DEFAULT OFF. Grounds only the disagreement queue + enum-solo values.
 LLM_ENSEMBLE_GROUNDING_ENABLED: bool = os.getenv("LLM_ENSEMBLE_GROUNDING_ENABLED", "false").lower() in ("1", "true", "yes")
+# Perf gate: solo (single-model) values are grounded via external web-search ONLY when
+# this is True. Default OFF -- solo web-search is the slowest per-field await (2-5s each,
+# dozens of enum solos = minutes). With it OFF, solo values go straight to the cheap judge
+# path. The A<->B disagreement grounding (ground_disagreement) is NOT gated by this and
+# stays governed by LLM_ENSEMBLE_GROUNDING_ENABLED.
+LLM_ENSEMBLE_GROUND_SOLO: bool = os.getenv("LLM_ENSEMBLE_GROUND_SOLO", "false").lower() in ("1", "true", "yes")
 GROUNDING_MODEL: str = os.getenv("GROUNDING_MODEL", "perplexity/sonar")
 
 if not OPENAI_API_KEY:

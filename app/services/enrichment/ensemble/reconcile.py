@@ -14,6 +14,7 @@ gpt-4o-mini) на остаточных характеристиках, кото�
 """
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import logging
 import math
@@ -254,8 +255,8 @@ async def reconcile(
     product_name = getattr(context, "product_name", None) if context is not None else None
     grounding_enabled = config.LLM_ENSEMBLE_GROUNDING_ENABLED
 
-    def _emit(attr_id, value, confidence, evidence, target):
-        result.append(AttributeValue(
+    def _build(attr_id, value, confidence, evidence, target):
+        return AttributeValue(
             attribute_id=attr_id,
             value=value,
             confidence=confidence,
@@ -263,84 +264,95 @@ async def reconcile(
             evidence=(evidence[:297] + "...") if evidence and len(evidence) > 300 else evidence,
             semantic_type=target.semantic_type,
             is_collection=target.is_collection,
-        ))
+        )
 
-    for attr_id in both_ids:
-        attr_a = by_id_a[attr_id]
-        attr_b = by_id_b[attr_id]
-        target = target_by_id[attr_id]
-        fast = values_agree_fast(attr_a.value, attr_b.value, target)
-        if fast is True:
-            agree = True
-        elif fast is None:
-            attr_name = str(getattr(target, "name", None) or target.id)
-            agree = await values_agree_llm(attr_a.value, attr_b.value, attr_name, llm_manager, cache)
-        else:
-            agree = False
-        if agree:
-            evidence_parts = [p for p in (attr_a.reasoning, attr_b.reasoning) if p]
-            evidence = "ensemble consensus (A+B): " + " | ".join(evidence_parts)
-            evidence = evidence.strip(" |")
-            _emit(attr_id, attr_a.value, config.LLM_ENSEMBLE_CONFIDENCE, evidence, target)
-        else:
-            attr_name_d = str(getattr(target, "name", None) or target.id)
-            grounded_val = None
-            if grounding_enabled and grounding_manager is not None:
-                grounded_val = await ground_disagreement(product_name, attr_name_d, attr_a.value, attr_b.value, grounding_manager)
-            if grounded_val is not None:
-                _emit(attr_id, grounded_val, config.LLM_ENSEMBLE_CONFIDENCE, f"ensemble disagreement grounded: {grounded_val}", target)
-            else:
-                _log_disagreement(product_name, attr_name_d, attr_a.value, attr_b.value)
-
-    # Phase 2c: prepare cross-vendor solo judges once. A value produced by model A
-    # (DeepSeek) is judged by manager_b (gpt-4o-mini) and vice versa -- the judge never
-    # shares a vendor with the producer, so it cannot rubber-stamp its own hallucination.
     solo_judge_mode = config.LLM_ENSEMBLE_SOLO_JUDGE
-    cross_judge_for_a = None   # judges A-produced solos -> bound to manager_b (opposite vendor)
-    cross_judge_for_b = None   # judges B-produced solos -> bound to manager_a (opposite vendor)
+    cross_judge_for_a = None
+    cross_judge_for_b = None
     if solo_judge_mode == "cross" and manager_a is not None and manager_b is not None:
         from app.services.enrichment.judges.knowledge_judge import KnowledgeJudge
         cross_judge_for_a = KnowledgeJudge(llm_manager=manager_b)
         cross_judge_for_b = KnowledgeJudge(llm_manager=manager_a)
 
+    _SEM = asyncio.Semaphore(8)
+    coros = []
+
+    for attr_id in both_ids:
+        attr_a = by_id_a[attr_id]
+        attr_b = by_id_b[attr_id]
+        target = target_by_id[attr_id]
+
+        async def _both_coro(attr_a=attr_a, attr_b=attr_b, target=target, attr_id=attr_id):
+            async with _SEM:
+                fast = values_agree_fast(attr_a.value, attr_b.value, target)
+                if fast is True:
+                    agree = True
+                elif fast is None:
+                    attr_name = str(getattr(target, "name", None) or target.id)
+                    agree = await values_agree_llm(attr_a.value, attr_b.value, attr_name, llm_manager, cache)
+                else:
+                    agree = False
+                if agree:
+                    evidence_parts = [p for p in (attr_a.reasoning, attr_b.reasoning) if p]
+                    evidence = "ensemble consensus (A+B): " + " | ".join(evidence_parts)
+                    evidence = evidence.strip(" |")
+                    return _build(attr_id, attr_a.value, config.LLM_ENSEMBLE_CONFIDENCE, evidence, target)
+                else:
+                    attr_name_d = str(getattr(target, "name", None) or target.id)
+                    grounded_val = None
+                    if grounding_enabled and grounding_manager is not None:
+                        grounded_val = await ground_disagreement(product_name, attr_name_d, attr_a.value, attr_b.value, grounding_manager)
+                    if grounded_val is not None:
+                        return _build(attr_id, grounded_val, config.LLM_ENSEMBLE_CONFIDENCE, f"ensemble disagreement grounded: {grounded_val}", target)
+                    else:
+                        _log_disagreement(product_name, attr_name_d, attr_a.value, attr_b.value)
+                        return None
+
+        coros.append(_both_coro())
+
     for attr_id in solo_ids:
         target = target_by_id[attr_id]
         from_a = attr_id in by_id_a
         solo = by_id_a[attr_id] if from_a else by_id_b[attr_id]
-        if config.LLM_ENSEMBLE_SOLO_POLICY != "judge" or context is None:
-            continue
-        # Phase 3: enum/categorical solos are where "category-plausible but product-wrong"
-        # values hide (e.g. headphone form-factor). Ground ONLY those against an external
-        # product-specific source. Non-enum solos keep the cheaper judge path (cost bound).
-        is_enum_target = bool(getattr(target, "allowed_values", None))
-        if grounding_enabled and grounding_manager is not None and is_enum_target:
-            g = await ground_value(product_name, str(getattr(target, "name", None) or target.id), solo.value, grounding_manager)
-            if g == "confirm":
-                _emit(attr_id, solo.value, 0.85, f"ensemble solo (grounded-confirm): {solo.reasoning or ''}".strip(), target)
-                continue
-            if g == "refute":
-                continue
-            # g == "unknown" -> fall through to the existing solo-judge path below.
-        # cross-vendor judge (opposite of producer) when wired; else the passed same-vendor judge.
-        if solo_judge_mode == "cross" and cross_judge_for_a is not None:
-            chosen_judge = cross_judge_for_a if from_a else cross_judge_for_b
-        else:
-            chosen_judge = judge
-        if chosen_judge is None:
-            continue
-        candidate = AttributeValue(
-            attribute_id=attr_id,
-            value=solo.value,
-            confidence=0.85,
-            source=Source.LLM_KNOWLEDGE,
-            evidence=solo.reasoning,
-            semantic_type=target.semantic_type,
-            is_collection=target.is_collection,
-        )
-        ok = await chosen_judge.validate(candidate, context)
-        if ok:
-            vendor_note = "cross-vendor" if (solo_judge_mode == "cross" and cross_judge_for_a is not None) else "main"
-            evidence = f"ensemble solo (judge-confirmed, {vendor_note}): {solo.reasoning or ''}".strip()
-            _emit(attr_id, solo.value, 0.85, evidence, target)
+
+        async def _solo_coro(attr_id=attr_id, target=target, from_a=from_a, solo=solo):
+            async with _SEM:
+                if config.LLM_ENSEMBLE_SOLO_POLICY != "judge" or context is None:
+                    return None
+                is_enum_target = bool(getattr(target, "allowed_values", None))
+                if grounding_enabled and grounding_manager is not None and is_enum_target and config.LLM_ENSEMBLE_GROUND_SOLO:
+                    g = await ground_value(product_name, str(getattr(target, "name", None) or target.id), solo.value, grounding_manager)
+                    if g == "confirm":
+                        return _build(attr_id, solo.value, 0.85, f"ensemble solo (grounded-confirm): {solo.reasoning or ''}".strip(), target)
+                    if g == "refute":
+                        return None
+                if solo_judge_mode == "cross" and cross_judge_for_a is not None:
+                    chosen_judge = cross_judge_for_a if from_a else cross_judge_for_b
+                else:
+                    chosen_judge = judge
+                if chosen_judge is None:
+                    return None
+                candidate = AttributeValue(
+                    attribute_id=attr_id,
+                    value=solo.value,
+                    confidence=0.85,
+                    source=Source.LLM_KNOWLEDGE,
+                    evidence=solo.reasoning,
+                    semantic_type=target.semantic_type,
+                    is_collection=target.is_collection,
+                )
+                ok = await chosen_judge.validate(candidate, context)
+                if ok:
+                    vendor_note = "cross-vendor" if (solo_judge_mode == "cross" and cross_judge_for_a is not None) else "main"
+                    evidence = f"ensemble solo (judge-confirmed, {vendor_note}): {solo.reasoning or ''}".strip()
+                    return _build(attr_id, solo.value, 0.85, evidence, target)
+                return None
+
+        coros.append(_solo_coro())
+
+    gathered = await asyncio.gather(*coros)
+    for item in gathered:
+        if item is not None:
+            result.append(item)
 
     return result

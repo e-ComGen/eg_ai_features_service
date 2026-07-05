@@ -183,3 +183,96 @@ async def test_extract_flag_on_calls_ensemble_and_reconcile(monkeypatch):
     fake_reconcile.assert_awaited()
     assert len(result) == 1
     assert result[0].attribute_id == 3001
+
+
+# ========== Perf refactor: gather-parallel == sequential semantics ==========
+
+@pytest.mark.asyncio
+async def test_gather_parallel_matches_sequential_on_mixed_fixture(tmp_path, monkeypatch):
+    """Mixed agree/disagree/solo fixture: the parallelized reconcile() must yield
+    exactly the same set of AttributeValues (by attribute_id/value/confidence/source)
+    that the per-field sequential logic did -- parallelization is pure perf, no
+    behavior change. Deterministic mocks (no ordering-dependent output)."""
+    import importlib
+    _rec_mod = importlib.import_module("app.services.enrichment.ensemble.reconcile")
+    monkeypatch.setattr(_rec_mod, "_DISAGREEMENT_LOG", tmp_path / "d.jsonl")
+    config.LLM_ENSEMBLE_SOLO_POLICY = "judge"
+    config.LLM_ENSEMBLE_SOLO_JUDGE = "cross"
+    try:
+        targets = [
+            _mk_target(1, name="Цвет"),          # both, fast-agree -> emit consensus
+            _mk_target(2, name="Матрица"),       # both, disagree (arbiter no) -> abstain
+            _mk_target(3, name="Процессор"),     # solo from A, cross-judge yes -> emit
+            _mk_target(4, name="Память"),        # solo from B, cross-judge no -> drop
+        ]
+        parsed_a = [_mk_parsed(1, "Синий"), _mk_parsed(2, "IPS"), _mk_parsed(3, "Apple M2")]
+        parsed_b = [_mk_parsed(1, "синий"), _mk_parsed(2, "VA"), _mk_parsed(4, "8 ГБ")]
+
+        # arbiter says disagree (same=False) for the id=2 pair
+        arbiter = AsyncMock()
+        arbiter.structured_request = AsyncMock(return_value=(SimpleNamespace(same=False), 10))
+        # manager_a judges B-produced solos, manager_b judges A-produced solos (cross)
+        # id=3 (from A) -> judged by manager_b => valid True
+        # id=4 (from B) -> judged by manager_a => valid False
+        manager_a = _mk_manager(False)
+        manager_b = _mk_manager(True)
+
+        result = await reconcile(parsed_a, parsed_b, targets, arbiter,
+                                 context=_mk_context(), manager_a=manager_a, manager_b=manager_b)
+
+        by_id = {av.attribute_id: av for av in result}
+        # id=1 consensus emitted
+        assert 1 in by_id
+        assert by_id[1].value == "Синий"
+        assert by_id[1].confidence == pytest.approx(config.LLM_ENSEMBLE_CONFIDENCE)
+        assert by_id[1].source == Source.LLM_KNOWLEDGE
+        # id=2 abstained (disagree, no grounding)
+        assert 2 not in by_id
+        # id=3 solo from A, cross-judged by manager_b=True -> emitted
+        assert 3 in by_id
+        assert by_id[3].value == "Apple M2"
+        assert by_id[3].confidence == pytest.approx(0.85)
+        assert "cross-vendor" in (by_id[3].evidence or "")
+        # id=4 solo from B, cross-judged by manager_a=False -> dropped
+        assert 4 not in by_id
+        # exactly 2 emitted
+        assert len(result) == 2
+    finally:
+        config.LLM_ENSEMBLE_SOLO_JUDGE = "main"
+
+
+@pytest.mark.asyncio
+async def test_solo_grounding_off_skips_ground_value(monkeypatch):
+    """With LLM_ENSEMBLE_GROUND_SOLO=False (default), an enum solo must NOT call
+    ground_value -- it goes straight to the judge path. ground_disagreement on the
+    A<->B disagreement branch is unaffected (not exercised here)."""
+    import importlib
+    _rec_mod = importlib.import_module("app.services.enrichment.ensemble.reconcile")
+    ground_value_spy = AsyncMock(return_value="confirm")
+    monkeypatch.setattr(_rec_mod, "ground_value", ground_value_spy)
+    monkeypatch.setattr(config, "LLM_ENSEMBLE_GROUNDING_ENABLED", True)  # grounding globally on...
+    monkeypatch.setattr(config, "LLM_ENSEMBLE_GROUND_SOLO", False)       # ...but solo grounding gated OFF
+    config.LLM_ENSEMBLE_SOLO_POLICY = "judge"
+    config.LLM_ENSEMBLE_SOLO_JUDGE = "cross"
+    try:
+        # enum target (allowed_values set) => would be grounded IF the gate were on
+        target = TargetAttribute(id=5, name="Тип", type="enum", allowed_values=["A", "B"])
+        parsed_a = [_mk_parsed(5, "A")]  # solo from A
+        parsed_b = []
+        manager_a = _mk_manager(True)
+        manager_b = _mk_manager(True)   # cross-judges A-solo -> valid True
+        arbiter = AsyncMock()
+        grounding_manager = SimpleNamespace()  # non-None, so only the flag gates it
+
+        result = await reconcile(parsed_a, parsed_b, [target], arbiter,
+                                 context=_mk_context(), manager_a=manager_a, manager_b=manager_b,
+                                 grounding_manager=grounding_manager)
+
+        # ground_value must NOT have been called (solo grounding gated off)
+        ground_value_spy.assert_not_awaited()
+        # judge path still emits the solo
+        assert len(result) == 1
+        assert result[0].attribute_id == 5
+        assert "judge-confirmed" in (result[0].evidence or "")
+    finally:
+        config.LLM_ENSEMBLE_SOLO_JUDGE = "main"
