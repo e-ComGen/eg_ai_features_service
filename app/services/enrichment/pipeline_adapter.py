@@ -132,6 +132,8 @@ class PipelineAdapter:
         targets_raw: list[dict] | None = None,
         max_cost_usd: float = 0.10,
         marketplace: Optional[str] = None,
+        research_mode: Optional[str] = None,
+        enable_web_search: bool = False,
     ) -> list[AttributeValue]:
         """Build context + targets and run orchestrator.
 
@@ -166,6 +168,8 @@ class PipelineAdapter:
             max_cost_usd=max_cost_usd,
             marketplace=marketplace,
             ozon_type_id=ozon_type_id,  # forwarded by eg-importer → OzonStrategy value_id resolution
+            research_mode=research_mode,
+            enable_web_search=enable_web_search,
         )
 
         targets: list[TargetAttribute] = []

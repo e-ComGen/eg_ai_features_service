@@ -178,6 +178,13 @@ class ExtractionContext(BaseModel):
     max_cost_usd: float = 0.10
     llm_calls_so_far: int = 0
 
+    # Request-driven research intent (threaded: /process-batch → job_processor → adapter).
+    # research_mode == "deep" (or enable_web_search) forces web-search on the remaining
+    # targets in Stage 4, bypassing the CostPredictor gate.
+    research_mode: Optional[str] = None       # "off" | "fallback" | "deep"
+    enable_web_search: bool = False
+    tokens_used_so_far: int = 0
+
 
 # ---------------------------------------------------------------------------
 # Abstract interfaces

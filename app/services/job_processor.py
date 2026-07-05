@@ -367,6 +367,8 @@ class JobProcessor:
                 image_urls=getattr(product, "image_urls", []),
                 targets_raw=targets_raw,
                 marketplace=options.marketplace if options else None,
+                research_mode=research_mode.value if research_mode else None,
+                enable_web_search=bool(options.enable_web_search) if options else False,
             )
             result_dict = self._values_to_legacy_format(
                 av_list, schema, targets_raw,

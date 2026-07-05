@@ -4706,6 +4706,11 @@ class PipelineOrchestrator:
         #  - optional_ws: remaining targets that classifier routed to WEB_SEARCH
         #                 → CostPredictor decides as before
         force_attr_ids = self._strategy.force_websearch_targets(targets, context)
+        # Deep research intent (request-driven): force web-search on all remaining
+        # unfilled targets, bypassing the CostPredictor gate. ws_applicable still applies
+        # below, so non-web-searchable targets are still excluded.
+        if getattr(context, "research_mode", None) == "deep" or getattr(context, "enable_web_search", False):
+            force_attr_ids = set(force_attr_ids) | {t.id for t in remaining}
         ws_applicable = self._sources[Source.WEB_SEARCH].is_applicable
 
         # Force targets: all targets in the force list (not just unfilled ones — we want
