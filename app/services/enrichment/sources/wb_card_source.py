@@ -82,6 +82,7 @@ from app.services.enrichment.strategies.dictionaries.ozon_loader import (
 from app.services.enrichment.strategies.dictionaries.eg_wb_ozon_field_map import (
     eg_get_field_map,
 )
+from app.services.enrichment.sources import wb_field_map_selfheal
 from app.services.enrichment.strategies.dictionaries.unit_normalizer import (
     normalize_value as _normalize_unit_value,
 )
@@ -1717,6 +1718,38 @@ class WbCardSource(AttributeSource):
             verified_map = eg_get_field_map(wb_subject, cat_id, type_id)
         except Exception as exc:
             logger.debug("[WbCard] eg_get_field_map failed: %s", exc)
+
+        # Step 2 (FIX-17): LIVE self-heal -- WB names absent from the static
+        # verified_map get LLM-mapped (DeepSeek) onto an existing Ozon attribute
+        # of this (cat_id, type_id) and unioned into a growing on-disk cache.
+        # Only fires when there is something to heal; graceful no-op fallback on
+        # any failure (flag off / no cat-type / no ozon_chars / no chars / LLM
+        # error) leaves verified_map exactly as the static-only result.
+        if (wb_field_map_selfheal.is_enabled()
+                and cat_id
+                and type_id
+                and ozon_chars
+                and chars):
+            try:
+                wb_fields = {
+                    c["name"].strip().lower(): c["value"].strip()
+                    for c in chars
+                    if isinstance(c, dict) and c.get("name") and c.get("value")
+                }
+                if wb_fields:
+                    healed_result = wb_field_map_selfheal.self_heal_sync(
+                        static_map=verified_map,
+                        wb_fields=wb_fields,
+                        ozon_attrs=ozon_chars,
+                        wb_subject=wb_subject,
+                        ozon_cat_id=cat_id,
+                        ozon_type_id=type_id,
+                    )
+                    verified_map = {
+                        k: v for k, v in healed_result.items() if v is not None
+                    }
+            except Exception as exc:
+                logger.debug("[WbCard] self_heal failed: %s", exc)
 
         evidence_short = f"wb:{title[:50]} | match={score:.1f}"
         conf = _CONF_EXACT if mode == "exact" else _CONF_BRAND_LINE
