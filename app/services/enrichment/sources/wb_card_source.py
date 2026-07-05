@@ -286,6 +286,7 @@ _CHROME_UA = (
 
 _HTTP_TIMEOUT = 15.0
 _MAX_CANDIDATES = 10  # топ-N уникальных nm_id из scrape.do search.wb.ru (многие дадут 404)
+_MAX_SCAN_PRODUCTS = 50  # сколько верхних products сканировать для локального рерэнка (#3)
 
 # Ретрай Serper-поиска. Serper флакает при concurrency (троттлинг, пустые
 # ответы): один и тот же запрос то даёт 10 nm_id, то 0. Если поиск вернул 0
@@ -676,6 +677,48 @@ def _wb_query_type_word(product_name: str, cat_leaf: Optional[str]) -> Optional[
         if _is_noun_lemma(low):
             return tok
     return None
+
+
+def _rank_candidates(products: list, query: str,
+                     limit: int = _MAX_CANDIDATES,
+                     scan: int = _MAX_SCAN_PRODUCTS) -> list:
+    """Чистый рерэнк nm_id по релевантности name к query (top-limit). Дедуп, скан
+    первых `scan`. Нет name ни у кого → graceful fallback на popular-порядок."""
+    candidates = []
+    seen_ids: set[int] = set()
+    for idx, p in enumerate(products[:scan]):
+        if not isinstance(p, dict) or p.get("id") is None:
+            continue
+        try:
+            nm_id = int(p["id"])
+        except (TypeError, ValueError):
+            continue
+        if nm_id in seen_ids:
+            continue
+        seen_ids.add(nm_id)
+        candidates.append((nm_id, p.get("name", "") or "", p.get("brand", "") or "", idx))
+    if not any(name.strip() for _, name, _, _ in candidates):
+        return [nm_id for nm_id, _, _, _ in candidates[:limit]]
+    scored = [(_candidate_relevance(query, name, brand), api_index, nm_id)
+              for nm_id, name, brand, api_index in candidates]
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [nm_id for _, _, nm_id in scored[:limit]]
+
+
+def _candidate_relevance(query: str, name: str, brand: str = "") -> float:
+    """Чистый скорер: доля токенов запроса, встречающихся в name+brand товара.
+
+    Локальный рерэнк кандидатов search.wb.ru (0 кредитов): popular-порядок часто
+    прячет точный артикул вне топ-10. Токенизация Cyrillic-aware. Диапазон [0.0, 1.0].
+    """
+    query_tokens = [t for t in re.findall(r"[0-9a-zа-яё]+", query.lower()) if len(t) >= 2]
+    if not query_tokens:
+        return 0.0
+    product_tokens = {
+        t for t in re.findall(r"[0-9a-zа-яё]+", f"{name} {brand}".lower()) if len(t) >= 2
+    }
+    overlap = sum(1 for t in query_tokens if t in product_tokens)
+    return overlap / len(query_tokens)
 
 
 def _card_url(nn: str, nm_id: int) -> str:
@@ -1158,28 +1201,12 @@ class WbCardSource(AttributeSource):
         if not isinstance(products, list):
             products = []
 
-        seen: set[int] = set()
-        nm_ids: list[int] = []
-        for p in products:
-            if not isinstance(p, dict):
-                continue
-            raw_id = p.get("id")
-            if raw_id is None:
-                continue
-            try:
-                nm_id = int(raw_id)
-            except (TypeError, ValueError):
-                continue
-            if nm_id in seen:
-                continue
-            seen.add(nm_id)
-            nm_ids.append(nm_id)
-            if len(nm_ids) >= _MAX_CANDIDATES:
-                break
+        nm_ids = _rank_candidates(products, query)
 
         logger.info(
-            "[WbCard] scrape.do search: q='%s' status=%s credits=%s products=%d -> %d nm_id: %s",
-            query[:120], res.status_code, res.credits_used, len(products), len(nm_ids), nm_ids,
+            "[WbCard] scrape.do search: q='%s' status=%s credits=%s products=%d scanned=%d -> %d nm_id: %s",
+            query[:120], res.status_code, res.credits_used, len(products),
+            min(len(products), _MAX_SCAN_PRODUCTS), len(nm_ids), nm_ids,
         )
         return nm_ids
 
