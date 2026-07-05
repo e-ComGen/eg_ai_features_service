@@ -6,14 +6,17 @@
 
 Spec: docs/architecture/pipeline.md, section "Stage 2 / LlmKnowledgeSource".
 """
+import asyncio
 from typing import Optional
+
+from app import config
 from pydantic import BaseModel, Field, AliasChoices, model_validator
 from app.services.enrichment.base import (
     AttributeSource, AttributeValue, TargetAttribute, ExtractionContext,
     Source, LlmJudge,
 )
 from app.services.providers.structured_adapter import StructuredLlmManager
-from app.services.providers.factory import get_main_manager, get_openai_strict_manager
+from app.services.providers.factory import get_main_manager, get_openai_strict_manager, get_ensemble_managers, get_grounding_manager
 from app.services.enrichment.judges.knowledge_judge import KnowledgeJudge
 from app.services.enrichment.prompt_router import (
     format_target_line, build_meta_guidance,
@@ -21,6 +24,7 @@ from app.services.enrichment.prompt_router import (
 )
 from app.services.enrichment.strategies.base import MarketplaceStrategy
 from app.services.enrichment.strategies.default_strategy import DefaultStrategy
+from app.services.enrichment.ensemble.reconcile import reconcile as ensemble_reconcile
 
 
 class _KnowledgeAttr(BaseModel):
@@ -115,7 +119,15 @@ class LlmKnowledgeSource(AttributeSource):
             "below 0.85 = DO NOT include. "
             "Set confidence=0.95 for facts you know with certainty from official specs or brand history. "
             "Brief reasoning helps audit (e.g., 'official Samsung spec', 'Adidas classic model'). "
-            "If the target has is_collection=true, return a JSON array of values; otherwise a single scalar."
+            "If the target has is_collection=true, return a JSON array of values; otherwise a single scalar. "
+            "NEVER output: country of origin / manufacturer country; material composition or content "
+            "percentages; shelf-life / service-life / warranty periods; specific technical specs "
+            "(chipset/SoC, GPU, battery capacity mAh, power W, IP rating, Bluetooth/Wi-Fi version, "
+            "RPM, suction Pa, screen/camera resolution) — UNLESS you are certain of THIS exact branded "
+            "product model AND that value is an official published spec. For generic, commodity, or "
+            "unbranded items, SKIP these fields entirely. "
+            "Do NOT fabricate a value to satisfy a required field. Leaving a field empty is correct "
+            "and expected when the source does not support a value."
             + build_meta_guidance()
             + already_rule
         )
@@ -133,6 +145,16 @@ class LlmKnowledgeSource(AttributeSource):
         ]
 
         target_by_id = {t.id: t for t in targets}
+        if config.LLM_ENSEMBLE_ENABLED:
+            return await self._extract_ensemble(
+                context=context,
+                chunks=chunks,
+                context_prefix=context_prefix,
+                system_prompt=system_prompt,
+                target_by_id=target_by_id,
+                effective_targets=effective_targets,
+            )
+
         all_extracted: list[_KnowledgeAttr] = []
 
         for chunk in chunks:
@@ -183,6 +205,78 @@ class LlmKnowledgeSource(AttributeSource):
             )
             for a in all_extracted
         ]
+
+    async def _extract_ensemble(
+        self,
+        context: ExtractionContext,
+        chunks: list[list[TargetAttribute]],
+        context_prefix: str,
+        system_prompt: str,
+        target_by_id: dict[int, TargetAttribute],
+        effective_targets: list[TargetAttribute],
+    ) -> list[AttributeValue]:
+        """Phase 2a: 2-vendor ensemble path (DeepSeek + OpenAI gpt-4o-mini), strict consensus.
+
+        Called only when config.LLM_ENSEMBLE_ENABLED is True (see extract() above).
+        Calls model A and model B IN PARALLEL per chunk via asyncio.gather, then
+        reconciles each chunk's pair of results via ensemble.reconcile() (strict
+        2-model consensus: only-in-one-model values are abstained, never emitted).
+        KnowledgeJudge is intentionally NOT invoked in this path -- consensus
+        replaces it. Cross-chunk dedup mirrors the existing single-model path:
+        first occurrence of a given attribute_id wins, and only ids that were
+        actually requested (in effective_targets) are ever emitted.
+        """
+        manager_a, manager_b = get_ensemble_managers()
+        grounding_manager = get_grounding_manager()
+        arbiter = self._llm  # reuse the source's configured manager (DeepSeek by default) as the cheap arbiter
+
+        _eff_ids = {t.id for t in effective_targets}
+        all_values: list[AttributeValue] = []
+
+        for chunk in chunks:
+            targets_block = "\n".join([format_target_line(t) for t in chunk])
+            user_text = (
+                context_prefix
+                + f"Target attributes:\n{targets_block}\n\n"
+                f"Return only attributes you confidently know. Field name: 'known_attributes'."
+            )
+            response_model = self._strategy.build_response_model(_KnowledgeResponse, chunk)
+
+            (parsed_a, _tokens_a), (parsed_b, _tokens_b) = await asyncio.gather(
+                manager_a.structured_request(
+                    system_prompt=system_prompt, user_text=user_text, response_model=response_model,
+                ),
+                manager_b.structured_request(
+                    system_prompt=system_prompt, user_text=user_text, response_model=response_model,
+                ),
+            )
+            context.llm_calls_so_far += 2
+
+            chunk_ids = {t.id for t in chunk}
+            list_a = [
+                a for a in (parsed_a.known_attributes if parsed_a is not None else [])
+                if a.attribute_id in chunk_ids and a.attribute_id in _eff_ids
+            ]
+            list_b = [
+                b for b in (parsed_b.known_attributes if parsed_b is not None else [])
+                if b.attribute_id in chunk_ids and b.attribute_id in _eff_ids
+            ]
+
+            chunk_values = await ensemble_reconcile(
+                list_a, list_b, chunk, arbiter, judge=self._judge, context=context,
+                manager_a=manager_a, manager_b=manager_b, grounding_manager=grounding_manager,
+            )
+            all_values.extend(chunk_values)
+
+        # Cross-chunk dedup safety net (mirrors the single-model path): first
+        # occurrence per attribute_id wins, only ids that were actually requested.
+        seen: set[int] = set()
+        deduped: list[AttributeValue] = []
+        for v in all_values:
+            if v.attribute_id in _eff_ids and v.attribute_id not in seen:
+                seen.add(v.attribute_id)
+                deduped.append(v)
+        return deduped
 
     def get_judge(self) -> LlmJudge:
         return self._judge

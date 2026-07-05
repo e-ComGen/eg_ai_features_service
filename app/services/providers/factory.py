@@ -229,6 +229,51 @@ def get_gemini_pdf_provider() -> "GeminiPdfProvider | None":
 # Internal helper
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Phase 2a ensemble -- 2 genuinely different vendors for llm_knowledge consensus
+# ---------------------------------------------------------------------------
+
+def get_ensemble_managers() -> "tuple[StructuredLlmManager, OpenAIStrictProvider]":
+    """Return (manager_a, manager_b) for the Phase 2a llm_knowledge ensemble.
+
+    manager_a = explicit DeepSeek-backed StructuredLlmManager (vendor A). This is
+    intentionally NOT get_main_manager() -- it must stay DeepSeek even if
+    PROVIDER_MAIN is ever switched to "openai", because vendor diversity between
+    A and B is what makes ensemble consensus meaningful (uncorrelated hallucination
+    modes). Uses config.DEEPSEEK_DEFAULT_MODEL.
+
+    manager_b = OpenAI gpt-4o-mini via OpenAIStrictProvider (vendor B), model name
+    from config.LLM_ENSEMBLE_MODEL_B. OpenAIStrictProvider already exposes an
+    async structured_request(system_prompt, user_text, response_model) method
+    duck-type compatible with StructuredLlmManager, so no wrapper is needed.
+
+    Only called when config.LLM_ENSEMBLE_ENABLED is True.
+    """
+    manager_a = StructuredLlmManager(
+        provider=DeepSeekProvider(),
+        model=config.DEEPSEEK_DEFAULT_MODEL,
+    )
+    manager_b = OpenAIStrictProvider(
+        api_key=config.OPENAI_API_KEY,
+        model=config.LLM_ENSEMBLE_MODEL_B,
+    )
+    return manager_a, manager_b
+
+
+def get_grounding_manager() -> "OpenRouterProvider | None":
+    """Return an OpenRouter-backed provider for Phase-3 web-search grounding, or None.
+
+    Uses config.OPENROUTER_API_KEY (env OPEN_ROUTER_API_KEY). When the key is absent,
+    returns None so grounding becomes a silent no-op (never raises, never blocks the
+    pipeline). Model is config.GROUNDING_MODEL (e.g. perplexity/sonar -- a search-grounded
+    model). The raw provider is returned; grounding.py calls its .complete() and parses text.
+    """
+    if not config.OPENROUTER_API_KEY:
+        logger.debug("get_grounding_manager: OPENROUTER_API_KEY not set, grounding disabled")
+        return None
+    return OpenRouterProvider()
+
+
 def _make_raw_provider(provider_name: str) -> LlmProvider:
     if provider_name == "deepseek":
         return DeepSeekProvider()

@@ -201,6 +201,28 @@ OZON_API_RESOLVE_ENABLED: bool = os.getenv(
     "OZON_API_RESOLVE_ENABLED", "true"
 ).lower() not in ("0", "false", "no")
 
+# ---------------------------------------------------------------------------
+# Phase 2a: llm_knowledge ensemble (2-vendor strict consensus) -- DEFAULT OFF
+# ---------------------------------------------------------------------------
+# When True, LlmKnowledgeSource calls DeepSeek (A) + OpenAI gpt-4o-mini (B) in
+# parallel per chunk and reconciles via strict consensus instead of a single
+# self-reported-confidence call. See app/services/enrichment/ensemble/reconcile.py.
+LLM_ENSEMBLE_ENABLED: bool = os.getenv("LLM_ENSEMBLE_ENABLED", "false").lower() in ("1", "true", "yes")
+LLM_ENSEMBLE_MODEL_B: str = os.getenv("LLM_ENSEMBLE_MODEL_B", "gpt-4o-mini")
+LLM_ENSEMBLE_CONFIDENCE: float = float(os.getenv("LLM_ENSEMBLE_CONFIDENCE", "0.9"))
+LLM_ENSEMBLE_FUZZY_THRESHOLD: float = float(os.getenv("LLM_ENSEMBLE_FUZZY_THRESHOLD", "92")) / 100.0
+LLM_ENSEMBLE_VECTOR_LAYER: bool = os.getenv("LLM_ENSEMBLE_VECTOR_LAYER", "false").lower() in ("1", "true", "yes")
+# Phase 2b solo policy: "judge" (default, smart -- silence is not a veto; a solo
+# single-model value is confirmed via the existing KnowledgeJudge before emit) or
+# "drop" (strict Phase-2a behaviour -- any solo value is discarded).
+LLM_ENSEMBLE_SOLO_POLICY: str = os.getenv("LLM_ENSEMBLE_SOLO_POLICY", "judge")
+# Phase 2c: which vendor judges a solo value -- "cross" (opposite vendor, default) | "main" (same-vendor, old 2b).
+LLM_ENSEMBLE_SOLO_JUDGE: str = os.getenv("LLM_ENSEMBLE_SOLO_JUDGE", "main")
+# Phase 3: external web-search grounding (the only thing that catches category-plausible-but-
+# product-wrong values). DEFAULT OFF. Grounds only the disagreement queue + enum-solo values.
+LLM_ENSEMBLE_GROUNDING_ENABLED: bool = os.getenv("LLM_ENSEMBLE_GROUNDING_ENABLED", "false").lower() in ("1", "true", "yes")
+GROUNDING_MODEL: str = os.getenv("GROUNDING_MODEL", "perplexity/sonar")
+
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set in environment (.env)")
 if not INTERNAL_SERVICE_SECRET:
