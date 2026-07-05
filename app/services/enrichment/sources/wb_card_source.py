@@ -88,7 +88,7 @@ from app.services.enrichment.strategies.dictionaries.unit_normalizer import (
 )
 from app.services.enrichment.size_normalizer import extract_wb_sizes
 from app.services.providers.scrapedo_client import scrapedo_fetch
-from app.services.enrichment.sources.donor_gate import DonorMatchGate
+from app.services.enrichment.sources.donor_gate import DonorMatchGate, DonorVerdict
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +287,22 @@ _CHROME_UA = (
 _HTTP_TIMEOUT = 15.0
 _MAX_CANDIDATES = 10  # топ-N уникальных nm_id из scrape.do search.wb.ru (многие дадут 404)
 _MAX_SCAN_PRODUCTS = 50  # сколько верхних products сканировать для локального рерэнка (#3)
+_DONOR_GATE_MAX_LLM = int(os.getenv("WB_DONOR_GATE_MAX_LLM", "3"))
+
+
+class _GateBudget:
+    """Кап суммарных donor-gate LLM-вызовов на один extract-проход (#2)."""
+    def __init__(self, cap: int = _DONOR_GATE_MAX_LLM) -> None:
+        self.cap = cap
+        self.used = 0
+
+    @property
+    def remaining(self) -> int:
+        return self.cap - self.used
+
+    def charge(self, was_llm_call: bool) -> None:
+        if was_llm_call:
+            self.used += 1
 
 # Ретрай Serper-поиска. Serper флакает при concurrency (троттлинг, пустые
 # ответы): один и тот же запрос то даёт 10 nm_id, то 0. Если поиск вернул 0
@@ -1067,33 +1083,21 @@ class WbCardSource(AttributeSource):
             )
 
             # ---- PICK BEST (тип-гейт → match-фильтр → среди релевантных богатую) ----
-            best = self._pick_best_card(used_query, cat_leaf, target_type, cards)
-            if best is None:
+            # ---- PICK + LLM DONOR GATE с re-pick (#2) ----
+            # brand_line/exact-с-расхождением модели требуют LLM-гейта; на
+            # DIFFERENT/UNKNOWN _select_gated_card пробует следующую-лучшую карту
+            # из пула (кап _DONOR_GATE_MAX_LLM), вместо старого whole-donor drop.
+            budget = _GateBudget()
+            selected = await self._select_gated_card(
+                used_query, cat_leaf, target_type, cards, full_name, budget
+            )
+            if selected is None:
                 return []
-            nm_id, card, title, score = best
-            mode = self._classify_match(score)
-            if mode == "skip":
-                logger.info("[WbCard] best score=%.1f < %.0f — skip", score, _BRAND_LINE_THRESHOLD)
-                return []
-
+            nm_id, card, title, score, mode = selected
             logger.info(
                 "[WbCard] match=%s score=%.1f title='%s' nm=%s",
                 mode, score, title[:80], nm_id,
             )
-
-            # ---- LLM DONOR GATE (brand_line + exact-с-расхождением модели) ----
-            # brand_line (60-78): «того же бренда/типа» — Osprey Daylite проходит
-            # за Osprey Farpoint, LLM проверяет тот ли это товар. exact (≥78) с
-            # СОВПАДЕНИЕМ модель-индекса доверяем fuzzy без LLM; exact с
-            # РАСХОЖДЕНИЕМ (Mi Band 8 → карточка Mi Band 7 @78.2) тоже зовёт гейт.
-            if self._should_run_donor_gate(mode, full_name, title):
-                same = await self._donor_gate.is_same_product(full_name, title)
-                if not same:
-                    logger.info(
-                        "[WbCard] DonorGate DIFFERENT target='%s' donor='%s' — возвращаем []",
-                        full_name[:60], title[:60],
-                    )
-                    return []
 
             chars = self._extract_options(card)
             if not chars:
@@ -1397,14 +1401,14 @@ class WbCardSource(AttributeSource):
     # Match scoring
     # ------------------------------------------------------------------
 
-    def _pick_best_card(
+    def _rank_cards(
         self,
         query: str,
         cat_leaf: Optional[str],
         target_type: Optional[str],
         cards: list[tuple[int, dict]],
-    ) -> Optional[tuple[int, dict, str, float]]:
-        """Выбрать карточку среди скачанных: тип-гейт → матч → богатство.
+    ) -> list[tuple[int, dict, str, float]]:
+        """Ранжировать скачанные карточки: тип-гейт → матч → богатство.
 
         Прежняя стратегия брала ОДИН лучший по fuzzy-скору вслепую — если у
         лидера была бедная карточка (3 options), мы теряли соседнюю богатую с
@@ -1429,7 +1433,7 @@ class WbCardSource(AttributeSource):
              приоритетнее (не утащить богатую карточку чужой модели), далее
              n_opts, далее score.
 
-        Возвращает (nm_id, card, title, score) или None.
+        Возвращает отсортированный список (nm_id, card, title, score), лучший первым.
         """
         # ---- Шаг 0: жёсткий тип-гейт ----
         if target_type:
@@ -1456,7 +1460,7 @@ class WbCardSource(AttributeSource):
                     "[WbCard] тип-гейт: НИ ОДНОЙ карточки типа '%s' — честный 0 "
                     "(не подмешиваем чужой тип)", target_type,
                 )
-                return None
+                return []
             cards = gated
 
         # Модель-токены запроса (артикулы 501/M/Resolve2) — если заданы, карточка
@@ -1492,8 +1496,8 @@ class WbCardSource(AttributeSource):
             # вернуть абсолютного лидера по скору, дальше _classify_match → skip.
             top = max(scored, key=lambda c: c["score"], default=None)
             if top is None:
-                return None
-            return (top["nm_id"], top["card"], top["title"], top["score"])
+                return []
+            return [(top["nm_id"], top["card"], top["title"], top["score"])]
 
         # Тип уже гарантирован тип-гейтом, бренд/модель — порогом матча. Среди
         # этих релевантных кандидатов БОГАТСТВО (n_opts) — основной ключ выбора:
@@ -1503,20 +1507,80 @@ class WbCardSource(AttributeSource):
         # её выбрать. ГАРД: при заданных model-токенах запроса model-совпавшие
         # кандидаты приоритетнее (чтобы не утащить богатую карточку чужой модели);
         # при равной модельности решает n_opts, далее score.
-        best = max(relevant, key=lambda c: (c["model_match"], c["n_opts"], c["score"]))
+        relevant.sort(key=lambda c: (c["model_match"], c["n_opts"], c["score"]), reverse=True)
 
         if logger.isEnabledFor(logging.INFO):
             ranking = ", ".join(
                 f"nm={c['nm_id']}(score={c['score']:.1f},opts={c['n_opts']}"
                 f",mm={int(c['model_match'])})"
-                for c in sorted(relevant, key=lambda c: (-c["n_opts"], -c["score"]))
+                for c in relevant
             )
             logger.info(
                 "[WbCard] pick: %d релевантных → выбран nm=%s (score=%.1f, opts=%d) | %s",
-                len(relevant), best["nm_id"], best["score"], best["n_opts"], ranking,
+                len(relevant), relevant[0]["nm_id"], relevant[0]["score"],
+                relevant[0]["n_opts"], ranking,
             )
 
-        return (best["nm_id"], best["card"], best["title"], best["score"])
+        return [(c["nm_id"], c["card"], c["title"], c["score"]) for c in relevant]
+
+    async def _select_gated_card(self, query, cat_leaf, target_type, cards, full_name, budget):
+        """Выбрать карту из ranked с donor-gate re-pick. (nm_id,card,title,score,mode) или None."""
+        ranked = self._rank_cards(query, cat_leaf, target_type, cards)
+        stats = {k: 0 for k in ("clean", "same", "different", "unknown", "retry", "cap_hit", "unknown_drop")}
+        result = None
+        for nm_id, card, title, score in ranked:
+            mode = self._classify_match(score)
+            if mode == "skip":
+                continue
+            if not self._should_run_donor_gate(mode, full_name, title):
+                stats["clean"] += 1
+                result = (nm_id, card, title, score, mode)
+                break
+            if budget.remaining <= 0:
+                stats["cap_hit"] += 1
+                break
+            verdict, was_llm = await self._donor_gate.verdict(full_name, title)
+            budget.charge(was_llm)
+            if verdict == DonorVerdict.SAME:
+                stats["same"] += 1
+                result = (nm_id, card, title, score, mode)
+                break
+            if verdict == DonorVerdict.DIFFERENT:
+                stats["different"] += 1
+                continue
+
+            # UNKNOWN → ретрай×1 если бюджет есть
+            stats["unknown"] += 1
+            if budget.remaining > 0:
+                stats["retry"] += 1
+                verdict2, was_llm2 = await self._donor_gate.verdict(full_name, title)
+                budget.charge(was_llm2)
+                if verdict2 == DonorVerdict.SAME:
+                    stats["same"] += 1
+                    result = (nm_id, card, title, score, mode)
+                    break
+                if verdict2 == DonorVerdict.DIFFERENT:
+                    stats["different"] += 1
+                    continue
+                stats["unknown"] += 1
+            stats["unknown_drop"] += 1
+            continue
+        logger.info(
+            "[WbCard] donor_gate_stats: %s used=%d/%d → %s",
+            stats, budget.used, budget.cap, "hit" if result else "MISS",
+        )
+        return result
+
+    def _pick_best_card(
+        self,
+        query: str,
+        cat_leaf: Optional[str],
+        target_type: Optional[str],
+        cards: list[tuple[int, dict]],
+    ) -> Optional[tuple[int, dict, str, float]]:
+        """Лучшая карточка = первый элемент _rank_cards (или None). Обёртка."""
+        ranked = self._rank_cards(query, cat_leaf, target_type, cards)
+        return ranked[0] if ranked else None
 
     @staticmethod
     def _type_compatible(target_type: str, subj_lemmas: set[str]) -> bool:

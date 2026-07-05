@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
 
 from pydantic import BaseModel
@@ -64,6 +65,12 @@ class _SameProductResponse(BaseModel):
     reason: str = ""
 
 
+class DonorVerdict(Enum):
+    SAME = auto()
+    DIFFERENT = auto()
+    UNKNOWN = auto()
+
+
 class DonorMatchGate:
     """Хранит кэш и lazy-инициализированный LLM manager.
 
@@ -73,7 +80,7 @@ class DonorMatchGate:
 
     def __init__(self) -> None:
         self._llm: Optional[object] = None  # StructuredLlmManager | OpenAIManager
-        self._cache: dict[tuple[str, str], bool] = {}
+        self._cache: dict[tuple[str, str], "DonorVerdict"] = {}
 
     def _get_llm(self):
         if self._llm is None:
@@ -81,45 +88,32 @@ class DonorMatchGate:
             self._llm = get_main_manager()
         return self._llm
 
-    async def is_same_product(self, target_name: str, donor_title: str) -> bool:
-        """True если донор описывает тот же товар что и цель.
-
-        Fail-open: при ошибке LLM возвращает True (не режем покрытие).
-        """
+    async def verdict(self, target_name: str, donor_title: str) -> tuple["DonorVerdict", bool]:
+        """(вердикт, was_llm_call). Один LLM-вызов, без внутреннего ретрая. UNKNOWN не кэшируется."""
         if not _GATE_ENABLED:
-            return True
-
+            return (DonorVerdict.SAME, False)
         key = (target_name.strip().lower(), donor_title.strip().lower())
         if key in self._cache:
-            return self._cache[key]
-
-        user_text = (
-            f"Целевой товар: «{target_name}»\n"
-            f"Донор-карточка: «{donor_title}»\n\n"
-            "Это один и тот же товар?"
-        )
-
-        result = True  # fail-open default
+            return (self._cache[key], False)
+        user_text = (f"Целевой товар: «{target_name}»\n"
+                     f"Донор-карточка: «{donor_title}»\n\nЭто один и тот же товар?")
         try:
-            llm = self._get_llm()
             parsed, _tokens = await asyncio.wait_for(
-                llm.structured_request(
-                    system_prompt=_SYSTEM_PROMPT,
-                    user_text=user_text,
-                    response_model=_SameProductResponse,
-                ),
-                timeout=12,
-            )
-            if parsed is not None:
-                result = bool(parsed.same)
-                logger.info(
-                    "[DonorGate] target='%s' donor='%s' → same=%s reason='%s'",
-                    target_name[:60], donor_title[:60], result, parsed.reason[:80],
-                )
+                self._get_llm().structured_request(
+                    system_prompt=_SYSTEM_PROMPT, user_text=user_text,
+                    response_model=_SameProductResponse), timeout=12)
+            if parsed is None:
+                return (DonorVerdict.UNKNOWN, True)
+            verdict = DonorVerdict.SAME if parsed.same else DonorVerdict.DIFFERENT
+            logger.info("[DonorGate] target='%s' donor='%s' → verdict=%s reason='%s'",
+                        target_name[:60], donor_title[:60], verdict.name, parsed.reason[:80])
+            self._cache[key] = verdict
+            return (verdict, True)
         except Exception as exc:
-            logger.warning(
-                "[DonorGate] LLM ошибка — fail-open (пропускаем донора): %s", exc
-            )
+            logger.warning("[DonorGate] LLM ошибка → UNKNOWN: %s", exc)
+            return (DonorVerdict.UNKNOWN, True)
 
-        self._cache[key] = result
-        return result
+    async def is_same_product(self, target_name: str, donor_title: str) -> bool:
+        """Fail-open bool-обёртка над verdict (IceCat). UNKNOWN/SAME→True, DIFFERENT→False."""
+        v, _ = await self.verdict(target_name, donor_title)
+        return v != DonorVerdict.DIFFERENT
