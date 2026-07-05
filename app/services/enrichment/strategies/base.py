@@ -21,6 +21,13 @@ class ValidationResult(BaseModel):
 class MarketplaceStrategy(ABC):
     """Базовая абстракция marketplace-specific логики."""
 
+    # Привязывает ли стратегия enum-значения к словарным value_id. При True
+    # enum со значением value_id=None ДРОПАЕТСЯ (целостность Ozon/WB-словаря).
+    # cscart/DefaultStrategy работает по строковым лейблам (variant_id резолвит
+    # PHP-аппликатор), поэтому переопределяет во False, чтобы label-only enum'ы
+    # доживали до ответа. Fail-closed дефолт = True.
+    requires_dictionary_value_ids: bool = True
+
     @property
     @abstractmethod
     def name(self) -> str:

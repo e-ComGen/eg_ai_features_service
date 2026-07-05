@@ -5289,8 +5289,13 @@ class PipelineOrchestrator:
             resolved = await self._apply_wb_api_resolve(resolved, targets, context)
 
         resolved = _drop_ungrounded_color_guess(resolved, targets)
-        resolved = _drop_unresolved_optional_enums(resolved, targets)
-        resolved = _drop_unresolved_required_enums(resolved, targets)
+        # Дроп нерезолвнутых enum'ов — guard под словарную привязку Ozon/WB
+        # (там value_id обязателен). cscart/DefaultStrategy работает по лейблам
+        # без value_id, поэтому для неё guard пропускаем — иначе каждый select
+        # молча вылетает. Цвет-guard выше остаётся безусловным.
+        if self._strategy.requires_dictionary_value_ids:
+            resolved = _drop_unresolved_optional_enums(resolved, targets)
+            resolved = _drop_unresolved_required_enums(resolved, targets)
         return resolved
 
     # ──────────────────────────────────────────────────────────────────────────
