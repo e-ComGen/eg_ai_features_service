@@ -639,6 +639,13 @@ def _common_prefix_len(a: str, b: str) -> int:
     return i
 
 
+# RU-словоизменительные суффиксы: короткий корень категории («сок», «нож») отличается
+# от словоформы в заголовке («соки», «ножи») именно такой флексией. Матчим 3-символьные
+# корни, НЕ ловя ложные пары («сок↔сокол» — «ол» не флексия; «сок↔соска» — не префикс).
+_RU_INFLECTIONS = frozenset({"и", "ы", "а", "я", "е", "у", "ю", "ов", "ев", "ей",
+                             "ам", "ям", "ах", "ях", "ка", "ки"})
+
+
 def _category_present_in_title(cat_leaf_low: str, title_low: str) -> bool:
     r"""FIX-12: stem/prefix-aware проверка присутствия категории в заголовке карточки.
 
@@ -646,18 +653,23 @@ def _category_present_in_title(cat_leaf_low: str, title_low: str) -> bool:
     карточки Ozon («Смартфоны» vs «Смартфон POCO...», «Дрели ударные» vs «Дрель ударная...»).
     Буквальная подстрока это не ловит; вместо этого сравниваем общий префикс токенов.
 
-    Токенизация по [\s\-–—/]+, токены длиной >= 4 символа. Категория
-    считается присутствующей, если хоть один токен категории делит общий префикс
-    >= 4 симв. с каким-либо токеном title (смартфоны↔смартфон, дрели↔дрель, куртки↔куртка).
+    Токенизация по [\s\-–—/]+, токены длиной >= 3 символа. Матч двумя правилами:
+    (A) общий префикс >= 4 симв. (смартфоны↔смартфон, дрели↔дрель, куртки↔куртка);
+    (B) короткий токен — полный префикс длинного, остаток <= 2 симв. и он ∈ RU-флексий
+    (сок↔соки, нож↔ножи) — чинит 3-символьные корни, которые старое правило теряло.
     Чистая функция: без I/O, без внешних зависимостей. Пустые строки → False.
     """
     if not cat_leaf_low or not title_low:
         return False
-    cat_tokens = [t for t in re.split(r"[\s\-–—/]+", cat_leaf_low.lower()) if len(t) >= 4]
-    title_tokens = [t for t in re.split(r"[\s\-–—/]+", title_low.lower()) if len(t) >= 4]
+    cat_tokens = [t for t in re.split(r"[\s\-–—/]+", cat_leaf_low.lower()) if len(t) >= 3]
+    title_tokens = [t for t in re.split(r"[\s\-–—/]+", title_low.lower()) if len(t) >= 3]
     for ct in cat_tokens:
         for tt in title_tokens:
             if _common_prefix_len(ct, tt) >= 4:
+                return True
+            short, long = (ct, tt) if len(ct) <= len(tt) else (tt, ct)
+            if (long.startswith(short) and 0 < len(long) - len(short) <= 2
+                    and long[len(short):] in _RU_INFLECTIONS):
                 return True
     return False
 
