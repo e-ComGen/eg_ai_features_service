@@ -8,6 +8,8 @@ rapidfuzz
 pymorphy3
 pymorphy3-dicts-ru
 sentence-transformers
+# CompetitorRag vector store client — MUST match qdrant server major.minor (server @ 1.18.x)
+qdrant-client==1.18.0
 numpy
 python-dotenv
 # Stage 2: web-fetch dependencies
