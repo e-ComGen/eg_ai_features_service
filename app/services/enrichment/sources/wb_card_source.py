@@ -1228,6 +1228,7 @@ class WbCardSource(AttributeSource):
             if data is not None:
                 if nn != primary_nn:
                     logger.info("[WbCard] nm=%s найден на basket-%s (fallback)", nm_id, nn)
+                data["_wb_basket_nn"] = nn
                 return data
         logger.info("[WbCard] card.json не найден ни на одном basket для nm=%s", nm_id)
         return None
@@ -1385,7 +1386,7 @@ class WbCardSource(AttributeSource):
 
         photo_count = media.get("photo_count")
         if isinstance(photo_count, int) and photo_count > 0:
-            nn = _basket_nn_from_table(nm_id)
+            nn = card.get("_wb_basket_nn") or _basket_nn_from_table(nm_id)
             vol = nm_id // 100_000
             part = nm_id // 1000
             base = f"https://basket-{nn}.wbbasket.ru/vol{vol}/part{part}/{nm_id}/images/big"

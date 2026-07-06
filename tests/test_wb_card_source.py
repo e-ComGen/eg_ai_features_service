@@ -208,7 +208,10 @@ async def test_inv13d_fetch_card_finds_basket_37():
 
     with patch.object(src, "_try_basket", side_effect=fake_try_basket):
         result = await src._fetch_card(client, nm_id)
-    assert result == {"nm_id": nm_id}
+    assert result is not None
+    assert result["nm_id"] == nm_id
+    # vision-404 fix: рабочий basket-nn записан в карту для переиспользования в image-URL
+    assert result["_wb_basket_nn"] == "37"
 
 
 @pytest.mark.asyncio
