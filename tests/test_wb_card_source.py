@@ -801,3 +801,42 @@ class TestExtractOptionsCompositions:
         assert len(lining_entries) == 1, (
             "Dedup must prevent duplicate 'Материал подкладки' entries"
         )
+
+    def test_brand_name_from_selling_extracted(self):
+        """Verify brand_name from selling is extracted as a Бренд option."""
+        card = {"selling": {"brand_name": "GROSSRYUKZAK"}}
+        opts = WbCardSource._extract_options(card)
+        brand = next((o for o in opts if o["name"].lower() == "бренд"), None)
+        assert brand is not None, "_extract_options must emit 'Бренд' from selling.brand_name"
+        assert brand["value"] == "GROSSRYUKZAK"
+
+    def test_brand_name_empty_or_missing_not_added(self):
+        """Verify empty, missing brand_name key, or missing selling does not produce Бренд."""
+        # empty string
+        card1 = {"selling": {"brand_name": ""}}
+        opts1 = WbCardSource._extract_options(card1)
+        brand1 = next((o for o in opts1 if o["name"].lower() == "бренд"), None)
+        assert brand1 is None, "Empty brand_name must not produce Бренд entry"
+
+        # brand_name key absent
+        card2 = {"selling": {}}
+        opts2 = WbCardSource._extract_options(card2)
+        brand2 = next((o for o in opts2 if o["name"].lower() == "бренд"), None)
+        assert brand2 is None, "Missing brand_name key must not produce Бренд entry"
+
+        # no selling key at all
+        card3 = {}
+        opts3 = WbCardSource._extract_options(card3)
+        brand3 = next((o for o in opts3 if o["name"].lower() == "бренд"), None)
+        assert brand3 is None, "Missing selling key must not produce Бренд entry and must not raise"
+
+    def test_brand_name_does_not_duplicate_existing_options_brand(self):
+        """Verify selling.brand_name does not duplicate an existing Бренд option."""
+        card = {
+            "options": [{"name": "Бренд", "value": "FromOptions"}],
+            "selling": {"brand_name": "FromSelling"}
+        }
+        opts = WbCardSource._extract_options(card)
+        brand_entries = [o for o in opts if o["name"].lower() == "бренд"]
+        assert len(brand_entries) == 1, "There must be exactly one Бренд entry"
+        assert brand_entries[0]["value"] == "FromOptions", "Existing options Бренд must take precedence"

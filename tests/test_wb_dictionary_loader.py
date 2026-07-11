@@ -3,6 +3,7 @@
 All tests use mocks — no real API calls are made.
 """
 import json
+import gzip
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -13,14 +14,20 @@ from unittest.mock import patch, MagicMock
 # ---------------------------------------------------------------------------
 
 SAMPLE_DICT = {
-    "12345": {
-        "name": "Кроссовки мужские",
-        "path": ["Обувь", "Мужская обувь", "Кроссовки"],
-        "characteristics": [
-            {"id": 14177419, "name": "Цвет"},
-            {"id": 14177421, "name": "Материал верха"},
-        ],
-    }
+    "schema_version": 1,
+    "source": "wb-api",
+    "generated_at": "2024-01-01T00:00:00",
+    "categories": {
+        "12345": {
+            "subject_id": 12345,
+            "subject_name": "Кроссовки мужские",
+            "parent_id": 8995,
+            "characteristics": [
+                {"id": 14177419, "name": "Цвет"},
+                {"id": 14177421, "name": "Материал верха"},
+            ],
+        }
+    },
 }
 
 
@@ -28,6 +35,12 @@ def _reset_cache():
     """Clear lru_cache on load_wb_dictionary between tests."""
     from app.services.enrichment.strategies.dictionaries.loader import load_wb_dictionary
     load_wb_dictionary.cache_clear()
+
+
+def _write_gzip_dict(path: Path, data: dict) -> None:
+    """Write a gzip-compressed JSON file at *path* containing *data*."""
+    with gzip.open(path, "wt", encoding="utf-8") as f:
+        json.dump(data, f)
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +53,7 @@ class TestLoadWbDictionary:
         _reset_cache()
 
     def test_returns_empty_dict_when_file_missing(self, tmp_path):
-        """load_wb_dictionary returns {} when wb_dictionary.json does not exist."""
+        """load_wb_dictionary returns {} when wb_dictionary.json.gz does not exist."""
         with patch(
             "app.services.enrichment.strategies.dictionaries.loader.DATA_DIR",
             tmp_path,
@@ -53,10 +66,8 @@ class TestLoadWbDictionary:
         assert result == {}
 
     def test_returns_parsed_json_when_file_exists(self, tmp_path):
-        """load_wb_dictionary parses and returns the JSON file contents."""
-        (tmp_path / "wb_dictionary.json").write_text(
-            json.dumps(SAMPLE_DICT), encoding="utf-8"
-        )
+        """load_wb_dictionary parses and returns the unwrapped categories dict."""
+        _write_gzip_dict(tmp_path / "wb_dictionary.json.gz", SAMPLE_DICT)
         with patch(
             "app.services.enrichment.strategies.dictionaries.loader.DATA_DIR",
             tmp_path,
@@ -67,12 +78,13 @@ class TestLoadWbDictionary:
             )
             result = load_wb_dictionary()
         assert "12345" in result
-        assert result["12345"]["name"] == "Кроссовки мужские"
+        assert result["12345"]["subject_name"] == "Кроссовки мужские"
+        # Prove the envelope was unwrapped — no top-level schema_version key
+        assert "schema_version" not in result
 
     def test_load_dictionary_is_cached(self, tmp_path):
         """Repeated calls to load_wb_dictionary do not re-read the file."""
-        dict_path = tmp_path / "wb_dictionary.json"
-        dict_path.write_text(json.dumps(SAMPLE_DICT), encoding="utf-8")
+        _write_gzip_dict(tmp_path / "wb_dictionary.json.gz", SAMPLE_DICT)
 
         with patch(
             "app.services.enrichment.strategies.dictionaries.loader.DATA_DIR",
@@ -82,23 +94,31 @@ class TestLoadWbDictionary:
             from app.services.enrichment.strategies.dictionaries.loader import (
                 load_wb_dictionary,
             )
-            with patch("builtins.open", wraps=open) as mock_open:
-                # We patch Path.read_text instead to count file reads
-                original_read_text = Path.read_text
+            with patch(
+                "app.services.enrichment.strategies.dictionaries.loader.gzip.open",
+                wraps=gzip.open,
+            ) as mock_gzip_open:
+                load_wb_dictionary()
+                load_wb_dictionary()
+                load_wb_dictionary()
 
-                call_count = {"n": 0}
+            # File should be opened exactly once due to lru_cache
+            assert mock_gzip_open.call_count == 1
 
-                def counting_read_text(self, **kwargs):
-                    call_count["n"] += 1
-                    return original_read_text(self, **kwargs)
-
-                with patch.object(Path, "read_text", counting_read_text):
-                    load_wb_dictionary()
-                    load_wb_dictionary()
-                    load_wb_dictionary()
-
-                # File should be read exactly once due to lru_cache
-                assert call_count["n"] == 1
+    def test_unwraps_envelope_categories_key(self, tmp_path):
+        """load_wb_dictionary returns exactly the categories sub-dict from the envelope."""
+        _write_gzip_dict(tmp_path / "wb_dictionary.json.gz", SAMPLE_DICT)
+        with patch(
+            "app.services.enrichment.strategies.dictionaries.loader.DATA_DIR",
+            tmp_path,
+        ):
+            _reset_cache()
+            from app.services.enrichment.strategies.dictionaries.loader import (
+                load_wb_dictionary,
+            )
+            result = load_wb_dictionary()
+        expected = SAMPLE_DICT["categories"]
+        assert result == expected
 
 
 class TestGetWbCharacteristicsForCategory:
@@ -107,9 +127,7 @@ class TestGetWbCharacteristicsForCategory:
 
     def test_returns_empty_list_for_unknown_subject(self, tmp_path):
         """get_wb_characteristics_for_category returns [] for an unknown subject_id."""
-        (tmp_path / "wb_dictionary.json").write_text(
-            json.dumps(SAMPLE_DICT), encoding="utf-8"
-        )
+        _write_gzip_dict(tmp_path / "wb_dictionary.json.gz", SAMPLE_DICT)
         with patch(
             "app.services.enrichment.strategies.dictionaries.loader.DATA_DIR",
             tmp_path,
@@ -123,9 +141,7 @@ class TestGetWbCharacteristicsForCategory:
 
     def test_returns_characteristics_for_known_subject(self, tmp_path):
         """get_wb_characteristics_for_category returns the characteristics list."""
-        (tmp_path / "wb_dictionary.json").write_text(
-            json.dumps(SAMPLE_DICT), encoding="utf-8"
-        )
+        _write_gzip_dict(tmp_path / "wb_dictionary.json.gz", SAMPLE_DICT)
         with patch(
             "app.services.enrichment.strategies.dictionaries.loader.DATA_DIR",
             tmp_path,
@@ -159,9 +175,7 @@ class TestGetWbSubjectName:
 
     def test_returns_name_for_known_subject(self, tmp_path):
         """get_wb_subject_name returns the subject name string."""
-        (tmp_path / "wb_dictionary.json").write_text(
-            json.dumps(SAMPLE_DICT), encoding="utf-8"
-        )
+        _write_gzip_dict(tmp_path / "wb_dictionary.json.gz", SAMPLE_DICT)
         with patch(
             "app.services.enrichment.strategies.dictionaries.loader.DATA_DIR",
             tmp_path,
@@ -174,9 +188,7 @@ class TestGetWbSubjectName:
 
     def test_returns_none_for_unknown_subject(self, tmp_path):
         """get_wb_subject_name returns None for an unknown subject_id."""
-        (tmp_path / "wb_dictionary.json").write_text(
-            json.dumps(SAMPLE_DICT), encoding="utf-8"
-        )
+        _write_gzip_dict(tmp_path / "wb_dictionary.json.gz", SAMPLE_DICT)
         with patch(
             "app.services.enrichment.strategies.dictionaries.loader.DATA_DIR",
             tmp_path,
