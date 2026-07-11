@@ -31,11 +31,109 @@ from app.services.enrichment.base import (
     TargetAttribute,
 )
 from app.services.enrichment.marketplaces.base import MarketplaceSource
-from app.services.enrichment.marketplaces.generic import GenericMarketplace
+from app.services.enrichment.marketplaces.generic import ExtractorMarketplace
+from app.services.enrichment.marketplaces.extractors.base import Extractor
+from app.services.enrichment.marketplaces.extractors.embedded_json_family import EmbeddedJsonExtractor
+from app.services.enrichment.marketplaces.extractors.llm_extractor_family import LlmSpecExtractor
+from app.services.enrichment.marketplaces.extractors.static_table_family import StaticTableExtractor
+from app.services.enrichment.marketplaces.extractors.suburl_family import SubUrlExtractor
+from app.services.enrichment.marketplaces.brandshop import BrandshopMarketplace
+from app.services.enrichment.marketplaces.fhby import FhByMarketplace
+from app.services.enrichment.marketplaces.kupivip import KupiVipMarketplace
 from app.services.enrichment.marketplaces.lamoda import LamodaMarketplace
+from app.services.enrichment.marketplaces.vipavenue import VipavenueMarketplace
 from app.services.enrichment.marketplaces.yandex import YandexMarketMarketplace
 
 logger = logging.getLogger(__name__)
+
+_llm = LlmSpecExtractor(slug="llm")
+
+# Domain -> extractor chain. P1 populates eldorado.ru (EmbeddedJson family, __NEXT_DATA__
+# Redux dump); P2 populates holodilnik.ru + nix.ru (StaticTable family); P3 populates
+# dns-shop.ru (SubUrl family wrapping an inner StaticTable against /characteristics/).
+# Remaining domains stay on DEFAULT_CHAIN until their own slice lands.
+DOMAIN_EXTRACTORS: dict[str, list[Extractor]] = {
+    "eldorado.ru": [
+        EmbeddedJsonExtractor(
+            slug="json:eldorado",
+            specs_path=lambda root: next(iter(root["props"]["initialState"]["products-store-module"]["products"].values()))["attributeGroups"],
+            grouped=True,
+            group_items_key="propertyValues",
+            name_key="name",
+            value_key="propertyValues",
+            unit_key="units",
+        ),
+        _llm,
+    ],
+    "holodilnik.ru": [
+        StaticTableExtractor(
+            slug="table:holodilnik",
+            row_selector=".params-list--in-product .params-list__item:not(.params-list__item--caption)",
+            name_selector=".params-list__item-name",
+            value_selector=".params-list__item-value",
+            name_strip_selectors=[".params-list__item-name-widget", ".d-none"],
+        ),
+        _llm,
+    ],
+    "nix.ru": [
+        StaticTableExtractor(
+            slug="table:nix",
+            row_selector='table#PriceTable tr[id^="trs"]',
+            name_selector='td[id^="tds"]:not([id^="tdsa"])',
+            value_selector='td[id^="tdsa"] div',
+            value_take_first=True,
+        ),
+        _llm,
+    ],
+    "dns-shop.ru": [
+        SubUrlExtractor(
+            slug="suburl:dns",
+            url_rule=lambda u: u.split("?")[0].split("#")[0].rstrip("/") + "/characteristics/",
+            inner=StaticTableExtractor(
+                slug="table:dns",
+                row_selector="li.product-characteristics__spec",
+                name_selector=".product-characteristics__spec-title",
+                value_selector=".product-characteristics__spec-value",
+            ),
+        ),
+        _llm,
+    ],
+}
+
+# Fallback chain for any domain not in DOMAIN_EXTRACTORS. llm-only for P0 -- this
+# reproduces current GenericMarketplace behavior byte-for-byte (the parity gate).
+DEFAULT_CHAIN: list[Extractor] = [_llm]
+
+# Family whitelist: comma-separated family prefixes (slug before ":", or the whole slug
+# when it has no ":"). Default "llm" ONLY -- deterministic families (json/table/suburl/
+# ldjson) stay opt-in until their own A/B slice lands. Point of this flag: kill-switch
+# per family without code changes.
+MP_EXTRACTOR_FAMILIES: set[str] = {
+    fam.strip() for fam in os.environ.get("MP_EXTRACTOR_FAMILIES", "llm").split(",") if fam.strip()
+}
+
+# Point kill-switch: comma-separated exact extractor slugs to disable regardless of family
+# whitelist state (e.g. "json:eldorado" broke on a vendor markup change -- disable just it).
+MP_EXTRACTOR_DISABLE: set[str] = {
+    slug.strip() for slug in os.environ.get("MP_EXTRACTOR_DISABLE", "").split(",") if slug.strip()
+}
+
+
+def _extractor_family(slug: str) -> str:
+    """Family prefix of an extractor slug: text before ':' or the whole slug if no ':'."""
+    return slug.split(":", 1)[0]
+
+
+def _build_extractor_chain(domain: str) -> list[Extractor]:
+    """Resolve a domain's configured extractor chain, filtered by the family whitelist
+    and the point-disable set. Falls back to DEFAULT_CHAIN when the domain has no
+    dedicated entry in DOMAIN_EXTRACTORS."""
+    chain = DOMAIN_EXTRACTORS.get(domain, DEFAULT_CHAIN)
+    return [
+        ex for ex in chain
+        if _extractor_family(ex.slug) in MP_EXTRACTOR_FAMILIES
+        and ex.slug not in MP_EXTRACTOR_DISABLE
+    ]
 
 # ---------------------------------------------------------------------------
 # Cost knob: max number of marketplaces to attempt per product.
@@ -43,6 +141,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _MAX_DISCOVERY: int = int(os.getenv("MARKETPLACE_MAX_DISCOVERY", "0"))
+
+# Extra CIS marketplace domains, flag-gated (default OFF — pool byte-identical
+# to today unless explicitly enabled).
+EXTRA_MARKETPLACES_ENABLED: bool = os.environ.get("EXTRA_MARKETPLACES_ENABLED", "0") == "1"
+
+# Lamoda.ru is NO-GO (DECISIONS.md 2026-07-10) — independent flag, default OFF, kept OFF.
+# LAMODA_SCRAPFLY_ENABLED now only gates the rest of the web-marketplace router stage.
+LAMODA_MARKETPLACE_ENABLED: bool = os.environ.get("LAMODA_MARKETPLACE_ENABLED", "0") == "1"
 
 # ---------------------------------------------------------------------------
 # Singleton instances — one per marketplace (stateless beyond injected deps)
@@ -76,8 +182,99 @@ _SPECIALIST_DOMAINS = [
     ("petrovich",      "petrovich.ru"),       # стройматериалы
     ("sunlight",       "sunlight.net"),       # ювелирка
     ("alltime",        "alltime.ru"),         # часы
+    ("jnsonline",      "jnsonline.ru"),       # одежда
+    ("aromacode",      "aromacode.ru"),       # косметика-парфюм
+    ("akusherstvo",    "akusherstvo.ru"),     # мягкие игрушки
+    ("votonia",        "votonia.ru"),         # мягкие игрушки
 ]
-_specialists = [GenericMarketplace(name=n, domain=d) for n, d in _SPECIALIST_DOMAINS]
+_specialists = [
+    ExtractorMarketplace(name=n, domain=d, extractors=_build_extractor_chain(d))
+    for n, d in _SPECIALIST_DOMAINS
+]
+
+# vipavenue.ru — plain httpx GET (no anti-bot), bespoke accordion parser. Not gated by a
+# separate flag: rides the general web-marketplace router stage (LAMODA_SCRAPFLY_ENABLED),
+# same as goldapple/sportmaster/etc.
+_vipavenue = VipavenueMarketplace()
+# kupivip.ru — plain httpx GET (no anti-bot), bespoke detail-block text parser. Not gated
+# by a separate flag: rides the general web-marketplace router stage (LAMODA_SCRAPFLY_ENABLED),
+# same as goldapple/sportmaster/vipavenue.
+_kupivip = KupiVipMarketplace()
+# brandshop.ru — plain httpx GET (no anti-bot), product-data block + description-list
+# parser. Not gated by a separate flag: rides the general web-marketplace router stage
+# (LAMODA_SCRAPFLY_ENABLED), same as goldapple/sportmaster/vipavenue/kupivip.
+_brandshop = BrandshopMarketplace()
+# fh.by — plain httpx GET (no anti-bot), __NEXT_DATA__ JSON parser (Next.js app, not
+# CSS-selector based). Not gated by a separate flag: rides the general web-marketplace
+# router stage (LAMODA_SCRAPFLY_ENABLED), same as goldapple/sportmaster/vipavenue/kupivip/
+# brandshop. Confirmed GO 2026-07-10 (_reports/probe_4_new_analogs.txt).
+_fhby = FhByMarketplace()
+
+# Reorder: fast plain-httpx specialists first, then slow proxy-backed scrapedo specialists.
+# Previously the 22 scrapedo specialists ran first, consuming the request timeout budget
+# before fast hits could fire (see _reports/diag_prada_timeout.log).
+_specialists = [_vipavenue, _kupivip, _brandshop, _fhby, *_specialists]
+
+# ---------------------------------------------------------------------------
+# Extra CIS marketplace domains (flag-gated — see EXTRA_MARKETPLACES_ENABLED).
+# scrape.do-verified 2026-07-07, rich-spec, see cis_pool coverage map
+# ---------------------------------------------------------------------------
+
+EXTRA_MARKETPLACE_DOMAINS = [
+    ("bakuelectronics", "bakuelectronics.az"),
+    ("kontakt", "kontakt.az"),
+    ("umico", "umico.az"),
+    ("5element", "5element.by"),
+    ("zoommer", "zoommer.ge"),
+    ("mechta", "mechta.kz"),
+    ("sulpak", "sulpak.kz"),
+    ("technodom", "technodom.kz"),
+    ("flip", "flip.kz"),
+    ("kaspi", "kaspi.kz"),
+    ("satu", "satu.kz"),
+    ("price", "price.ru"),
+    ("holodilnik", "holodilnik.ru"),
+    ("armtek", "armtek.ru"),
+    ("autodoc", "autodoc.ru"),
+    ("zzap", "zzap.ru"),
+    ("letu", "letu.ru"),
+    ("randewoo", "randewoo.ru"),
+    ("rivegauche", "rivegauche.ru"),
+    ("citilink", "citilink.ru"),
+    ("dns_shop", "dns-shop.ru"),
+    ("eldorado", "eldorado.ru"),
+    ("mvideo", "mvideo.ru"),
+    ("nix", "nix.ru"),
+    ("notik", "notik.ru"),
+    ("pult", "pult.ru"),
+    ("askona", "askona.ru"),
+    ("sima_land", "sima-land.ru"),
+    ("lemanapro", "lemanapro.ru"),
+    ("585zolotoy", "585zolotoy.ru"),
+    ("apteka", "apteka.ru"),
+    ("bestwatch", "bestwatch.ru"),
+    ("texnomart", "texnomart.uz"),
+    ("uzum", "uzum.uz"),
+]
+
+# Scrape.do geo by TLD — non-RU TLDs get their own geo; everything else
+# (incl. .by, no dedicated hook here) defaults to "ru" — acceptable, the
+# probe confirmed these domains fetch fine under the default geo.
+_TLD_GEO: dict[str, str] = {"kz": "kz", "az": "az", "ge": "ge", "uz": "uz"}
+
+
+def _geo_for_domain(domain: str) -> str:
+    """Scrape.do geo code by TLD (see _TLD_GEO); default 'ru'."""
+    tld = domain.rsplit(".", 1)[-1]
+    return _TLD_GEO.get(tld, "ru")
+
+
+_extra_specialists = [
+    ExtractorMarketplace(
+        name=n, domain=d, geo=_geo_for_domain(d), extractors=_build_extractor_chain(d),
+    )
+    for n, d in EXTRA_MARKETPLACE_DOMAINS
+]
 
 # ---------------------------------------------------------------------------
 # Pool definition — flat, universal, no product-type routing
@@ -89,7 +286,15 @@ _specialists = [GenericMarketplace(name=n, domain=d) for n, d in _SPECIALIST_DOM
 # always-relevant site (Yandex.Market) first, then specialist catalogues whose
 # search naturally no-ops on out-of-domain products (Lamoda for a TV → []).
 # Adding a marketplace is a one-line append — no per-type wiring.
-MARKETPLACES: list[MarketplaceSource] = [_yandex, _lamoda, *_specialists]
+MARKETPLACES: list[MarketplaceSource] = [_yandex]
+if LAMODA_MARKETPLACE_ENABLED:
+    # Lamoda.ru NO-GO (DECISIONS.md 2026-07-10) — excluded from the pool unless this
+    # flag is explicitly set (default OFF, independent of LAMODA_SCRAPFLY_ENABLED).
+    MARKETPLACES.append(_lamoda)
+MARKETPLACES.extend(_specialists)
+if EXTRA_MARKETPLACES_ENABLED:
+    # Appended, not interleaved — preserves existing cost/coverage order.
+    MARKETPLACES = [*MARKETPLACES, *_extra_specialists]
 
 
 def get_marketplace_pool(context: ExtractionContext) -> list[MarketplaceSource]:
